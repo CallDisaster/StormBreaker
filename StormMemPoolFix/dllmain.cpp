@@ -39,7 +39,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
     {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
-        std::cout << "Version:0.03" << std::endl;
+        std::cout << "Version:0.04" << std::endl;
         //if (SPDLogger::InitializeLogger()) {
         //    std::cout << "InitializeLogger success!" << std::endl;
         //}
