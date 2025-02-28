@@ -57,27 +57,54 @@ static FILE* g_logFile = nullptr;
 // 辅助函数
 ///////////////////////////////////////////////////////////////////////////////
 
-// 日志函数
+// 4. 改进日志记录，避免大量日志
 void LogMessage(const char* format, ...) {
-    if (!g_logFile) {
+    static bool firstRun = true;
+    static DWORD lastLogFlushTime = 0;
+
+    // 第一次运行时清空日志文件
+    if (firstRun) {
+        if (g_logFile) {
+            fclose(g_logFile);
+            g_logFile = nullptr;
+        }
+        fopen_s(&g_logFile, "StormHook.log", "w");
+        firstRun = false;
+    }
+    else if (!g_logFile) {
         if (fopen_s(&g_logFile, "StormHook.log", "a") != 0) {
-            return; // 文件打开失败
+            return;
         }
     }
 
+    // 常规日志记录...
     va_list args;
     va_start(args, format);
 
-    // 打印时间戳
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(g_logFile, "[%02d:%02d:%02d.%03d] ",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    // 检查是否要跳过某些频繁的日志
+    bool shouldSkip = false;
+    if (strstr(format, "触发过于频繁") != nullptr) {
+        static int throttleCounter = 0;
+        throttleCounter++;
+        // 只记录每20次中的1次
+        shouldSkip = (throttleCounter % 20 != 0);
+    }
 
-    // 打印消息
-    vfprintf(g_logFile, format, args);
-    fprintf(g_logFile, "\n");
-    fflush(g_logFile);
+    if (!shouldSkip) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(g_logFile, "[%02d:%02d:%02d.%03d] ",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        vfprintf(g_logFile, format, args);
+        fprintf(g_logFile, "\n");
+
+        // 定期刷新日志，而不是每次都刷新
+        DWORD currentTime = GetTickCount();
+        if (currentTime - lastLogFlushTime > 1000) { // 每秒刷新一次
+            fflush(g_logFile);
+            lastLogFlushTime = currentTime;
+        }
+    }
 
     va_end(args);
 }
@@ -584,48 +611,94 @@ void Hooked_StormHeap_CleanupAll() {
     // 时间节流 - 避免频繁CleanAll
     DWORD currentTime = GetTickCount();
     DWORD lastTime = g_lastCleanAllTime.load();
-    if (currentTime - lastTime < 1000) { // 1秒内不重复执行
-        LogMessage("[CleanAll] 触发过于频繁，已跳过");
+    if (currentTime - lastTime < 1000) {
+        // 这里不打印日志，减少刷屏
         return;
     }
 
     tls_inCleanAll = true;
     g_cleanAllInProgress = true;
+    g_cleanAllThreadId = GetCurrentThreadId();  // 设置当前线程ID
     g_lastCleanAllTime.store(currentTime);
 
-    LogMessage("[CleanAll] 开始执行");
+    // 只在管理块数量大于0时详细记录
+    size_t bigBlocksCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+        bigBlocksCount = g_bigBlocks.size();
+        if (bigBlocksCount > 0) {
+            LogMessage("[CleanAll] 开始执行");
+            LogMessage("[CleanAll] 准备执行，当前TLSF管理块数量: %zu", bigBlocksCount);
+        }
+    }
 
     // 保存原始的g_DebugHeapPtr值
     int originalDebugHeapPtr = Storm_g_DebugHeapPtr;
 
+    // 执行原始CleanupAll，为它做好准备
+    {
+        // 临时记录所有TLSF管理的块，防止在CleanAll中被修改
+        std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+        // 可以在这里添加额外的保护措施...
+    }
+
     // 执行原始CleanupAll
     s_origCleanupAll();
 
-    // *** 关键修复点：重置Storm内部状态 ***
-    // 将g_DebugHeapPtr重置为0，防止Storm再次触发CleanAll
+    // 重置Storm内部状态
     Storm_g_DebugHeapPtr = 0;
 
-    // 标记CleanAll后的状态
+    // 检查TLSF块数量变化
+    if (bigBlocksCount > 0) {
+        std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+        LogMessage("[CleanAll] 完成后，TLSF管理块数量: %zu", g_bigBlocks.size());
+    }
+
+    // 设置清理完成标志
     g_afterCleanAll = true;
     g_cleanAllInProgress = false;
+    g_cleanAllThreadId = 0;
     tls_inCleanAll = false;
 
-    LogMessage("[CleanAll] 完成，已重置内部状态");
+    if (bigBlocksCount > 0) {
+        LogMessage("[CleanAll] 完成，已重置内部状态");
+    }
 }
 
 // Hook: SMemAlloc - 处理大块分配
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag) {
+    // 在 Hooked_Storm_MemAlloc 函数中
     // 检查是否在CleanAll后的第一次分配
     bool isAfterCleanAll = g_afterCleanAll.exchange(false);
 
     // CleanAll后的关键分配，需要特殊处理
     if (isAfterCleanAll) {
-        // 直接使用Storm分配一个小块，防止Storm触发新的CleanAll
-        void* smallBlock = (void*)s_origStormAlloc(ecx, edx, 16, "HookStabilizer", __LINE__, 0);
-        if (smallBlock) {
-            LogMessage("[StabilizerBlock] 分配成功: %p", smallBlock);
-            // 故意不释放这个小块，保持Storm堆状态稳定
+        static int cleanAllCounter = 0;
+        cleanAllCounter++;
+
+        int numStabilizers = 5;  // 默认稳定化块数量
+
+        // 如果连续多次CleanAll，可能需要更多稳定化块
+        if (cleanAllCounter > 10) numStabilizers = 8;
+
+        LogMessage("[StabilizerBlocks] 开始创建%d个稳定化块(第%d次CleanAll)",
+            numStabilizers, cleanAllCounter);
+
+        // 分配不同大小的块，覆盖更多堆
+        for (int i = 0; i < numStabilizers; i++) {
+            // 使用不同的大小，让它们分散到更多堆
+            size_t blockSize = 16 + (i * 4); // 16, 20, 24, 28...
+            void* smallBlock = (void*)s_origStormAlloc(ecx, edx, blockSize,
+                "HookStabilizer", __LINE__ + i, i % 3);
+            if (smallBlock) {
+                // 减少日志刷屏
+                if (i < 3) {
+                    LogMessage("[StabilizerBlock] 分配成功: %p (大小: %zu)", smallBlock, blockSize);
+                }
+            }
         }
+
+        LogMessage("[StabilizerBlocks] 稳定化块创建完成");
     }
     // 在CleanAll过程中，直接使用原始分配
     if (g_cleanAllInProgress && GetCurrentThreadId() == g_cleanAllThreadId) {
@@ -688,14 +761,13 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
 
     void* ptr = reinterpret_cast<void*>(a1);
 
-    // 在CleanAll过程中特殊处理
+    // 在CleanAll过程中特殊处理我们的块
     if (g_cleanAllInProgress && GetCurrentThreadId() == g_cleanAllThreadId) {
-        // 如果是我们的块，不让Storm处理它
         if (IsOurBlock(ptr)) {
-            //LogMessage("[Free][CleanAll] Skipping our block: %p", ptr);
-            g_freedByAllocHook++;
-            return 1;  // 返回成功
+            // 完全跳过TLSF管理的块的释放操作
+            return 1;  // 假装成功
         }
+        // 其他情况走原始路径
         return s_origStormFree(a1, name, argList, a4);
     }
 
