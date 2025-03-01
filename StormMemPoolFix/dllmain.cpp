@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <io.h>
 #include <fcntl.h>
-#include <Base/spdLogger.h>
+#include <Base/Logger.h>
 #include <Storm/StormHook.h>
 #include <Storm/StormOffsets.h>
 #include <mimalloc.h>
@@ -30,59 +30,45 @@ void CreateConsole()
 }
 
 
-BOOL APIENTRY DllMain( HMODULE hModule,
-                       DWORD  ul_reason_for_call,
-                       LPVOID lpReserved
-                     )
-{
-    switch (ul_reason_for_call)
-    {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
-        std::cout << "Version:0.04" << std::endl;
-        //if (SPDLogger::InitializeLogger()) {
-        //    std::cout << "InitializeLogger success!" << std::endl;
-        //}
-        //else {
-        //    std::cout << "InitializeLogger faild!" << std::endl;
-        //}
-// 例如：
-    // 关闭 eager_commit
+        std::cout << "Version:0.05" << std::endl; // 更新版本号
+
+        // 设置mimalloc选项
         mi_option_set_enabled(mi_option_eager_commit, false);
-
-        // 关闭 arena_eager_commit (如果在大块场景里将 Arena 也会 eager commit)
         mi_option_set_enabled(mi_option_arena_eager_commit, false);
-
-        // 禁用 large OS pages
         mi_option_set_enabled(mi_option_allow_large_os_pages, false);
-
-        // 禁用 (or lower) reserve_huge_os_pages
         mi_option_set(mi_option_reserve_huge_os_pages, 0);
-
-        mi_collect(true);  // 尝试释放未使用的内存
-        // 使选项生效
+        mi_collect(true);
         mi_process_init();
+
         Sleep(500);
-        //if (HookAllStormHeapFunctions()) {
-        //    std::cout << "StormFixHook success!" << std::endl;
-        //}
-        //else {
-        //    std::cout << "StormFixHook failed!" << std::endl;
-        //}
+
+        // 初始化内存钩子
         if (InitializeStormMemoryHooks()) {
-            std::cout << "StormMemPoolHook success!" << std::endl;
+            std::cout << "StormMemPoolHook 初始化成功！" << std::endl;
+
+            // 打印初始内存报告到控制台
+            PrintMemoryStatus();
         }
         else {
-            std::cout << "StormMemPoolHook failed!" << std::endl;
+            std::cout << "StormMemPoolHook 初始化失败！" << std::endl;
         }
         break;
+
     case DLL_THREAD_ATTACH:
     case DLL_THREAD_DETACH:
         break;
+
     case DLL_PROCESS_DETACH:
+        // 生成最终内存报告
+        GenerateMemoryReport(true);
+
+        // 关闭钩子
         ShutdownStormMemoryHooks();
         break;
     }
     return TRUE;
 }
-

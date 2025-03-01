@@ -8,6 +8,8 @@
 #include <mutex>
 #include <vector>
 #include <string>
+#include <psapi.h>  // 添加这个头文件
+#pragma comment(lib, "psapi.lib")
 
 // Storm结构体定义
 #pragma pack(push, 1)
@@ -114,3 +116,9 @@ namespace MemPool {
     void FreeSafe(void* ptr);
     void* ReallocSafe(void* oldPtr, size_t newSize);
 }
+
+void GenerateMemoryReport(bool forceWrite = false);
+size_t GetStormVirtualMemoryUsage();
+size_t GetTLSFPoolUsage();
+void PrintMemoryStatus();
+
