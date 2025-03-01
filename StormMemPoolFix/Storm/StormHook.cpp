@@ -15,6 +15,7 @@
 #include "tlsf.h"
 #include <algorithm>
 #include <Base/MemorySafety.h>
+#include "../Base/Logger.h"
 
 MemorySafety& g_MemSafety = MemorySafety::GetInstance();
 
@@ -63,6 +64,126 @@ static FILE* g_logFile = nullptr;
 ///////////////////////////////////////////////////////////////////////////////
 // 辅助函数
 ///////////////////////////////////////////////////////////////////////////////
+
+// 替换原来的 LogMessage 函数
+void LogMessage(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    char buffer[4096];
+    vsnprintf(buffer, sizeof(buffer), format, args);
+
+    va_end(args);
+
+    // 使用新的日志系统记录
+    LogSystem::GetInstance().Log("%s", buffer);
+}
+
+// StormHook.cpp 中添加实现
+size_t GetStormVirtualMemoryUsage() {
+    // 获取 Storm 虚拟内存占用
+    if (Storm_g_TotalAllocatedMemory) {
+        return Storm_g_TotalAllocatedMemory;
+    }
+    return 0;
+}
+
+size_t GetTLSFPoolUsage() {
+    // 获取 TLSF 内存池已用大小
+    return MemPool::GetUsedSize();
+}
+
+size_t GetTLSFPoolTotal() {
+    // 获取 TLSF 内存池总大小
+    return MemPool::GetTotalSize();
+}
+
+// 生成完整的内存报告
+void GenerateMemoryReport(bool forceWrite) {
+    static DWORD lastReportTime = 0;
+    DWORD currentTime = GetTickCount();
+
+    // 默认每30秒生成一次报告，除非强制生成
+    if (!forceWrite && (currentTime - lastReportTime < 30000)) {
+        return;
+    }
+
+    lastReportTime = currentTime;
+
+    // 获取内存数据
+    size_t stormVMUsage = GetStormVirtualMemoryUsage();
+    size_t tlsfUsed = GetTLSFPoolUsage();
+    size_t tlsfTotal = GetTLSFPoolTotal();
+    size_t managed = g_bigBlocks.size();
+
+    // 计算使用率
+    double tlsfUsagePercent = tlsfTotal > 0 ? (tlsfUsed * 100.0 / tlsfTotal) : 0.0;
+
+    // 获取进程整体内存使用情况
+    PROCESS_MEMORY_COUNTERS pmc;
+    memset(&pmc, 0, sizeof(pmc));
+    pmc.cb = sizeof(pmc);
+
+    size_t workingSetMB = 0;
+    size_t virtualMemMB = 0;
+
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        workingSetMB = pmc.WorkingSetSize / (1024 * 1024);
+        virtualMemMB = pmc.PagefileUsage / (1024 * 1024);  // 使用 PagefileUsage 替代 PrivateUsage
+    }
+
+    // 获取当前时间
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    // 生成报告文本
+    char reportBuffer[2048];
+    int len = sprintf_s(reportBuffer,
+        "===== 内存使用报告 =====\n"
+        "时间: %02d:%02d:%02d\n"
+        "Storm 虚拟内存: %zu MB\n"
+        "TLSF 内存池: %zu MB / %zu MB (%.1f%%)\n"
+        "TLSF 管理块数量: %zu\n"
+        "工作集大小: %zu MB\n"
+        "虚拟内存总量: %zu MB\n"
+        "========================\n",
+        st.wHour, st.wMinute, st.wSecond,
+        stormVMUsage / (1024 * 1024),
+        tlsfUsed / (1024 * 1024), tlsfTotal / (1024 * 1024), tlsfUsagePercent,
+        managed,
+        workingSetMB,
+        virtualMemMB
+    );
+
+    // 同时输出到控制台和日志
+    printf("%s", reportBuffer);
+    LogMessage("\n%s", reportBuffer);
+}
+
+// 简化版状态输出，适合频繁调用
+void PrintMemoryStatus() {
+    size_t stormVMUsage = GetStormVirtualMemoryUsage();
+    size_t tlsfUsed = GetTLSFPoolUsage();
+    size_t tlsfTotal = GetTLSFPoolTotal();
+
+    // 获取当前时间
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    printf("[%02d:%02d:%02d] [内存] Storm: %zu MB, TLSF: %zu/%zu MB (%.1f%%)\n",
+        st.wHour, st.wMinute, st.wSecond,
+        stormVMUsage / (1024 * 1024),
+        tlsfUsed / (1024 * 1024),
+        tlsfTotal / (1024 * 1024),
+        tlsfTotal > 0 ? (tlsfUsed * 100.0 / tlsfTotal) : 0.0);
+
+    LogMessage("[%02d:%02d:%02d] [内存] Storm: %zu MB, TLSF: %zu/%zu MB (%.1f%%)",
+        st.wHour, st.wMinute, st.wSecond,
+        stormVMUsage / (1024 * 1024),
+        tlsfUsed / (1024 * 1024),
+        tlsfTotal / (1024 * 1024),
+        tlsfTotal > 0 ? (tlsfUsed * 100.0 / tlsfTotal) : 0.0);
+}
 
 // 替代方案：使用SEH和函数封装
 LONG WINAPI CustomUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
@@ -141,61 +262,6 @@ void SafeExecuteCleanupAll() {
     g_MemSafety.ExitUnsafePeriod();
 }
 
-
-// 4. 改进日志记录，避免大量日志
-void LogMessage(const char* format, ...) {
-    static bool firstRun = true;
-    static DWORD lastLogFlushTime = 0;
-    static std::mutex logMutex; // 新增：日志互斥锁
-
-    std::lock_guard<std::mutex> lock(logMutex); // 保护日志操作
-
-    // 第一次运行时清空日志文件
-    if (firstRun) {
-        if (g_logFile) {
-            fclose(g_logFile);
-            g_logFile = nullptr;
-        }
-        fopen_s(&g_logFile, "StormHook.log", "w");
-        firstRun = false;
-    }
-    else if (!g_logFile) {
-        if (fopen_s(&g_logFile, "StormHook.log", "a") != 0) {
-            return;
-        }
-    }
-
-    // 常规日志记录...
-    va_list args;
-    va_start(args, format);
-
-    // 检查是否要跳过某些频繁的日志
-    bool shouldSkip = false;
-    if (strstr(format, "触发过于频繁") != nullptr) {
-        static int throttleCounter = 0;
-        throttleCounter++;
-        // 只记录每20次中的1次
-        shouldSkip = (throttleCounter % 20 != 0);
-    }
-
-    if (!shouldSkip) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(g_logFile, "[%02d:%02d:%02d.%03d] ",
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        vfprintf(g_logFile, format, args);
-        fprintf(g_logFile, "\n");
-
-        // 定期刷新日志，而不是每次都刷新
-        DWORD currentTime = GetTickCount();
-        if (currentTime - lastLogFlushTime > 1000) { // 每秒刷新一次
-            fflush(g_logFile);
-            lastLogFlushTime = currentTime;
-        }
-    }
-
-    va_end(args);
-}
 
 // 设置Storm兼容的内存块头
 void SetupCompatibleHeader(void* userPtr, size_t size) {
@@ -859,11 +925,18 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
 
     DWORD lastCleanupTime = GetTickCount();
     DWORD lastStatsTime = GetTickCount();
+    DWORD lastReportTime = GetTickCount();
 
     while (true) {
         Sleep(5000);  // 每5秒检查一次
 
         DWORD currentTime = GetTickCount();
+
+        // 每30秒生成内存报告
+        if (currentTime - lastReportTime > 30000) {
+            GenerateMemoryReport();
+            lastReportTime = currentTime;
+        }
 
         // 每30秒尝试释放未使用的扩展池
         if (currentTime - lastCleanupTime > 30000) {
@@ -969,7 +1042,7 @@ void Hooked_StormHeap_CleanupAll() {
     DWORD currentTime = GetTickCount();
     DWORD lastTime = g_lastCleanAllTime.load();
     if (currentTime - lastTime < 2000) {
-        LogMessage("[CleanAll] 触发过于频繁，已跳过");
+        //LogMessage("[CleanAll] 触发过于频繁，已跳过");
         return;
     }
 
@@ -1528,9 +1601,15 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 ///////////////////////////////////////////////////////////////////////////////
 
 bool InitializeStormMemoryHooks() {
+    // 初始化新的日志系统
+    if (!LogSystem::GetInstance().Initialize()) {
+        printf("[错误] 无法初始化日志系统\n");
+        return false;
+    }
+
     LogMessage("[Init] 正在初始化Storm内存钩子...");
 
-    // 初始化内存安全系统 - 新增
+    // 初始化内存安全系统
     if (!g_MemSafety.Initialize()) {
         LogMessage("[Init] 内存安全系统初始化失败");
         return false;
@@ -1595,47 +1674,21 @@ bool InitializeStormMemoryHooks() {
     // 重置Storm的g_DebugHeapPtr，防止初始CleanAll触发
     Storm_g_DebugHeapPtr = 0;
 
-    // 启动内存安全系统监控线程 - 新增
-    HANDLE hMemSafetyThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-        LogMessage("[MemSafety] 内存安全监控线程已启动");
-
-        while (true) {
-            Sleep(10000); // 每10秒
-
-            // 处理延迟释放队列
-            g_MemSafety.ProcessDeferredFreeQueue();
-
-            // 定期验证内存块
-            if (!g_MemSafety.IsInUnsafePeriod()) {
-                g_MemSafety.ValidateAllBlocks();
-            }
-
-            // 每分钟打印统计
-            static DWORD lastStatsTime = 0;
-            DWORD currentTime = GetTickCount();
-            if (currentTime - lastStatsTime > 60000) {
-                g_MemSafety.PrintStats();
-                lastStatsTime = currentTime;
-            }
-        }
-
-        return 0;
-        }, nullptr, 0, nullptr);
-
-    if (hMemSafetyThread) CloseHandle(hMemSafetyThread);
-
-    LogMessage("[Init] 内存安全系统集成成功");
-    return true;
-
+    // 输出初始内存报告
+    GenerateMemoryReport(true);
 
     LogMessage("[Init] Storm内存钩子安装成功！");
     return true;
 }
 
+// 修改 ShutdownStormMemoryHooks 函数，关闭日志系统
 void ShutdownStormMemoryHooks() {
     LogMessage("[关闭] 正在移除Storm内存钩子...");
 
-    // 关闭内存安全系统 - 新增
+    // 最后的内存报告
+    GenerateMemoryReport(true);
+
+    // 关闭内存安全系统
     g_MemSafety.Shutdown();
 
     // 标记进入不安全期，防止后续内存操作
@@ -1673,11 +1726,8 @@ void ShutdownStormMemoryHooks() {
     // 清理TLSF内存池
     MemPool::Shutdown();
 
-    // 关闭日志
-    if (g_logFile) {
-        fclose(g_logFile);
-        g_logFile = nullptr;
-    }
+    // 关闭日志系统
+    LogSystem::GetInstance().Shutdown();
 
     LogMessage("[关闭] Storm内存钩子已移除");
 }
