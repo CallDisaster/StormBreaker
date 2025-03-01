@@ -75,6 +75,11 @@ extern Storm_MemFree_t s_origStormFree;
 extern Storm_MemReAlloc_t s_origStormReAlloc;
 extern StormHeap_CleanupAll_t s_origCleanupAll;
 extern std::atomic<bool> g_cleanAllInProgress;
+extern std::atomic<bool> g_afterCleanAll;
+extern std::atomic<DWORD> g_lastCleanAllTime;
+extern thread_local bool tls_inCleanAll;
+extern std::atomic<bool> g_insideUnsafePeriod; // 新增：标记不安全时期
+extern DWORD g_cleanAllThreadId;
 
 // 函数声明
 bool InitializeStormMemoryHooks();
@@ -83,6 +88,9 @@ void LogMessage(const char* format, ...);
 void SetupCompatibleHeader(void* userPtr, size_t size);
 bool IsOurBlock(void* ptr);
 void PrintAllPoolsUsage();
+void CreateStabilizingBlocks(int cleanAllCount);
+bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);
+bool IsPermanentBlock(void* ptr);
 ResourceType GetResourceType(const char* name);
 
 // Hook函数声明
@@ -102,4 +110,7 @@ namespace MemPool {
     size_t GetTotalSize();
     void PrintStats();
     bool IsFromPool(void* ptr);
+    void* AllocateSafe(size_t size);
+    void FreeSafe(void* ptr);
+    void* ReallocSafe(void* oldPtr, size_t newSize);
 }
