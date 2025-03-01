@@ -152,6 +152,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Base\fp_call.h" />
+    <ClInclude Include="Base\MemorySafety.h" />
     <ClInclude Include="Base\spdLogger.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
@@ -163,6 +164,7 @@
     <ClInclude Include="Storm\tlsf.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Base\MemroySafety.cpp" />
     <ClCompile Include="Base\spdLogger.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="pch.cpp">
