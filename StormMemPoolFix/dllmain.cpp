@@ -1,4 +1,10 @@
-﻿// dllmain.cpp : 定义 DLL 应用程序的入口点。
+﻿// StormBreaker
+// Author: Disaster (CallDisaster)
+// GitHub: https://github.com/CallDisaster/StormBreaker
+// License: MIT License
+// Date: 2025-03-02
+// Description: 延缓 Warcraft III 旧版本 Storm.dll 的虚拟内存增长过快的问题
+
 #include "pch.h"
 #include <windows.h>
 #include <iostream>
@@ -22,10 +28,6 @@ void CreateConsole()
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    //// 让 wcout 可以正确输出 Unicode
-    //_setmode(_fileno(stdout), _O_U16TEXT);
-    //_setmode(_fileno(stdin), _O_U16TEXT);
-    //_setmode(_fileno(stderr), _O_U16TEXT);
     std::cout << "Hello StormFix!" << std::endl;
 }
 
@@ -34,7 +36,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
-        std::cout << "Version:0.07" << std::endl; // 更新版本号
+        std::cout << "Version:1.0.0" << std::endl; // 更新版本号
 
         Sleep(500);
         // 初始化内存钩子
