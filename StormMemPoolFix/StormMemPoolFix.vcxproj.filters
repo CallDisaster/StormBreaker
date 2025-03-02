@@ -81,7 +81,7 @@
       <Filter>源文件\Storm</Filter>
     </ClCompile>
     <ClCompile Include="Base\MemroySafety.cpp">
-      <Filter>源文件</Filter>
+      <Filter>源文件\Base</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
