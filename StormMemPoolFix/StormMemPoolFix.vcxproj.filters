@@ -84,9 +84,4 @@
       <Filter>源文件\Base</Filter>
     </ClCompile>
   </ItemGroup>
-  <ItemGroup>
-    <None Include="README.md">
-      <Filter>源文件</Filter>
-    </None>
-  </ItemGroup>
 </Project>
