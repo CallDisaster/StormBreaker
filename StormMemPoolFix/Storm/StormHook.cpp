@@ -1,5 +1,4 @@
-﻿// StormHook.cpp 修复版
-
+﻿// StormHook.cpp
 #include "pch.h"
 #include "StormHook.h"
 #include "StormOffsets.h"
@@ -39,7 +38,7 @@ thread_local bool tls_inCleanAll = false;
 std::atomic<bool> g_insideUnsafePeriod{ false }; // 新增：标记不安全时期
 
 // 全局变量定义
-std::atomic<size_t> g_bigThreshold{ 512 * 1024 };      // 默认512KB为大块阈值
+std::atomic<size_t> g_bigThreshold{ 512 * 1024 };      // 默认512KB为大块阈值,若您要修改该数值最好不要低于128KB，256已经比较危险了。
 std::mutex g_bigBlocksMutex;
 std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
 MemoryStats g_memStats;
@@ -371,6 +370,7 @@ void* AllocateJassVMMemory(size_t size) {
 ///////////////////////////////////////////////////////////////////////////////
 
 // 主内存池大小: 64MB
+// 由于当前内存池安全性过高动态扩容有问题请您重新编译的时候针对自己地图调整内存池大小。
 constexpr size_t TLSF_MAIN_POOL_SIZE = 64 * 1024 * 1024;
 
 namespace MemPool {
