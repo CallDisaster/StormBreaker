@@ -45,20 +45,17 @@
     <ClInclude Include="Storm\StormHook.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
-    <ClInclude Include="Storm\StormMemoryInternal.h">
-      <Filter>头文件\Storm</Filter>
-    </ClInclude>
     <ClInclude Include="Base\fp_call.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
     <ClInclude Include="Storm\tlsf.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
-    <ClInclude Include="Base\MemorySafety.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
     <ClInclude Include="Base\Logger.h">
-      <Filter>头文件</Filter>
+      <Filter>头文件\Base</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\MemorySafety.h">
+      <Filter>头文件\Base</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -68,19 +65,13 @@
     <ClCompile Include="pch.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="Storm\StormMemoryHelpers.cpp">
-      <Filter>源文件\Storm</Filter>
-    </ClCompile>
     <ClCompile Include="Storm\StormOffsets.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
     <ClCompile Include="Storm\MemoryPool.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
-    <ClCompile Include="Storm\StormHeap.cpp">
-      <Filter>源文件\Storm</Filter>
-    </ClCompile>
-    <ClCompile Include="Storm\StormHeapReplacement.cpp">
+    <ClCompile Include="Storm\StormHeapHook.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
     <ClCompile Include="Storm\StormHook.cpp">

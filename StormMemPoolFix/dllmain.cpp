@@ -34,10 +34,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
-        std::cout << "Version:0.05" << std::endl; // 更新版本号
+        std::cout << "Version:0.07" << std::endl; // 更新版本号
 
         Sleep(500);
-
         // 初始化内存钩子
         if (InitializeStormMemoryHooks()) {
             std::cout << "StormMemPoolHook 初始化成功！" << std::endl;
@@ -47,6 +46,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         }
         else {
             std::cout << "StormMemPoolHook 初始化失败！" << std::endl;
+        }
+
+        // 初始化小块优化
+        if (HookAllStormHeapFunctions()) {
+            std::cout << "StormHeapHook 初始化成功！" << std::endl;
+        }
+        else {
+            std::cout << "StormHeapHook 初始化失败！" << std::endl;
         }
         break;
 

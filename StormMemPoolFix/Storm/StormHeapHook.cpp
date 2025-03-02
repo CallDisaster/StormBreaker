@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include "StormOffsets.h"  
 #include "StormHook.h"
+#include "MemoryPool.h"
 
 // 当块被 free 后, Storm 通常把头4字节改成 size(WORD) + AlignPadding(BYTE) + Flags(BYTE=2) + pNext
 #pragma pack(push,1)
@@ -190,6 +191,28 @@ unsigned __int16* __fastcall StormHeap_AllocPageHook(char* heapBase, unsigned in
 // ============== Hook: StormHeap_InternalFree ==============
 char __fastcall StormHeap_InternalFreeHook(DWORD* heap, unsigned __int16* blockHeader)
 {
+
+    // 获取原始用户指针和大小
+    void* userPtr = (void*)((char*)blockHeader + sizeof(StormAllocHeader));
+    size_t size = 0;
+
+    try {
+        // 尝试获取块大小
+        StormAllocHeader* hdr = reinterpret_cast<StormAllocHeader*>(blockHeader);
+        size = hdr->Size;
+
+        // 检查是否是我们管理的小块
+        if (size > 0 && SmallBlockPool::ShouldIntercept(size)) {
+            if (SmallBlockPool::Free(userPtr, size)) {
+                // 我们已处理，返回成功码
+                return 2;
+            }
+        }
+    }
+    catch (...) {
+        // 异常处理
+    }
+
     size_t usageBefore = StormFix_GetCurrentUsage();
     //printf("[InternalFree] Freeing block at %p\n", blockHeader);
 
@@ -264,12 +287,22 @@ char __fastcall StormHeap_InternalFreeHook(DWORD* heap, unsigned __int16* blockH
 // ============== Hook: StormHeap_Alloc (可选) ==============
 void* __fastcall StormHeap_AllocHook(DWORD* pHeap, int a2, int flags, size_t size)
 {
-    // 1) 调用原始
+    // 1) 检查是否是我们要拦截的小块大小
+    if (SmallBlockPool::ShouldIntercept(size)) {
+        void* ptr = SmallBlockPool::Allocate(size);
+        if (ptr) {
+            // 统计和记录
+            return ptr;
+        }
+        // 无可用块，继续Storm分配
+    }
+
+    // 2) 调用原始
     void* pUserPtr = s_origStormHeap_Alloc(pHeap, a2, flags, size);
     if (!pUserPtr)
         return nullptr;
 
-    // 2) 可能 Storm 又给你分配了某个“曾被 Decommit”的空闲块
+    // 3) 可能 Storm 又给你分配了某个“曾被 Decommit”的空闲块
     //    估计 pUserPtr = blockHeader + 12? (含StormAllocHeader)
     //    这里若你原先以 “blockPtr = pUserPtr - 4” 做记录，就保持一致:
     char* guessBlock = (char*)pUserPtr - 4;

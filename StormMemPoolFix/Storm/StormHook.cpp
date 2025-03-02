@@ -39,7 +39,7 @@ thread_local bool tls_inCleanAll = false;
 std::atomic<bool> g_insideUnsafePeriod{ false }; // 新增：标记不安全时期
 
 // 全局变量定义
-std::atomic<size_t> g_bigThreshold{ 512 * 1024 };      // 默认512KB为大块阈值
+std::atomic<size_t> g_bigThreshold{ 256 * 1024 };      // 默认256KB为大块阈值
 std::mutex g_bigBlocksMutex;
 std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
 MemoryStats g_memStats;
