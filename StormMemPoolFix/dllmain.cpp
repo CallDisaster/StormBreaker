@@ -36,14 +36,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         CreateConsole();
         std::cout << "Version:0.05" << std::endl; // 更新版本号
 
-        // 设置mimalloc选项
-        mi_option_set_enabled(mi_option_eager_commit, false);
-        mi_option_set_enabled(mi_option_arena_eager_commit, false);
-        mi_option_set_enabled(mi_option_allow_large_os_pages, false);
-        mi_option_set(mi_option_reserve_huge_os_pages, 0);
-        mi_collect(true);
-        mi_process_init();
-
         Sleep(500);
 
         // 初始化内存钩子
@@ -63,9 +55,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         break;
 
     case DLL_PROCESS_DETACH:
-        // 生成最终内存报告
-        GenerateMemoryReport(true);
-
         // 关闭钩子
         ShutdownStormMemoryHooks();
         break;

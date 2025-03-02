@@ -3,7 +3,7 @@
 #pragma once
 #include "pch.h"
 
-namespace MemPool {
+namespace JVM_MemPool {
     // 初始化内存池（可选，如果使用全局静态数组，不一定要这么做）
     void Initialize();
 
@@ -12,6 +12,9 @@ namespace MemPool {
 
     // 释放 Allocate 获得的指针
     void  Free(void* p);
+
+    // 重新分配内存块
+    void* Realloc(void* oldPtr, size_t newSize);
 
     // 判断是否来自本内存池
     bool  IsFromPool(void* p);

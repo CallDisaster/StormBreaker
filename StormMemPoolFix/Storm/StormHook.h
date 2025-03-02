@@ -43,6 +43,29 @@ struct BigBlockInfo {
     ResourceType type;  // 资源类型
 };
 
+// 缓存特殊大块的过滤条件（优化频繁分配的特定模式）
+struct SpecialBlockFilter {
+    size_t size;
+    const char* name;
+    int sourceLine;
+    bool useCustomPool;
+    bool forceSystemAlloc;  // 新增：强制使用系统分配
+
+    // 显式构造函数
+    SpecialBlockFilter(size_t s, const char* n, int sl, bool ucp, bool fsa)
+        : size(s), name(n), sourceLine(sl), useCustomPool(ucp) , forceSystemAlloc(fsa){
+    }
+};
+
+//namespace JassVMMemory {
+//    void Initialize();
+//    void* Allocate(size_t size, const char* source, int line);
+//    void Free(void* ptr);
+//    void* Realloc(void* ptr, size_t newSize);
+//    bool IsJassVMPtr(void* ptr);
+//    void Shutdown();
+//}
+
 // 内存统计结构
 struct MemoryStats {
     std::atomic<size_t> totalAllocated{ 0 };
@@ -116,6 +139,15 @@ namespace MemPool {
     void FreeSafe(void* ptr);
     void* ReallocSafe(void* oldPtr, size_t newSize);
 }
+
+// 定义临时稳定块结构
+struct TempStabilizerBlock {
+    void* ptr;
+    size_t size;
+    DWORD createTime;
+    int ttl;  // 生存周期，按 CleanAll 计数
+};
+
 
 void GenerateMemoryReport(bool forceWrite = false);
 size_t GetStormVirtualMemoryUsage();
