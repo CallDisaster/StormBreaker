@@ -28,23 +28,22 @@ void CreateConsole()
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    std::cout << "Hello StormFix!" << std::endl;
 }
 
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    int featureActivationCount = 0;
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
-        std::cout << "Version:1.0.0" << std::endl; // 更新版本号
+        std::cout << "Version: 1.0.0" << std::endl; // 更新版本号
 
-        Sleep(500);
         // 初始化内存钩子
         if (InitializeStormMemoryHooks()) {
             std::cout << "StormMemPoolHook 初始化成功！" << std::endl;
-
             // 打印初始内存报告到控制台
             PrintMemoryStatus();
+            featureActivationCount++;
         }
         else {
             std::cout << "StormMemPoolHook 初始化失败！" << std::endl;
@@ -53,9 +52,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         // 初始化小块优化
         if (HookAllStormHeapFunctions()) {
             std::cout << "StormHeapHook 初始化成功！" << std::endl;
+            featureActivationCount++;
         }
         else {
             std::cout << "StormHeapHook 初始化失败！" << std::endl;
+        }
+
+        // 根据 featureActivationCount 输出最终状态
+        if (featureActivationCount == 2) {
+            std::cout << "所有系统启动成功！" << std::endl;
+            std::cout << "Hello StormBreaker!" << std::endl;
+        }
+        else if (featureActivationCount == 1) {
+            std::cout << "部分功能未启动成功！" << std::endl;
+        }
+        else {
+            std::cout << "StormBreaker 注入失败！" << std::endl;
         }
         break;
 
