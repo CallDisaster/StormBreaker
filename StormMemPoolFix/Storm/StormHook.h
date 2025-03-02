@@ -108,6 +108,7 @@ extern DWORD g_cleanAllThreadId;
 
 // 函数声明
 bool InitializeStormMemoryHooks();
+bool HookAllStormHeapFunctions();
 void ShutdownStormMemoryHooks();
 void LogMessage(const char* format, ...);
 void SetupCompatibleHeader(void* userPtr, size_t size);

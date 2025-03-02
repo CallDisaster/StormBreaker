@@ -164,3 +164,75 @@ void Cleanup() {
 }
 
 } // namespace MemPool
+
+// ------- 小块内存池实现 -------
+namespace SmallBlockPool {
+    // 常见块大小定义
+    static const std::size_t kPoolSizes[] = { 16, 32, 64, 128, 256, 512, 1024, 2048 };
+
+    // 每个大小的池
+    struct Pool {
+        std::vector<void*> freeBlocks;
+        std::mutex mutex;
+        std::size_t blockSize;
+        std::size_t blockCount;
+    };
+
+    // 池映射
+    static std::unordered_map<std::size_t, Pool> pools;
+
+    // 判断是否要拦截处理的大小
+    bool ShouldIntercept(std::size_t size) {
+        for (auto poolSize : kPoolSizes) {
+            if (size == poolSize) return true;
+        }
+        return false;
+    }
+
+    // 初始化
+    void Initialize() {
+        for (auto size : kPoolSizes) {
+            Pool& pool = pools[size];
+            pool.blockSize = size;
+            pool.blockCount = 0;
+        }
+    }
+
+    // 申请内存
+    void* Allocate(std::size_t size) {
+        auto it = pools.find(size);
+        if (it == pools.end()) return nullptr;
+
+        Pool& pool = it->second;
+        std::lock_guard<std::mutex> lock(pool.mutex);
+
+        if (!pool.freeBlocks.empty()) {
+            void* ptr = pool.freeBlocks.back();
+            pool.freeBlocks.pop_back();
+            return ptr;
+        }
+
+        // 无可用块，从Storm分配
+        return nullptr;
+    }
+
+    // 释放内存
+    bool Free(void* ptr, std::size_t size) {
+        auto it = pools.find(size);
+        if (it == pools.end()) return false;
+
+        Pool& pool = it->second;
+        std::lock_guard<std::mutex> lock(pool.mutex);
+
+        // 保留一定数量的块以供复用，超过则真正释放
+        const std::size_t MAX_CACHED = 100; // 可根据大小调整
+
+        if (pool.freeBlocks.size() < MAX_CACHED) {
+            pool.freeBlocks.push_back(ptr);
+            return true;
+        }
+
+        // 超过缓存上限，让Storm处理
+        return false;
+    }
+}

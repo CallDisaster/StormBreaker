@@ -159,7 +159,6 @@
     <ClInclude Include="Storm\MemoryPool.h" />
     <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
-    <ClInclude Include="Storm\StormMemoryInternal.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
     <ClInclude Include="Storm\tlsf.h" />
   </ItemGroup>
@@ -173,10 +172,8 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Storm\MemoryPool.cpp" />
-    <ClCompile Include="Storm\StormHeap.cpp" />
-    <ClCompile Include="Storm\StormHeapReplacement.cpp" />
+    <ClCompile Include="Storm\StormHeapHook.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
-    <ClCompile Include="Storm\StormMemoryHelpers.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />
     <ClCompile Include="Storm\tlsf.c">
       <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Default</CompileAs>
