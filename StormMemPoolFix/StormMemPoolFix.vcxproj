@@ -112,7 +112,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>detours.lib;mimalloc.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>detours.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)$(TargetName).asi</OutputFile>
     </Link>
   </ItemDefinitionGroup>

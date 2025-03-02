@@ -16,8 +16,21 @@
 #include <algorithm>
 #include <Base/MemorySafety.h>
 #include "../Base/Logger.h"
+#include "MemoryPool.h"
 
 MemorySafety& g_MemSafety = MemorySafety::GetInstance();
+
+static std::vector<SpecialBlockFilter> g_specialFilters = {
+    // JassVM 相关分配，使用独立的低地址内存
+    { 0x28A8, "Instance.cpp", 0, true, true },  // JassVM 实例
+    //{ 0x64, "jass.cpp", 0, true, true },       // JassVM 栈帧
+    //{ 0, "jass", 0, true, true },              // 捕获所有包含 "jass" 的分配
+    //{ 0, "Instance", 0, true, true },          // 捕获所有包含 "Instance" 的分配
+
+    // 地形和模型可以使用 TLSF
+    { 0, "terrain", 0, true, false },
+    { 0, "model", 0, true, false },
+};
 
 // 额外状态变量
 std::atomic<bool> g_afterCleanAll{ false };
@@ -33,7 +46,7 @@ MemoryStats g_memStats;
 std::atomic<bool> g_cleanAllInProgress{ false };
 DWORD g_cleanAllThreadId = 0;
 static std::vector<void*> g_permanentBlocks; // 新增：永久保留块
-
+std::vector<TempStabilizerBlock> g_tempStabilizers;
 // Storm原始函数指针
 Storm_MemAlloc_t    s_origStormAlloc = nullptr;
 Storm_MemFree_t     s_origStormFree = nullptr;
@@ -43,23 +56,502 @@ StormHeap_CleanupAll_t s_origCleanupAll = nullptr;
 size_t g_freedByAllocHook = 0;
 size_t g_freedByFreeHook = 0;
 
-// 缓存特殊大块的过滤条件（优化频繁分配的特定模式）
-struct SpecialBlockFilter {
-    size_t size;
-    const char* name;
-    int sourceLine;
-    bool useCustomPool;
-};
-
-static std::vector<SpecialBlockFilter> g_specialFilters = {
-    // JassVM分配，使用自定义池管理
-    { 0x28A8, "Instance.cpp", 0, true },
-    // Storm附近Jass虚拟机相关分配，需要特殊处理
-    { 0x64, "jass.cpp", 0, true }
-};
-
 // 日志文件句柄
 static FILE* g_logFile = nullptr;
+
+//namespace JassVMMemory {
+//    // JassVM 内存块信息
+//    struct JassBlock {
+//        void* rawPtr;
+//        void* userPtr;
+//        size_t size;
+//        const char* source;
+//        int line;
+//        DWORD timestamp;
+//        bool isPermanent;
+//    };
+//
+//    // 全局变量
+//    std::mutex g_jassMemMutex;
+//    std::unordered_map<void*, JassBlock> g_jassBlocks;
+//    bool g_initialized = false;
+//    CRITICAL_SECTION g_jassCS;
+//    // 按大小缓存内存块
+//    std::unordered_map<size_t, std::vector<void*>> g_memoryCache;
+//
+//    // JassVM 内存范围控制 - 确保分配在低地址区域
+//    const uintptr_t JASS_MEM_MAX_ADDR = 0x50000000; // 1.25GB 限制
+//    HANDLE g_lowMemHeap = NULL;
+//
+//    void Initialize() {
+//        std::lock_guard<std::mutex> lock(g_jassMemMutex);
+//
+//        if (g_initialized) return;
+//
+//        InitializeCriticalSection(&g_jassCS);
+//
+//        // 为 JassVM 创建专用堆 - 在低位地址空间
+//        g_lowMemHeap = HeapCreate(0, 1024 * 1024 * 64, 0); // 64MB 初始，无上限
+//
+//        if (!g_lowMemHeap) {
+//            LogMessage("[JassVMMemory] 无法创建堆！");
+//            return;
+//        }
+//
+//        g_initialized = true;
+//        LogMessage("[JassVMMemory] 已初始化");
+//    }
+//
+//    void Shutdown() {
+//        std::lock_guard<std::mutex> lock(g_jassMemMutex);
+//
+//        if (!g_initialized) return;
+//
+//        DeleteCriticalSection(&g_jassCS);
+//
+//        // 释放所有 JassVM 内存块
+//        for (auto& pair : g_jassBlocks) {
+//            if (!pair.second.isPermanent) {
+//                HeapFree(g_lowMemHeap, 0, pair.second.rawPtr);
+//            }
+//        }
+//
+//        g_jassBlocks.clear();
+//
+//        // 销毁堆
+//        if (g_lowMemHeap) {
+//            HeapDestroy(g_lowMemHeap);
+//            g_lowMemHeap = NULL;
+//        }
+//
+//        g_initialized = false;
+//        LogMessage("[JassVMMemory] 已关闭");
+//    }
+//
+//    bool AlreadyAllocated(void* ptr) {
+//        EnterCriticalSection(&g_jassCS);
+//        bool result = g_jassBlocks.find(ptr) != g_jassBlocks.end();
+//        LeaveCriticalSection(&g_jassCS);
+//
+//        if (result) {
+//            LogMessage("[JassVMMemory] 警告: 地址 %p 已被分配", ptr);
+//        }
+//        return result;
+//    }
+//
+//    void CreatePermanentBlocks() {
+//        // 为常见的 JassVM 操作预留块
+//        static const struct {
+//            size_t size;
+//            const char* name;
+//        } jassVMBlocks[] = {
+//            {10408, "JassVM_Instance"},   // JassVM 主实例
+//            //{40960, "JassVM_Compile"},    // 编译缓冲区
+//            //{4612, "JassVM_HandleTable"}, // 句柄表
+//            //{40, "JassVM_Reference"},     // 引用
+//            //{16, "JassVM_String"},        // 字符串
+//            //{12, "JassVM_Frame"}          // 栈帧
+//        };
+//
+//        for (const auto& block : jassVMBlocks) {
+//            void* ptr = Allocate(block.size, block.name, 0);
+//            if (ptr) {
+//                // 标记为永久块
+//                EnterCriticalSection(&g_jassCS);
+//                auto it = g_jassBlocks.find(ptr);
+//                if (it != g_jassBlocks.end()) {
+//                    it->second.isPermanent = true;
+//                    LogMessage("[JassVMMemory] 创建永久块: %p (大小: %zu, 用途: %s)",
+//                        ptr, block.size, block.name);
+//                }
+//                LeaveCriticalSection(&g_jassCS);
+//            }
+//        }
+//    }
+//
+//    // 记录JassVM内存块信息
+//    void RecordJassBlock(void* rawPtr, void* userPtr, size_t size, const char* source, int line) {
+//        // 创建块信息
+//        JassBlock block;
+//        block.rawPtr = rawPtr;
+//        block.userPtr = userPtr;
+//        block.size = size;
+//        block.source = source ? _strdup(source) : _strdup("Unknown");
+//        block.line = line;
+//        block.timestamp = GetTickCount();
+//        block.isPermanent = false;
+//
+//        // 记录到JassVM块映射表
+//        g_jassBlocks[userPtr] = block;
+//
+//        // 也记录到全局块管理
+//        BigBlockInfo info;
+//        info.rawPtr = rawPtr;
+//        info.size = size;
+//        info.timestamp = GetTickCount();
+//        info.source = _strdup(source ? source : "JassVM");
+//        info.srcLine = line;
+//        info.type = ResourceType::JassVM;
+//
+//        {
+//            std::lock_guard<std::mutex> blockLock(g_bigBlocksMutex);
+//            g_bigBlocks[userPtr] = info;
+//        }
+//
+//        LogMessage("[JassVMMemory] 分配: %p (大小: %zu, 源: %s:%d)",
+//            userPtr, size, block.source, line);
+//    }
+//
+//    LPVOID ReserveMemoryLowRegion(size_t size) {
+//        // 从低地址开始尝试分配
+//        const DWORD_PTR START_ADDR = 0x20000000;  // 512MB 边界
+//        const DWORD_PTR END_ADDR = 0x40000000;    // 1GB 边界
+//        const DWORD_PTR STEP = 0x10000;          // 64KB 步进
+//
+//        for (DWORD_PTR addr = START_ADDR; addr < END_ADDR; addr += STEP) {
+//            // 尝试 MEM_RESERVE，后续再提交
+//            LPVOID result = VirtualAlloc((LPVOID)addr, size, MEM_RESERVE, PAGE_READWRITE);
+//            if (result) {
+//                // 提交实际内存
+//                if (VirtualAlloc(result, size, MEM_COMMIT, PAGE_READWRITE)) {
+//                    //LogMessage("[JassVMMemory] 在低地址成功分配: %p (大小: %zu)", result, size);
+//                    return result;
+//                }
+//
+//                // 如果无法提交，释放预留并继续尝试
+//                VirtualFree(result, 0, MEM_RELEASE);
+//            }
+//        }
+//
+//        // 如果低地址区域都失败，尝试常规分配
+//        LogMessage("[JassVMMemory] 警告: 无法在低地址区域分配，尝试常规分配");
+//        return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+//    }
+//
+//    // 更准确的JassVM识别函数
+//    bool IsJassVMAllocation(size_t size, const char* name, DWORD src_line) {
+//        if (!name) return false;
+//
+//        // 精确匹配 JassVM 源文件
+//        bool isJassSource = false;
+//
+//        // 如果不是 JassVM 源文件，但大小匹配关键值，进行额外检查
+//        if (!isJassSource) {
+//            // JassVM 主实例特定大小
+//            if (size == 10408 && strstr(name, "Instance.cpp")) {
+//                return true;
+//            }
+//
+//            //// JassVM 编译缓冲区特定大小
+//            //if (size == 40960 && strstr(name, "Compile.h")) {
+//            //    return true;
+//            //}
+//
+//            // 完全不匹配 - 不是 JassVM 内存
+//            return false;
+//        }
+//
+//        // 是 JassVM 源文件，可以接受
+//        return true;
+//    }
+//
+//    // 预分配一些常用大小的块
+//    void PreallocateCommonSizes() {
+//        // 只预分配真正的 JassVM 常用大小
+//        static const std::pair<size_t, int> jassVMSizes[] = {
+//            {10408, 2},  // JassVM 实例
+//            {40, 10},    // JassVM 引用
+//            {16, 10},    // JassVM 小字符串
+//            {12, 5},     // JassVM 栈帧
+//            {48, 2},     // JassVM 列表头
+//            {4612, 1},   // JassVM 句柄表
+//            {40960, 3}   // JassVM 编译缓冲区
+//        };
+//
+//        for (const auto& pair : jassVMSizes) {
+//            for (int i = 0; i < pair.second; i++) {
+//                void* mem = ReserveMemoryLowRegion(pair.first + sizeof(StormAllocHeader));
+//                if (mem) {
+//                    void* userPtr = static_cast<char*>(mem) + sizeof(StormAllocHeader);
+//                    SetupCompatibleHeader(userPtr, pair.first);
+//                    g_memoryCache[pair.first].push_back(userPtr);
+//
+//                    LogMessage("[JassVMMemory] 预分配: %p (大小: %zu, #%d)",
+//                        userPtr, pair.first, i + 1);
+//                }
+//            }
+//        }
+//    }
+//
+//    // 从缓存获取内存
+//    void* TryGetFromCache(size_t size) {
+//        auto it = g_memoryCache.find(size);
+//        if (it != g_memoryCache.end() && !it->second.empty()) {
+//            void* result = it->second.back();
+//            it->second.pop_back();
+//            return result;
+//        }
+//        return nullptr;
+//    }
+//
+//    // 返回内存到缓存
+//    bool ReturnToCache(void* ptr, size_t size) {
+//        // 限制每种大小的缓存数量
+//        const size_t MAX_CACHE_PER_SIZE = 20;
+//
+//        if (g_memoryCache[size].size() < MAX_CACHE_PER_SIZE) {
+//            g_memoryCache[size].push_back(ptr);
+//            return true;
+//        }
+//        return false;
+//    }
+//
+//    // 辅助函数 - 在纯 C 环境下处理异常
+//    void* AllocateWithSEH(void* rawPtr, size_t size, const char* source, int line) {
+//        __try {
+//            void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
+//            SetupCompatibleHeader(userPtr, size);
+//
+//            // 记录块信息（使用 C 风格分配，不创建 C++ 对象）
+//            JassBlock block;
+//            block.rawPtr = rawPtr;
+//            block.userPtr = userPtr;
+//            block.size = size;
+//            block.source = source ? _strdup(source) : _strdup("Unknown");
+//            block.line = line;
+//            block.timestamp = GetTickCount();
+//            block.isPermanent = false;
+//
+//            // 使用 C 风格操作
+//            EnterCriticalSection(&g_jassCS);
+//            g_jassBlocks[userPtr] = block;
+//            LeaveCriticalSection(&g_jassCS);
+//
+//            LogMessage("[JassVMMemory] 分配: %p (大小: %zu, 源: %s:%d)",
+//                userPtr, size, block.source, line);
+//
+//            return userPtr;
+//        }
+//        __except (EXCEPTION_EXECUTE_HANDLER) {
+//            LogMessage("[JassVMMemory] 分配异常: %zu 字节, 错误=0x%x",
+//                size, GetExceptionCode());
+//            return nullptr;
+//        }
+//    }
+//
+//    // 主分配函数 - 不含 __try/__except
+//    void* Allocate(size_t size, const char* source, int line) {
+//        static CRITICAL_SECTION cs;
+//        static bool initialized = false;
+//
+//        if (!initialized) {
+//            InitializeCriticalSection(&cs);
+//            initialized = true;
+//        }
+//
+//        EnterCriticalSection(&cs);
+//
+//        // 验证这确实是一个 JassVM 分配
+//        if (!IsJassVMAllocation(size, source, line)) {
+//            LeaveCriticalSection(&cs);
+//            return nullptr;
+//        }
+//
+//        // 尝试从缓存获取
+//        void* cached = TryGetFromCache(size);
+//        if (cached) {
+//            LeaveCriticalSection(&cs);
+//            return cached;
+//        }
+//
+//        // 在低地址区域分配内存
+//        void* rawPtr = ReserveMemoryLowRegion(size + sizeof(StormAllocHeader));
+//        if (!rawPtr) {
+//            LeaveCriticalSection(&cs);
+//            return nullptr;
+//        }
+//
+//        // 使用辅助函数进行异常处理部分
+//        void* userPtr = AllocateWithSEH(rawPtr, size, source, line);
+//
+//        // 也添加到全局块管理
+//        if (userPtr) {
+//            BigBlockInfo info;
+//            info.rawPtr = rawPtr;
+//            info.size = size;
+//            info.timestamp = GetTickCount();
+//            info.source = _strdup(source ? source : "JassVM");
+//            info.srcLine = line;
+//            info.type = ResourceType::JassVM;
+//
+//            std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+//            g_bigBlocks[userPtr] = info;
+//        }
+//
+//        LeaveCriticalSection(&cs);
+//        return userPtr;
+//    }
+//
+//    void Free(void* ptr) {
+//        if (!ptr) return;
+//
+//        EnterCriticalSection(&g_jassCS);
+//
+//        __try {
+//            auto it = g_jassBlocks.find(ptr);
+//            if (it == g_jassBlocks.end()) {
+//                LeaveCriticalSection(&g_jassCS);
+//                return;
+//            }
+//
+//            const JassBlock& block = it->second;
+//
+//            // 永久块不释放
+//            if (block.isPermanent) {
+//                LeaveCriticalSection(&g_jassCS);
+//                return;
+//            }
+//
+//            // 尝试缓存这个块
+//            if (ReturnToCache(ptr, block.size)) {
+//                // 块被缓存，不实际释放
+//                g_jassBlocks.erase(it);
+//                LeaveCriticalSection(&g_jassCS);
+//                return;
+//            }
+//
+//            // 不能缓存，实际释放
+//            if (block.source) free((void*)block.source);
+//            VirtualFree(block.rawPtr, 0, MEM_RELEASE);
+//            g_jassBlocks.erase(it);
+//        }
+//        __except (EXCEPTION_EXECUTE_HANDLER) {
+//            LogMessage("[JassVMMemory] 释放异常: %p, 错误=0x%x",
+//                ptr, GetExceptionCode());
+//        }
+//
+//        LeaveCriticalSection(&g_jassCS);
+//    }
+//
+//    void* Realloc(void* ptr, size_t newSize) {
+//        if (!g_initialized) {
+//            Initialize();
+//            if (!g_initialized) return nullptr;
+//        }
+//
+//        // 特殊情况处理
+//        if (!ptr) return Allocate(newSize, "JassVM_Realloc", 0);
+//        if (newSize == 0) {
+//            Free(ptr);
+//            return nullptr;
+//        }
+//
+//        std::lock_guard<std::mutex> lock(g_jassMemMutex);
+//
+//        // 检查是否是我们的块
+//        auto it = g_jassBlocks.find(ptr);
+//        if (it == g_jassBlocks.end()) {
+//            // 不是我们的块，创建新块
+//            return Allocate(newSize, "JassVM_Realloc", 0);
+//        }
+//
+//        const JassBlock& oldBlock = it->second;
+//        const char* source = oldBlock.source;
+//        int line = oldBlock.line;
+//
+//        // 如果是永久块，创建新块并复制数据
+//        if (oldBlock.isPermanent) {
+//            void* newPtr = Allocate(newSize, source, line);
+//            if (newPtr) {
+//                memcpy(newPtr, ptr, min(oldBlock.size, newSize));
+//            }
+//            return newPtr;
+//        }
+//
+//        // 重新分配
+//        void* newRawPtr = HeapReAlloc(g_lowMemHeap, 0, oldBlock.rawPtr, newSize + sizeof(StormAllocHeader));
+//
+//        if (!newRawPtr) {
+//            LogMessage("[JassVMMemory] 重分配失败: %p, 新大小=%zu", ptr, newSize);
+//            return nullptr;
+//        }
+//
+//        // 设置新块头
+//        void* newUserPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
+//        SetupCompatibleHeader(newUserPtr, newSize);
+//
+//        // 更新记录
+//        JassBlock newBlock = oldBlock;
+//        newBlock.rawPtr = newRawPtr;
+//        newBlock.userPtr = newUserPtr;
+//        newBlock.size = newSize;
+//
+//        // 如果指针变化，需要更新映射
+//        if (newUserPtr != ptr) {
+//            // 从主块管理中移除旧条目
+//            {
+//                std::lock_guard<std::mutex> blockLock(g_bigBlocksMutex);
+//                g_bigBlocks.erase(ptr);
+//            }
+//
+//            // 复制源字符串
+//            if (source && strcmp(source, "Unknown") != 0) {
+//                newBlock.source = _strdup(source);
+//                free((void*)oldBlock.source);
+//            }
+//
+//            g_jassBlocks.erase(it);
+//            g_jassBlocks[newUserPtr] = newBlock;
+//
+//            // 更新主块管理
+//            BigBlockInfo info;
+//            info.rawPtr = newRawPtr;
+//            info.size = newSize;
+//            info.timestamp = GetTickCount();
+//            info.source = _strdup("JassVM");
+//            info.srcLine = line;
+//            info.type = ResourceType::JassVM;
+//
+//            {
+//                std::lock_guard<std::mutex> blockLock(g_bigBlocksMutex);
+//                g_bigBlocks[newUserPtr] = info;
+//            }
+//        }
+//        else {
+//            // 指针未变，只更新大小
+//            g_jassBlocks[ptr] = newBlock;
+//
+//            // 更新主块管理
+//            auto it = g_bigBlocks.find(ptr);
+//            if (it != g_bigBlocks.end()) {
+//                it->second.size = newSize;
+//            }
+//        }
+//
+//        return newUserPtr;
+//    }
+//
+//    bool IsJassVMPtr(void* ptr) {
+//        if (!ptr || !g_initialized) return false;
+//
+//        std::lock_guard<std::mutex> lock(g_jassMemMutex);
+//        return g_jassBlocks.find(ptr) != g_jassBlocks.end();
+//    }
+//
+//    // 创建永久 JassVM 内存块
+//    void* CreatePermanentBlock(size_t size, const char* source) {
+//        void* ptr = Allocate(size, source, 0);
+//        if (ptr) {
+//            std::lock_guard<std::mutex> lock(g_jassMemMutex);
+//            auto it = g_jassBlocks.find(ptr);
+//            if (it != g_jassBlocks.end()) {
+//                it->second.isPermanent = true;
+//            }
+//        }
+//        return ptr;
+//    }
+//
+//}
 
 ///////////////////////////////////////////////////////////////////////////////
 // 辅助函数
@@ -338,12 +830,42 @@ bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line) {
     return false;
 }
 
+void* AllocateJassVMMemory(size_t size) {
+    // 使用 VirtualAlloc 直接分配而非 TLSF
+    void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    if (!rawPtr) {
+        LogMessage("[JassVM] 内存分配失败: %zu 字节", size);
+        return nullptr;
+    }
+
+    void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
+    SetupCompatibleHeader(userPtr, size);
+
+    LogMessage("[JassVM] 专用内存分配: %p (大小: %zu)", userPtr, size);
+
+    // 记录此块信息
+    BigBlockInfo info;
+    info.rawPtr = rawPtr;
+    info.size = size;
+    info.timestamp = GetTickCount();
+    info.source = _strdup("JassVM_专用内存");
+    info.srcLine = 0;
+    info.type = ResourceType::JassVM;
+
+    std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+    g_bigBlocks[userPtr] = info;
+
+    return userPtr;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // TLSF 内存池实现
 ///////////////////////////////////////////////////////////////////////////////
 
-// 主内存池大小: 128MB
-constexpr size_t TLSF_MAIN_POOL_SIZE = 128 * 1024 * 1024;
+// 主内存池大小: 64MB
+constexpr size_t TLSF_MAIN_POOL_SIZE = 64 * 1024 * 1024;
 
 namespace MemPool {
     // 内部变量
@@ -1012,23 +1534,35 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
 
 // 创建永久稳定块
 void CreatePermanentStabilizers(int count, const char* reason) {
+    // 针对Storm堆索引的科学分布
+    // 确保覆盖最常用的堆索引范围
     LogMessage("[稳定化] 创建%d个永久稳定块 (%s)", count, reason);
 
-    for (int i = 0; i < count; i++) {
-        // 使用不同大小，确保分散到不同堆
-        size_t blockSize = 16 + (i % 12) * 4; // 16, 20, 24, 28...
+    // 科学分布的大小 - 确保覆盖关键堆索引
+    // 黄金比例分布，每个块大小是前一个的约1.618倍
+    std::vector<size_t> sizes;
+    size_t size = 16;  // 起始大小
 
-        void* stabilizer = MemPool::CreateStabilizingBlock(blockSize, "永久稳定块");
-        if (stabilizer) {
-            if (i < 3) { // 减少日志输出
-                LogMessage("[稳定化] 永久稳定块#%d创建: %p (大小: %zu)",
-                    i + 1, stabilizer, blockSize);
-            }
-            g_permanentBlocks.push_back(stabilizer);
-        }
+    for (int i = 0; i < count; i++) {
+        sizes.push_back(size);
+        size = (size_t)(size * 1.618);  // 黄金比例
+        if (size > 4096) size = 16;     // 重置循环
     }
 
-    LogMessage("[稳定化] 永久稳定块创建完成");
+    // 确保有些特殊大小
+    if (count > 10) {
+        sizes[3] = 64;
+        sizes[7] = 128;
+    }
+
+    // 创建稳定块
+    for (size_t blockSize : sizes) {
+        void* stabilizer = MemPool::CreateStabilizingBlock(blockSize, "永久稳定块");
+        if (stabilizer) {
+            g_permanentBlocks.push_back(stabilizer);
+            LogMessage("[稳定化] 永久块: %p (大小: %zu)", stabilizer, blockSize);
+        }
+    }
 }
 
 void Hooked_StormHeap_CleanupAll() {
@@ -1090,87 +1624,148 @@ void Hooked_StormHeap_CleanupAll() {
     g_MemSafety.ProcessDeferredFreeQueue();
 }
 
-// 创建稳定化块逻辑
+// 创建稳定化块的改进函数
 void CreateStabilizingBlocks(int cleanAllCount) {
     static int lastCleanAllCount = 0;
 
-    // 跟踪CleanAll调用计数变化
-    if (cleanAllCount != lastCleanAllCount) {
-        lastCleanAllCount = cleanAllCount;
+    // 仅每 20 次 CleanAll 执行一次
+    if (cleanAllCount - lastCleanAllCount < 20) {
+        return;
+    }
 
-        int numStabilizers = 5;  // 默认稳定化块数量
+    lastCleanAllCount = cleanAllCount;
 
-        // 如果连续多次CleanAll，可能需要更多稳定化块
-        if (cleanAllCount > 10) numStabilizers = 8;
+    // 清理过期的临时块
+    auto it = g_tempStabilizers.begin();
+    while (it != g_tempStabilizers.end()) {
+        it->ttl--;
+        if (it->ttl <= 0) {
+            // 释放块
+            MemPool::FreeSafe(it->ptr);
 
-        LogMessage("[StabilizerBlocks] 创建%d个稳定化块 (第%d次CleanAll)",
-            numStabilizers, cleanAllCount);
+            // 从大块管理中移除
+            {
+                std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+                g_bigBlocks.erase(it->ptr);
+            }
 
-        // 分配不同大小的块，覆盖更多堆
-        for (int i = 0; i < numStabilizers; i++) {
-            // 使用不同的大小，让它们分散到更多堆
-            size_t blockSize = 16 + (i * 4); // 16, 20, 24, 28...
-            void* stabilizer = MemPool::CreateStabilizingBlock(blockSize, "临时稳定块");
+            // 从列表移除
+            it = g_tempStabilizers.erase(it);
+            LogMessage("[StabilizerBlocks] 释放过期临时块，剩余%zu个",
+                g_tempStabilizers.size());
+        }
+        else {
+            ++it;
+        }
+    }
 
-            if (stabilizer) {
-                // 减少日志刷屏
-                if (i < 3) {
-                    LogMessage("[StabilizerBlock] 分配稳定块: %p (大小: %zu)", stabilizer, blockSize);
-                }
+    // 如果已有足够的临时块，不再创建
+    if (g_tempStabilizers.size() >= 5) {
+        return;
+    }
 
-                // 记录到大块管理中
-                BigBlockInfo info;
-                info.rawPtr = static_cast<char*>(stabilizer) - sizeof(StormAllocHeader);
-                info.size = blockSize;
-                info.timestamp = GetTickCount();
-                info.source = _strdup("临时稳定块");
-                info.srcLine = 0;
-                info.type = ResourceType::Unknown;
+    // 只创建几个块
+    int numBlocks = 2;
 
-                {
-                    std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
-                    g_bigBlocks[stabilizer] = info;
-                }
+    LogMessage("[StabilizerBlocks] 创建%d个临时稳定块 (第%d次CleanAll)",
+        numBlocks, cleanAllCount);
+
+    for (int i = 0; i < numBlocks; i++) {
+        // 使用更大间隔的块大小
+        size_t blockSize = 16 * (1 << i);  // 16, 32, 64...
+        void* stabilizer = MemPool::CreateStabilizingBlock(blockSize, "临时稳定块");
+
+        if (stabilizer) {
+            LogMessage("[StabilizerBlock] 分配稳定块: %p (大小: %zu)",
+                stabilizer, blockSize);
+
+            // 添加到临时块列表
+            TempStabilizerBlock block;
+            block.ptr = stabilizer;
+            block.size = blockSize;
+            block.createTime = GetTickCount();
+            block.ttl = 10;  // 10次 CleanAll 生命周期
+
+            g_tempStabilizers.push_back(block);
+
+            // 记录到大块管理
+            BigBlockInfo info;
+            info.rawPtr = static_cast<char*>(stabilizer) - sizeof(StormAllocHeader);
+            info.size = blockSize;
+            info.timestamp = GetTickCount();
+            info.source = _strdup("临时稳定块");
+            info.srcLine = 0;
+            info.type = ResourceType::Unknown;
+
+            {
+                std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+                g_bigBlocks[stabilizer] = info;
             }
         }
-
-        LogMessage("[StabilizerBlocks] 稳定化块创建完成");
     }
+
+    LogMessage("[StabilizerBlocks] 稳定化块创建完成");
 }
 
+void ManageTempStabilizers(int currentCleanCount) {
+    // 移除过期的临时块
+    auto it = g_tempStabilizers.begin();
+    while (it != g_tempStabilizers.end()) {
+        it->ttl--;
+        if (it->ttl <= 0) {
+            // 释放此块
+            MemPool::FreeSafe(it->ptr);
+
+            // 从大块管理中移除
+            {
+                std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+                g_bigBlocks.erase(it->ptr);
+            }
+
+            // 从列表移除
+            it = g_tempStabilizers.erase(it);
+            LogMessage("[StabilizerBlocks] 释放过期临时块，剩余%zu个",
+                g_tempStabilizers.size());
+        }
+        else {
+            ++it;
+        }
+    }
+}
 // Hook: SMemAlloc - 处理大块分配
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag) {
-    // 检查是否在CleanAll后的第一次分配
+    // 检查是否在 CleanAll 后的第一次分配
     bool isAfterCleanAll = g_afterCleanAll.exchange(false);
-
-    // CleanAll后的关键分配，需要特殊处理
     if (isAfterCleanAll) {
         static int cleanAllCounter = 0;
         cleanAllCounter++;
-
-        // 稳定化块创建
         CreateStabilizingBlocks(cleanAllCounter);
     }
 
-    // 在CleanAll过程中，要特别小心
-    if (g_cleanAllInProgress && GetCurrentThreadId() == g_cleanAllThreadId) {
-        // 对于在CleanAll过程中的分配，直接使用原始分配
-        return s_origStormAlloc(ecx, edx, size, name, src_line, flag);
+    // 检查是否为 JassVM 相关分配 - 使用严格的识别
+    bool isJassVM = false;
+
+    if (name) {
+        if (size == 10408 && strstr(name, "Instance.cpp")) {
+            void* jassPtr = JVM_MemPool::Allocate(size);
+            if (jassPtr) {
+                g_memStats.OnAlloc(size);
+                return reinterpret_cast<size_t>(jassPtr);
+            }
+            // 分配失败回退到 Storm
+            LogMessage("[JassVM] 分配失败，回退到 Storm: %zu 字节", size);
+        }
     }
-
-    // 检查特殊分配模式
-    bool isSpecial = IsSpecialBlockAllocation(size, name, src_line);
-
-    // 分配策略：特殊块或大块使用TLSF，小块使用Storm
-    bool useTLSF = isSpecial || (size >= g_bigThreshold.load());
+    // 分配策略：大块使用 TLSF，小块使用 Storm
+    bool useTLSF = (size >= g_bigThreshold.load());
 
     if (useTLSF) {
-        // 使用TLSF分配
+        // 使用 TLSF 分配
         size_t totalSize = size + sizeof(StormAllocHeader);
         void* rawPtr = MemPool::AllocateSafe(totalSize);
 
         if (!rawPtr) {
-            LogMessage("[Alloc] TLSF分配失败: %zu字节, 回退到Storm", size);
+            LogMessage("[Alloc] TLSF 分配失败: %zu 字节, 回退到 Storm", size);
             return s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         }
 
@@ -1178,7 +1773,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
         SetupCompatibleHeader(userPtr, size);
 
-        // 注册到内存安全系统 - 新增
+        // 注册到内存安全系统
         g_MemSafety.RegisterMemoryBlock(rawPtr, userPtr, size, name, src_line);
 
         // 记录此块信息
@@ -1199,7 +1794,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         return reinterpret_cast<size_t>(userPtr);
     }
     else {
-        // 小块使用Storm原始分配
+        // 小块使用 Storm 原始分配
         size_t ret = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         if (ret) {
             g_memStats.OnAlloc(size);
@@ -1213,6 +1808,14 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     if (!a1) return 1;  // 空指针认为成功
 
     void* ptr = reinterpret_cast<void*>(a1);
+
+    // 先检查是否为 JVM_MemPool 指针
+    if (JVM_MemPool::IsFromPool(ptr)) {
+        // 使用 JVM_MemPool 专用释放
+        JVM_MemPool::Free(ptr);
+        return 1;
+    }
+
     bool ourBlock = false;
     bool permanentBlock = false;
 
@@ -1233,75 +1836,63 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
         return s_origStormFree(a1, name, argList, a4);
     }
 
-    // 在不安全期间的处理
-    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-        if (ourBlock) {
-            // 完全跳过释放，只记录延迟释放请求
-            __try {
-                g_MemSafety.EnqueueDeferredFree(ptr, 0);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                LogMessage("[Free] 延迟释放失败: %p", ptr);
-            }
-            return 1;
-        }
-        // 其他情况走原始路径
-        return s_origStormFree(a1, name, argList, a4);
-    }
-
     // 常规释放流程
     if (ourBlock) {
         __try {
-            BigBlockInfo blockInfo = {};
-            bool blockFound = false;
+            // 使用专用安全区域包装释放流程
+            CRITICAL_SECTION safeCS;
+            __try {
+                InitializeCriticalSection(&safeCS);
+                EnterCriticalSection(&safeCS);
 
-            // 使用原始同步
-            CRITICAL_SECTION tempCS;
-            InitializeCriticalSection(&tempCS);
-            EnterCriticalSection(&tempCS);
+                // 获取块信息
+                bool blockFound = false;
+                BigBlockInfo blockInfo = {};
 
-            auto it = g_bigBlocks.find(ptr);
-            if (it != g_bigBlocks.end()) {
-                blockInfo = it->second;
-                g_bigBlocks.erase(it);
-                blockFound = true;
-            }
-
-            LeaveCriticalSection(&tempCS);
-            DeleteCriticalSection(&tempCS);
-
-            if (blockFound) {
-                g_memStats.OnFree(blockInfo.size);
-
-                // 安全取消注册
-                g_MemSafety.TryUnregisterBlock(ptr);
-
-                // 释放名称字符串
-                if (blockInfo.source) {
-                    free((void*)blockInfo.source);
+                auto it = g_bigBlocks.find(ptr);
+                if (it != g_bigBlocks.end()) {
+                    blockInfo = it->second;
+                    g_bigBlocks.erase(it);
+                    blockFound = true;
                 }
 
-                // 释放实际内存
-                MemPool::FreeSafe(blockInfo.rawPtr);
-                g_freedByFreeHook++;
-            }
-            else {
-                LogMessage("[Free] 未找到注册的块: %p", ptr);
+                LeaveCriticalSection(&safeCS);
 
-                // 尝试释放原始内存
-                void* rawPtr = static_cast<char*>(ptr) - sizeof(StormAllocHeader);
-                MemPool::FreeSafe(rawPtr);
-                g_freedByFreeHook++;
+                if (blockFound) {
+                    g_memStats.OnFree(blockInfo.size);
+
+                    // 安全取消注册
+                    g_MemSafety.TryUnregisterBlock(ptr);
+
+                    // 释放名称字符串
+                    if (blockInfo.source) {
+                        free((void*)blockInfo.source);
+                    }
+
+                    // 释放实际内存
+                    MemPool::FreeSafe(blockInfo.rawPtr);
+                    g_freedByFreeHook++;
+                }
+                else {
+                    LogMessage("[Free] 未找到注册的块: %p", ptr);
+
+                    // 尝试释放原始内存
+                    void* rawPtr = static_cast<char*>(ptr) - sizeof(StormAllocHeader);
+                    MemPool::FreeSafe(rawPtr);
+                    g_freedByFreeHook++;
+                }
+            }
+            __finally {
+                DeleteCriticalSection(&safeCS);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            LogMessage("[Free] 释放过程异常: %p, 错误=0x%x",
-                ptr, GetExceptionCode());
+            LogMessage("[Free] 释放过程异常: %p, 错误=0x%x", ptr, GetExceptionCode());
         }
         return 1;
     }
     else {
-        // 不是我们的块，使用Storm释放
+        // 不是我们的块，使用 Storm 释放
         return s_origStormFree(a1, name, argList, a4);
     }
 }
@@ -1320,7 +1911,13 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         return nullptr;
     }
 
-    // 2. 永久块特殊处理
+    // 2. 检查是否是 JVM_MemPool 内存
+    if (JVM_MemPool::IsFromPool(oldPtr)) {
+        // 使用 JVM_MemPool 专用重分配
+        return JVM_MemPool::Realloc(oldPtr, newSize);
+    }
+
+    // 3. 永久块特殊处理
     if (IsPermanentBlock(oldPtr)) {
         LogMessage("[Realloc] 检测到永久块重分配: %p, 新大小=%zu", oldPtr, newSize);
         void* newPtr = reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
@@ -1640,11 +2237,14 @@ bool InitializeStormMemoryHooks() {
         return false;
     }
 
+    // 初始化 JassVM 内存管理
+    JVM_MemPool::Initialize();
+
     // 初始化TLSF内存池
     MemPool::Initialize(TLSF_MAIN_POOL_SIZE);
 
-    // 先创建一些永久稳定块，防止首次CleanAll引发问题
-    CreatePermanentStabilizers(10, "初始化保护");
+    // 创建永久稳定块，使用更广泛的大小分布
+    CreatePermanentStabilizers(25, "全周期保护");
 
     // 安装钩子
     DetourTransactionBegin();
@@ -1725,6 +2325,9 @@ void ShutdownStormMemoryHooks() {
 
     // 清理TLSF内存池
     MemPool::Shutdown();
+
+    // 关闭 JassVM 内存管理
+    JVM_MemPool::Cleanup();
 
     // 关闭日志系统
     LogSystem::GetInstance().Shutdown();

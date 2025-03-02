@@ -51,11 +51,14 @@
     <ClInclude Include="Base\fp_call.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
-    <ClInclude Include="Base\spdLogger.h">
-      <Filter>头文件\Base</Filter>
-    </ClInclude>
     <ClInclude Include="Storm\tlsf.h">
       <Filter>头文件\Storm</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\MemorySafety.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\Logger.h">
+      <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -83,11 +86,11 @@
     <ClCompile Include="Storm\StormHook.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
-    <ClCompile Include="Base\spdLogger.cpp">
-      <Filter>源文件\Base</Filter>
-    </ClCompile>
     <ClCompile Include="Storm\tlsf.c">
       <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\MemroySafety.cpp">
+      <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
