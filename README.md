@@ -136,3 +136,5 @@ QQ:1594199381
 感谢TLSF算法的原创者Matthew Conte，提供了高效的内存分配算法。
 
 感谢Detours库的开发团队，使得函数钩子变得更加简单可靠。
+
+最后感谢跟我一路过来的Claude、ChatGPT、DeepSeek帮我一起啃那不是人看的反汇编。
