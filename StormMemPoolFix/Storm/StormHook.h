@@ -118,6 +118,7 @@ void CreateStabilizingBlocks(int cleanAllCount);
 bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);
 bool IsPermanentBlock(void* ptr);
 ResourceType GetResourceType(const char* name);
+bool AddExtraPool(size_t size, bool callerHasLock = false);
 
 // Hook函数声明
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);
