@@ -37,9 +37,13 @@ std::atomic<bool> g_afterCleanAll{ false };
 std::atomic<DWORD> g_lastCleanAllTime{ 0 };
 thread_local bool tls_inCleanAll = false;
 std::atomic<bool> g_insideUnsafePeriod{ false }; // 新增：标记不安全时期
+std::atomic<bool> g_shouldExit{ false };
+std::atomic<bool> g_disableActualFree{ false };
+static std::atomic<bool> g_disableMemoryReleasing{ false };
+HANDLE g_statsThreadHandle = NULL;
 
 // 全局变量定义
-std::atomic<size_t> g_bigThreshold{ 512 * 1024 };      // 默认512KB为大块阈值
+std::atomic<size_t> g_bigThreshold{ 128 * 1024 };      // 默认512KB为大块阈值
 std::mutex g_bigBlocksMutex;
 std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
 MemoryStats g_memStats;
@@ -424,22 +428,39 @@ namespace MemPool {
         LogMessage("[MemPool] 已初始化，大小: %zu 字节，地址: %p", initialSize, g_mainPool);
     }
 
+    // 在MemPool命名空间中添加此函数
+    void DisableActualFree() {
+        std::lock_guard<std::mutex> lock(g_poolMutex);
+        g_disableActualFree = true;
+        LogMessage("[MemPool] 已禁用实际内存释放");
+    }
+
+    // 设置内存不释放标志的函数
+    void DisableMemoryReleasing() {
+        g_disableMemoryReleasing.store(true);
+        LogMessage("[MemPool] 已禁用内存释放，所有内存将保留到进程结束");
+    }
+
     // 清理资源
     void Shutdown() {
-        if (g_inTLSFOperation.exchange(true)) {
-            LogMessage("[MemPool] 关闭期间TLSF操作正在进行，跳过");
-            g_inTLSFOperation = false;
+        std::lock_guard<std::mutex> lock(g_poolMutex);
+
+        // 仅清理数据结构引用，不释放实际内存
+        if (g_disableMemoryReleasing.load()) {
+            LogMessage("[MemPool] 保留所有内存块，仅清理管理数据");
+
+            // 仅清理引用，不释放内存
+            g_tlsf = nullptr;
+            g_extraPools.clear();
+            g_mainPool = nullptr;
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
-
+        // 原有释放逻辑（只在未禁用时执行）
         if (g_tlsf) {
-            // TLSF本身不需要特别的销毁步骤
             g_tlsf = nullptr;
         }
 
-        // 释放所有额外池
         for (const auto& pool : g_extraPools) {
             if (pool.memory) {
                 VirtualFree(pool.memory, 0, MEM_RELEASE);
@@ -447,14 +468,12 @@ namespace MemPool {
         }
         g_extraPools.clear();
 
-        // 释放主池
         if (g_mainPool) {
             VirtualFree(g_mainPool, 0, MEM_RELEASE);
             g_mainPool = nullptr;
         }
 
-        g_inTLSFOperation = false;
-        LogMessage("[MemPool] 关闭完成");
+        LogMessage("[MemPool] 关闭并释放内存完成");
     }
 
     // 添加额外内存池
@@ -975,7 +994,7 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
     DWORD lastStatsTime = GetTickCount();
     DWORD lastReportTime = GetTickCount();
 
-    while (true) {
+    while (!g_shouldExit.load()) {
         Sleep(5000);  // 每5秒检查一次
 
         DWORD currentTime = GetTickCount();
@@ -1807,56 +1826,151 @@ bool InitializeStormMemoryHooks() {
     return true;
 }
 
-// 修改 ShutdownStormMemoryHooks 函数，关闭日志系统
-void ShutdownStormMemoryHooks() {
-    LogMessage("[关闭] 正在移除Storm内存钩子...");
+void TransferMemoryOwnership() {
+    LogMessage("[关闭] 转移内存管理权限...");
 
-    // 最后的内存报告
-    GenerateMemoryReport(true);
+    // 锁住统计数据，防止在转移过程中修改
+    std::lock_guard<std::mutex> blockLock(g_bigBlocksMutex);
 
-    // 关闭内存安全系统
-    g_MemSafety.Shutdown();
+    // 所有当前由TLSF管理的块都"放弃"而非释放
+    // 只记录日志用于调试，但不实际释放
+    LogMessage("[关闭] 放弃管理%zu个TLSF块的所有权", g_bigBlocks.size());
 
-    // 标记进入不安全期，防止后续内存操作
-    g_insideUnsafePeriod.store(true);
+    for (auto& entry : g_bigBlocks) {
+        if (entry.second.source) {
+            // 只释放源信息字符串，不释放实际内存块
+            free((void*)entry.second.source);
+        }
+    }
 
-    // 等待任何进行中的内存操作完成
-    Sleep(100);
+    g_bigBlocks.clear();
 
-    // 卸载钩子
+    // 禁止TLSF中的实际内存释放操作
+    LogMessage("[关闭] 禁用TLSF内存池释放...");
+    // 向TLSF传递一个全局标志，阻止实际的VirtualFree调用
+    MemPool::DisableActualFree();
+}
+
+void StopAllWorkThreads() {
+    LogMessage("[关闭] 停止所有工作线程...");
+
+    // 设置一个全局退出标志
+    g_shouldExit.store(true);
+
+    // 确保统计线程退出
+    if (g_statsThreadHandle) {
+        // 等待线程自然结束
+        WaitForSingleObject(g_statsThreadHandle, 1000);
+
+        // 如果超时，强制结束线程
+        if (WaitForSingleObject(g_statsThreadHandle, 0) != WAIT_OBJECT_0) {
+            LogMessage("[关闭] 统计线程未能自然结束，强制终止");
+            TerminateThread(g_statsThreadHandle, 0);
+        }
+
+        CloseHandle(g_statsThreadHandle);
+        g_statsThreadHandle = NULL;
+    }
+
+    // 等待所有进行中的内存操作完成
+    LogMessage("[关闭] 等待进行中的关键操作完成...");
+    int checkCount = 0;
+    while ((MemPool::g_inTLSFOperation.load() || g_cleanAllInProgress.load()) && checkCount < 10) {
+        Sleep(100);
+        checkCount++;
+    }
+
+    LogMessage("[关闭] 所有工作线程已停止");
+}
+
+void SafelyDetachHooks() {
+    LogMessage("[关闭] 安全卸载钩子...");
+
+    // 确保不在关键操作中
+    if (g_cleanAllInProgress.load()) {
+        LogMessage("[关闭] 等待CleanAll完成...");
+        // 等待直到CleanAll完成
+        int waitAttempts = 0;
+        while (g_cleanAllInProgress.load() && waitAttempts < 10) {
+            Sleep(100);
+            waitAttempts++;
+        }
+    }
+
+    // 开始钩子卸载事务
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
-    if (s_origStormAlloc) DetourDetach(&(PVOID&)s_origStormAlloc, Hooked_Storm_MemAlloc);
-    if (s_origStormFree) DetourDetach(&(PVOID&)s_origStormFree, Hooked_Storm_MemFree);
-    if (s_origStormReAlloc) DetourDetach(&(PVOID&)s_origStormReAlloc, Hooked_Storm_MemReAlloc);
-    if (s_origCleanupAll) DetourDetach(&(PVOID&)s_origCleanupAll, Hooked_StormHeap_CleanupAll);
-
-    DetourTransactionCommit();
-
-    // 释放所有永久块的引用（但不实际释放内存）
-    g_permanentBlocks.clear();
-
-    // 释放所有大块
-    {
-        std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
-        LogMessage("[关闭] 释放%zu个追踪块", g_bigBlocks.size());
-
-        for (auto& entry : g_bigBlocks) {
-            if (entry.second.source) free((void*)entry.second.source);
-        }
-
-        g_bigBlocks.clear();
+    // 按特定顺序卸载钩子 - 先卸载不太活跃的钩子
+    if (s_origCleanupAll) {
+        LogMessage("[关闭] 卸载CleanupAll钩子");
+        DetourDetach(&(PVOID&)s_origCleanupAll, Hooked_StormHeap_CleanupAll);
     }
 
-    // 清理TLSF内存池
-    MemPool::Shutdown();
+    // 等待100毫秒，确保没有正在进行的清理操作
+    Sleep(100);
 
-    // 关闭 JassVM 内存管理
+    // 然后卸载核心内存操作钩子
+    if (s_origStormReAlloc) {
+        LogMessage("[关闭] 卸载ReAlloc钩子");
+        DetourDetach(&(PVOID&)s_origStormReAlloc, Hooked_Storm_MemReAlloc);
+    }
+
+    if (s_origStormFree) {
+        LogMessage("[关闭] 卸载Free钩子");
+        DetourDetach(&(PVOID&)s_origStormFree, Hooked_Storm_MemFree);
+    }
+
+    if (s_origStormAlloc) {
+        LogMessage("[关闭] 卸载Alloc钩子");
+        DetourDetach(&(PVOID&)s_origStormAlloc, Hooked_Storm_MemAlloc);
+    }
+
+    // 提交事务
+    LONG result = DetourTransactionCommit();
+    LogMessage("[关闭] 钩子卸载%s", (result == NO_ERROR ? "成功" : "失败"));
+}
+
+// 修改 ShutdownStormMemoryHooks 函数，关闭日志系统
+void ShutdownStormMemoryHooks() {
+    LogMessage("[关闭] 开始优雅退出程序...");
+
+    // 1. 标记不安全期开始——必须最先执行
+    g_insideUnsafePeriod.store(true);
+
+    // 2. 最后的内存报告
+    GenerateMemoryReport(true);
+
+    // 3. 等待任何进行中的内存操作完成
+    LogMessage("[关闭] 等待进行中的内存操作完成...");
+    Sleep(500);
+
+    // 4. 停止统计线程和其他工作线程
+    StopAllWorkThreads();  // 需要实现
+
+    // 5. 处理内存归属转移
+    TransferMemoryOwnership();
+
+    // 6. 关闭内存安全系统
+    LogMessage("[关闭] 关闭内存安全系统...");
+    g_MemSafety.Shutdown();
+
+    // 7. 安全卸载钩子
+    SafelyDetachHooks();
+
+    // 8. 释放永久块引用但不实际释放内存
+    LogMessage("[关闭] 释放永久块引用...");
+    g_permanentBlocks.clear();
+
+    // 9. 清理JassVM内存池 - 同样禁用实际释放
+    LogMessage("[关闭] 关闭JassVM内存管理...");
     JVM_MemPool::Cleanup();
 
-    // 关闭日志系统
-    LogSystem::GetInstance().Shutdown();
+    // 10. 清理TLSF内存池 - 上面已经禁用了实际释放
+    LogMessage("[关闭] 关闭TLSF内存池...");
+    MemPool::Shutdown();
 
-    LogMessage("[关闭] Storm内存钩子已移除");
+    // 11. 关闭日志系统
+    LogMessage("[关闭] 关闭完成，正在关闭日志系统");
+    LogSystem::GetInstance().Shutdown();
 }

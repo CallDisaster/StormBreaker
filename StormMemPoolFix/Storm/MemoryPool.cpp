@@ -9,6 +9,7 @@
 #include <dbghelp.h>
 #include <iostream>
 #include <spdlog/spdlog.h>
+#include "StormHook.h"
 
 
 #pragma comment(lib, "dbghelp.lib")
@@ -89,6 +90,8 @@ void* Allocate(std::size_t size) {
     // 也可以自行扩容或其他策略
     return nullptr;
 }
+
+
 
 void Free(void* p) {
     if (!p) return;

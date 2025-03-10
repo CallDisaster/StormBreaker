@@ -105,6 +105,7 @@ extern std::atomic<DWORD> g_lastCleanAllTime;
 extern thread_local bool tls_inCleanAll;
 extern std::atomic<bool> g_insideUnsafePeriod; // 新增：标记不安全时期
 extern DWORD g_cleanAllThreadId;
+extern std::atomic<bool> g_disableMemoryReleasing;
 
 // 函数声明
 bool InitializeStormMemoryHooks();
