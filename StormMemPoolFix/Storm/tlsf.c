@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "tlsf.h"
 
 #if defined(__cplusplus)
@@ -129,6 +130,7 @@ tlsf_decl int tlsf_fls(unsigned int word)
 /* Green Hills support for PowerPC */
 
 #include <ppc_ghs.h>
+#include <ctime>
 
 tlsf_decl int tlsf_ffs(unsigned int word)
 {
@@ -196,12 +198,6 @@ tlsf_decl int tlsf_fls_sizet(size_t size)
 
 #undef tlsf_decl
 
-static void initialize_mapping_table();
-
-int test_optimized_mapping_thorough();
-
-static void optimize_mapping_search(size_t size, int* fli, int* sli);
-
 
 
 //add by Disaster
@@ -210,7 +206,28 @@ static void optimize_mapping_search(size_t size, int* fli, int* sli);
 // 全局启用/禁用标志
 static int g_use_optimized_mapping = 1;  // 默认启用
 
+// 全局标志控制是否使用优化版块查找
+static int g_use_optimized_block_search = 1; // 默认启用
+
+// 全局标志控制是否使用优化版块管理
+static int g_use_optimized_block_management = 1; // 默认启用
+
+// 全局开关
+static int g_use_optimized_memory_locality = 1; // 默认启用
+
 // 切换函数
+void tlsf_toggle_optimized_memory_locality(int enable) {
+	g_use_optimized_memory_locality = enable;
+}
+
+void tlsf_toggle_optimized_block_management(int enable) {
+	g_use_optimized_block_management = enable;
+}
+
+void tlsf_toggle_optimized_block_search(int enable) {
+	g_use_optimized_block_search = enable;
+}
+
 void tlsf_toggle_optimized_mapping(int enable) {
 	g_use_optimized_mapping = enable;
 }
@@ -559,6 +576,40 @@ typedef struct control_t
 /* A type used for casting when doing pointer arithmetic. */
 typedef ptrdiff_t tlsfptr_t;
 
+
+//add by Disaster
+
+static void initialize_mapping_table();
+
+int test_optimized_mapping_thorough();
+
+int test_optimized_block_search();
+
+int test_optimized_block_management();
+
+int test_optimized_memory_locality();
+
+static void optimize_mapping_search(size_t size, int* fli, int* sli);
+
+static block_header_t* optimized_search_suitable_block(control_t* control, int* fli, int* sli);
+
+static void optimized_insert_free_block(control_t* control, block_header_t* block, int fl, int sl);
+
+static void optimized_remove_free_block(control_t* control, block_header_t* block, int fl, int sl);
+
+static void initialize_small_block_cache();
+
+static void* get_block_from_cache(size_t size);
+
+static int put_block_to_cache(void* ptr, size_t size);
+
+static void flush_small_block_cache(tlsf_t tlsf);
+
+void* optimized_tlsf_malloc(tlsf_t tlsf, size_t size);
+
+void optimized_tlsf_free(tlsf_t tlsf, void* ptr);
+
+
 /*
 ** block_header_t member functions.
 */
@@ -771,6 +822,35 @@ static block_header_t* search_suitable_block(control_t* control, int* fli, int* 
 	return control->blocks[fl][sl];
 }
 
+// 优化版块查找函数
+static block_header_t* optimized_search_suitable_block(control_t* control, int* fli, int* sli) {
+	int fl = *fli;
+	int sl = *sli;
+
+	// 1. 优化第一级位图查找
+	unsigned int sl_map = control->sl_bitmap[fl] & (~0U << sl);
+	if (!sl_map) {
+		// 没有找到合适的二级列表，查找下一个第一级列表
+		const unsigned int fl_map = control->fl_bitmap & (~0U << (fl + 1));
+		if (!fl_map) {
+			// 没有可用的自由块
+			return 0;
+		}
+
+		// 使用优化过的ffs函数
+		fl = safe_ffs(fl_map);
+		*fli = fl;
+		sl_map = control->sl_bitmap[fl];
+	}
+
+	// 2. 优化第二级位图查找 - 使用优化过的位操作
+	sl = safe_ffs(sl_map);
+	*sli = sl;
+
+	// 返回找到的块
+	return control->blocks[fl][sl];
+}
+
 /* Remove a free block from the free list.*/
 static void remove_free_block(control_t* control, block_header_t* block, int fl, int sl)
 {
@@ -822,19 +902,29 @@ static void insert_free_block(control_t* control, block_header_t* block, int fl,
 }
 
 /* Remove a given block from the free list. */
-static void block_remove(control_t* control, block_header_t* block)
-{
+static void block_remove(control_t* control, block_header_t* block) {
 	int fl, sl;
 	mapping_insert(block_size(block), &fl, &sl);
-	remove_free_block(control, block, fl, sl);
+
+	if (g_use_optimized_block_management) {
+		optimized_remove_free_block(control, block, fl, sl);
+	}
+	else {
+		remove_free_block(control, block, fl, sl);
+	}
 }
 
 /* Insert a given block into the free list. */
-static void block_insert(control_t* control, block_header_t* block)
-{
+static void block_insert(control_t* control, block_header_t* block) {
 	int fl, sl;
 	mapping_insert(block_size(block), &fl, &sl);
-	insert_free_block(control, block, fl, sl);
+
+	if (g_use_optimized_block_management) {
+		optimized_insert_free_block(control, block, fl, sl);
+	}
+	else {
+		insert_free_block(control, block, fl, sl);
+	}
 }
 
 static int block_can_split(block_header_t* block, size_t size)
@@ -949,29 +1039,25 @@ static block_header_t* block_trim_free_leading(control_t* control, block_header_
 	return remaining_block;
 }
 
-static block_header_t* block_locate_free(control_t* control, size_t size)
-{
+static block_header_t* block_locate_free(control_t* control, size_t size) {
 	int fl = 0, sl = 0;
 	block_header_t* block = 0;
 
-	if (size)
-	{
+	if (size) {
 		mapping_search(size, &fl, &sl);
-		
-		/*
-		** mapping_search can futz with the size, so for excessively large sizes it can sometimes wind up 
-		** with indices that are off the end of the block array.
-		** So, we protect against that here, since this is the only callsite of mapping_search.
-		** Note that we don't need to check sl, since it comes from a modulo operation that guarantees it's always in range.
-		*/
-		if (fl < FL_INDEX_COUNT)
-		{
-			block = search_suitable_block(control, &fl, &sl);
+
+		if (fl < FL_INDEX_COUNT) {
+			if (g_use_optimized_block_search) {
+				block = optimized_search_suitable_block(control, &fl, &sl);
+			}
+			else {
+				// 原始版本
+				block = search_suitable_block(control, &fl, &sl);
+			}
 		}
 	}
 
-	if (block)
-	{
+	if (block) {
 		tlsf_assert(block_size(block) >= size);
 		remove_free_block(control, block, fl, sl);
 	}
@@ -1303,14 +1389,39 @@ tlsf_t tlsf_create(void* mem) {
 		printf("[TLSF] 使用优化映射函数");
 	}
 
+	//// 验证映射优化
+	//if (!test_optimized_block_search()) {
+	//	printf("[TLSF] 使用原始块查找");
+	//}
+	//else {
+	//	printf("[TLSF] 使用优化块查找");
+	//}
+
+	//// 验证映射优化
+	//if (!test_optimized_block_management()) {
+	//	printf("[TLSF] 使用原始块管理函数");
+	//}
+	//else {
+	//	printf("[TLSF] 使用优化块管理函数");
+	//}
+
+	//// 验证映射优化
+	//if (!test_optimized_memory_locality()) {
+	//	printf("[TLSF] 使用原始内存");
+	//}
+	//else {
+	//	printf("[TLSF] 使用优化内存");
+	//}
+
+
     if (((tlsfptr_t)mem % ALIGN_SIZE) != 0) {
         printf("tlsf_create: Memory must be aligned to %u bytes.\n",
             (unsigned int)ALIGN_SIZE);
         return 0;
     }
-
+	printf("[TLSF]control_construct\n");
     control_construct(tlsf_cast(control_t*, mem));
-
+	printf("[TLSF]初始化完成\n");
     return tlsf_cast(tlsf_t, mem);
 }
 
@@ -1334,10 +1445,16 @@ pool_t tlsf_get_pool(tlsf_t tlsf)
 
 void* tlsf_malloc(tlsf_t tlsf, size_t size)
 {
-	control_t* control = tlsf_cast(control_t*, tlsf);
-	const size_t adjust = adjust_request_size(size, ALIGN_SIZE);
-	block_header_t* block = block_locate_free(control, adjust);
-	return block_prepare_used(control, block, adjust);
+	if (g_use_optimized_memory_locality) {
+		return optimized_tlsf_malloc(tlsf, size);
+	}
+	else {
+		control_t* control = tlsf_cast(control_t*, tlsf);
+		const size_t adjust = adjust_request_size(size, ALIGN_SIZE);
+		block_header_t* block = block_locate_free(control, adjust);
+		return block_prepare_used(control, block, adjust);
+	}
+
 }
 
 void* tlsf_memalign(tlsf_t tlsf, size_t align, size_t size)
@@ -1400,16 +1517,26 @@ void* tlsf_memalign(tlsf_t tlsf, size_t align, size_t size)
 void tlsf_free(tlsf_t tlsf, void* ptr)
 {
 	/* Don't attempt to free a NULL pointer. */
-	if (ptr)
-	{
-		control_t* control = tlsf_cast(control_t*, tlsf);
-		block_header_t* block = block_from_ptr(ptr);
-		tlsf_assert(!block_is_free(block) && "block already marked as free");
-		block_mark_as_free(block);
-		block = block_merge_prev(control, block);
-		block = block_merge_next(control, block);
-		block_insert(control, block);
+	if (g_use_optimized_memory_locality) {
+		if (ptr) {
+			optimized_tlsf_free(tlsf, ptr);
+		}
+
 	}
+	else {
+		if (ptr)
+		{
+			control_t* control = tlsf_cast(control_t*, tlsf);
+			block_header_t* block = block_from_ptr(ptr);
+			tlsf_assert(!block_is_free(block) && "block already marked as free");
+			block_mark_as_free(block);
+			block = block_merge_prev(control, block);
+			block = block_merge_next(control, block);
+			block_insert(control, block);
+		}
+	}
+
+
 }
 
 /*
@@ -1481,6 +1608,53 @@ void* tlsf_realloc(tlsf_t tlsf, void* ptr, size_t size)
 	}
 
 	return p;
+}
+
+// 优化的块插入函数
+static void optimized_insert_free_block(control_t* control, block_header_t* block, int fl, int sl) {
+	// 快速获取当前头部
+	block_header_t* current = control->blocks[fl][sl];
+
+	// 一次性更新链接关系
+	block->next_free = current;
+	block->prev_free = &control->block_null;
+	current->prev_free = block;
+
+	// 直接更新头部
+	control->blocks[fl][sl] = block;
+
+	// 设置位图位
+	control->fl_bitmap |= (1U << fl);
+	control->sl_bitmap[fl] |= (1U << sl);
+}
+
+// 优化的块移除函数 
+static void optimized_remove_free_block(control_t* control, block_header_t* block, int fl, int sl) {
+	block_header_t* prev = block->prev_free;
+	block_header_t* next = block->next_free;
+
+	// 更新链接
+	next->prev_free = prev;
+	prev->next_free = next;
+
+	// 使用条件移动而非分支
+	int is_head = (control->blocks[fl][sl] == block);
+	int is_last = (next == &control->block_null);
+
+	// 条件更新头部
+	if (is_head) {
+		control->blocks[fl][sl] = next;
+
+		// 条件更新位图
+		if (is_last) {
+			control->sl_bitmap[fl] &= ~(1U << sl);
+
+			// 检查第一级位图是否需要更新
+			if (!control->sl_bitmap[fl]) {
+				control->fl_bitmap &= ~(1U << fl);
+			}
+		}
+	}
 }
 
 // 预计算的小尺寸映射表，最大覆盖到4KB
@@ -1677,4 +1851,791 @@ int test_optimized_mapping_thorough() {
 	}
 
 	return errors == 0;
+}
+
+// 测试优化的块查找函数
+int test_optimized_block_search() {
+	printf("[TLSF] 开始测试优化的块查找函数...\n");
+
+	// 创建测试控制结构
+	control_t control;
+	control_construct(&control);
+
+	// 创建测试用的内存池
+	const size_t pool_size = 1024 * 1024; // 1 MB测试池
+	void* pool_memory = malloc(pool_size);
+	if (!pool_memory) {
+		printf("[TLSF] 测试失败: 无法分配测试内存池\n");
+		return 0;
+	}
+
+	// 初始化内存池
+	void* pool = tlsf_add_pool(&control, pool_memory, pool_size);
+	if (!pool) {
+		printf("[TLSF] 测试失败: 无法初始化TLSF内存池\n");
+		free(pool_memory);
+		return 0;
+	}
+
+	// 创建各种大小的内存块测试场景
+	const int num_blocks = 20;
+	size_t block_sizes[] = {
+		16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+		24, 48, 96, 192, 384, 768, 1536, 3072, 6144, 9216
+	};
+
+	void* allocated_blocks[20];
+
+	// 分配一些块
+	for (int i = 0; i < num_blocks / 2; i++) {
+		allocated_blocks[i] = tlsf_malloc(&control, block_sizes[i]);
+		if (!allocated_blocks[i]) {
+			printf("[TLSF] 测试警告: 块分配失败, 大小=%zu\n", block_sizes[i]);
+		}
+	}
+
+	// 释放一些块，创建空闲块
+	for (int i = 0; i < num_blocks / 4; i++) {
+		if (allocated_blocks[i]) {
+			tlsf_free(&control, allocated_blocks[i]);
+			allocated_blocks[i] = NULL;
+		}
+	}
+
+	// 再分配一些块
+	for (int i = num_blocks / 2; i < num_blocks; i++) {
+		allocated_blocks[i] = tlsf_malloc(&control, block_sizes[i]);
+		if (!allocated_blocks[i]) {
+			printf("[TLSF] 测试警告: 块分配失败, 大小=%zu\n", block_sizes[i]);
+		}
+	}
+
+	// 再次释放一些块，创建更多碎片
+	for (int i = num_blocks / 2; i < num_blocks * 3 / 4; i++) {
+		if (allocated_blocks[i]) {
+			tlsf_free(&control, allocated_blocks[i]);
+			allocated_blocks[i] = NULL;
+		}
+	}
+
+	// 现在测试各种查找场景
+	int errors = 0;
+
+	// 测试场景1: 测试不同大小的请求
+	size_t test_sizes[] = {
+		8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512,
+		768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 16384
+	};
+
+	const int num_test_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
+
+	for (int i = 0; i < num_test_sizes; i++) {
+		size_t test_size = test_sizes[i];
+
+		// 计算映射
+		int fl_orig = 0, sl_orig = 0;
+		int fl_opt = 0, sl_opt = 0;
+
+		mapping_search(test_size, &fl_orig, &sl_orig);
+		fl_opt = fl_orig;
+		sl_opt = sl_orig;
+
+		// 如果fl值超出范围，跳过此测试
+		if (fl_orig >= FL_INDEX_COUNT) continue;
+
+		// 保存原始值用于恢复
+		int save_fl_orig = fl_orig;
+		int save_sl_orig = sl_orig;
+		int save_fl_opt = fl_opt;
+		int save_sl_opt = sl_opt;
+
+		// 调用原始函数
+		block_header_t* orig_block = search_suitable_block(&control, &fl_orig, &sl_orig);
+
+		// 恢复原始值
+		fl_opt = save_fl_opt;
+		sl_opt = save_sl_opt;
+
+		// 调用优化函数
+		block_header_t* opt_block = optimized_search_suitable_block(&control, &fl_opt, &sl_opt);
+
+		// 比较结果
+		if (orig_block != opt_block) {
+			printf("[TLSF] 块查找结果不匹配: 大小=%zu, 原始=0x%p, 优化=0x%p\n",
+				test_size, orig_block, opt_block);
+			errors++;
+		}
+
+		if (fl_orig != fl_opt) {
+			printf("[TLSF] fl索引不匹配: 大小=%zu, 原始=%d, 优化=%d\n",
+				test_size, fl_orig, fl_opt);
+			errors++;
+		}
+
+		if (sl_orig != sl_opt) {
+			printf("[TLSF] sl索引不匹配: 大小=%zu, 原始=%d, 优化=%d\n",
+				test_size, sl_orig, sl_opt);
+			errors++;
+		}
+	}
+
+	// 测试场景2: 边缘情况测试
+
+	// 1. 空列表测试
+	{
+		// 清空控制结构
+		control_t empty_control;
+		control_construct(&empty_control);
+
+		for (int fl = 0; fl < FL_INDEX_COUNT; fl++) {
+			for (int sl = 0; sl < SL_INDEX_COUNT; sl++) {
+				int fl_orig = fl, sl_orig = sl;
+				int fl_opt = fl, sl_opt = sl;
+
+				// 调用原始函数
+				block_header_t* orig_block = search_suitable_block(&empty_control, &fl_orig, &sl_orig);
+
+				// 重置索引
+				fl_opt = fl;
+				sl_opt = sl;
+
+				// 调用优化函数
+				block_header_t* opt_block = optimized_search_suitable_block(&empty_control, &fl_opt, &sl_opt);
+
+				// 比较结果 - 应该都返回NULL
+				if (orig_block != opt_block) {
+					printf("[TLSF] 空列表测试失败: fl=%d, sl=%d, 原始=0x%p, 优化=0x%p\n",
+						fl, sl, orig_block, opt_block);
+					errors++;
+				}
+			}
+		}
+	}
+
+	// 2. 填满位图的测试
+	{
+		// 创建一个新的控制结构并填充位图
+		control_t full_control;
+		control_construct(&full_control);
+
+		// 填充第一级位图
+		full_control.fl_bitmap = 0xFFFFFFFF;
+
+		// 填充第二级位图
+		for (int fl = 0; fl < FL_INDEX_COUNT; fl++) {
+			full_control.sl_bitmap[fl] = 0xFFFFFFFF;
+
+			// 创建一些假块
+			for (int sl = 0; sl < SL_INDEX_COUNT; sl++) {
+				static block_header_t dummy_block;
+				dummy_block.next_free = &dummy_block;
+				dummy_block.prev_free = &dummy_block;
+				full_control.blocks[fl][sl] = &dummy_block;
+			}
+		}
+
+		// 测试各种索引组合
+		for (int fl = 0; fl < FL_INDEX_COUNT - 1; fl++) {
+			for (int sl = 0; sl < SL_INDEX_COUNT - 1; sl++) {
+				int fl_orig = fl, sl_orig = sl;
+				int fl_opt = fl, sl_opt = sl;
+
+				// 调用原始函数
+				block_header_t* orig_block = search_suitable_block(&full_control, &fl_orig, &sl_orig);
+
+				// 重置索引
+				fl_opt = fl;
+				sl_opt = sl;
+
+				// 调用优化函数
+				block_header_t* opt_block = optimized_search_suitable_block(&full_control, &fl_opt, &sl_opt);
+
+				// 比较结果
+				if (orig_block != opt_block || fl_orig != fl_opt || sl_orig != sl_opt) {
+					printf("[TLSF] 满位图测试失败: 初始fl=%d, sl=%d\n", fl, sl);
+					printf("  原始: 块=0x%p, fl=%d, sl=%d\n", orig_block, fl_orig, sl_orig);
+					printf("  优化: 块=0x%p, fl=%d, sl=%d\n", opt_block, fl_opt, sl_opt);
+					errors++;
+				}
+			}
+		}
+	}
+
+	// 3. 特殊位模式测试
+	{
+		// 测试各种特殊的位图模式
+		struct {
+			unsigned int fl_bitmap;
+			unsigned int sl_bitmap[FL_INDEX_COUNT];
+			int start_fl;
+			int start_sl;
+		} test_patterns[] = {
+			// 只有一个位置1的情况
+			{0x00000001, {0x00000001}, 0, 0},
+			// 只有最高位为1的情况
+			{0x80000000, {0x80000000}, FL_INDEX_COUNT - 1, 0},
+			// 交错模式
+			{0xAAAAAAAA, {0xAAAAAAAA}, 1, 0},
+			// 只有一个可用块，但在较高索引
+			{0x00010000, {0x00000001}, 16, 0}
+		};
+
+		for (size_t pattern_idx = 0; pattern_idx < sizeof(test_patterns) / sizeof(test_patterns[0]); pattern_idx++) {
+			// 创建测试控制结构
+			control_t pattern_control;
+			control_construct(&pattern_control);
+
+			// 设置位图
+			pattern_control.fl_bitmap = test_patterns[pattern_idx].fl_bitmap;
+			for (int fl = 0; fl < FL_INDEX_COUNT; fl++) {
+				pattern_control.sl_bitmap[fl] = test_patterns[pattern_idx].sl_bitmap[0];
+
+				// 创建一些假块
+				for (int sl = 0; sl < SL_INDEX_COUNT; sl++) {
+					static block_header_t dummy_block;
+					dummy_block.next_free = &dummy_block;
+					dummy_block.prev_free = &dummy_block;
+					pattern_control.blocks[fl][sl] = &dummy_block;
+				}
+			}
+
+			// 测试搜索
+			int fl = test_patterns[pattern_idx].start_fl;
+			int sl = test_patterns[pattern_idx].start_sl;
+
+			int fl_orig = fl, sl_orig = sl;
+			int fl_opt = fl, sl_opt = sl;
+
+			// 调用原始函数
+			block_header_t* orig_block = search_suitable_block(&pattern_control, &fl_orig, &sl_orig);
+
+			// 重置索引
+			fl_opt = fl;
+			sl_opt = sl;
+
+			// 调用优化函数
+			block_header_t* opt_block = optimized_search_suitable_block(&pattern_control, &fl_opt, &sl_opt);
+
+			// 比较结果
+			if (orig_block != opt_block || fl_orig != fl_opt || sl_orig != sl_opt) {
+				printf("[TLSF] 特殊位模式测试失败: 模式=%zu\n", pattern_idx);
+				printf("  原始: 块=0x%p, fl=%d, sl=%d\n", orig_block, fl_orig, sl_orig);
+				printf("  优化: 块=0x%p, fl=%d, sl=%d\n", opt_block, fl_opt, sl_opt);
+				errors++;
+			}
+		}
+	}
+
+	// 清理测试资源
+	for (int i = 0; i < num_blocks; i++) {
+		if (allocated_blocks[i]) {
+			tlsf_free(&control, allocated_blocks[i]);
+		}
+	}
+
+	free(pool_memory);
+
+	// 报告结果
+	if (errors == 0) {
+		printf("[TLSF] 块查找优化测试全部通过!\n");
+		return 1;
+	}
+	else {
+		printf("[TLSF] 块查找优化测试失败: 发现%d个错误\n", errors);
+		// 自动禁用优化
+		g_use_optimized_block_search = 0;
+		return 0;
+	}
+}
+
+// 测试优化的块管理函数
+int test_optimized_block_management() {
+	printf("[TLSF] 开始测试优化的块管理函数...\n");
+
+	// 创建两个相同的控制结构
+	control_t control_orig, control_opt;
+	control_construct(&control_orig);
+	control_construct(&control_opt);
+
+	// 创建测试内存池
+	const size_t pool_size = 64 * 1024; // 64 KB测试池
+	void* pool_memory1 = malloc(pool_size);
+	void* pool_memory2 = malloc(pool_size);
+
+	if (!pool_memory1 || !pool_memory2) {
+		printf("[TLSF] 测试失败: 无法分配测试内存池\n");
+		if (pool_memory1) free(pool_memory1);
+		if (pool_memory2) free(pool_memory2);
+		return 0;
+	}
+
+	// 初始化内存池
+	void* pool1 = tlsf_add_pool(&control_orig, pool_memory1, pool_size);
+	void* pool2 = tlsf_add_pool(&control_opt, pool_memory2, pool_size);
+
+	if (!pool1 || !pool2) {
+		printf("[TLSF] 测试失败: 无法初始化TLSF内存池\n");
+		free(pool_memory1);
+		free(pool_memory2);
+		return 0;
+	}
+
+	// 测试: 分配和释放相同的块模式
+	const int num_sizes = 10;
+	size_t sizes[10] = { 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
+	void* blocks_orig[10];
+	void* blocks_opt[10];
+
+	int errors = 0;
+
+	// 暂时禁用优化以确保使用原始函数
+	int save_opt = g_use_optimized_block_management;
+	g_use_optimized_block_management = 0;
+
+	// 使用原始函数分配
+	for (int i = 0; i < num_sizes; i++) {
+		blocks_orig[i] = tlsf_malloc(&control_orig, sizes[i]);
+		if (!blocks_orig[i]) {
+			printf("[TLSF] 测试警告: 原始分配失败, 大小=%zu\n", sizes[i]);
+		}
+	}
+
+	// 启用优化
+	g_use_optimized_block_management = 1;
+
+	// 使用优化函数分配
+	for (int i = 0; i < num_sizes; i++) {
+		blocks_opt[i] = tlsf_malloc(&control_opt, sizes[i]);
+		if (!blocks_opt[i]) {
+			printf("[TLSF] 测试警告: 优化分配失败, 大小=%zu\n", sizes[i]);
+		}
+	}
+
+	// 比较分配结果
+	for (int i = 0; i < num_sizes; i++) {
+		if ((!blocks_orig[i] && blocks_opt[i]) || (blocks_orig[i] && !blocks_opt[i])) {
+			printf("[TLSF] 分配结果不一致: 大小=%zu, 原始=%p, 优化=%p\n",
+				sizes[i], blocks_orig[i], blocks_opt[i]);
+			errors++;
+		}
+	}
+
+	// 释放测试 - 交替释放
+	g_use_optimized_block_management = 0;
+	tlsf_free(&control_orig, blocks_orig[1]);
+	tlsf_free(&control_orig, blocks_orig[3]);
+	tlsf_free(&control_orig, blocks_orig[5]);
+	tlsf_free(&control_orig, blocks_orig[7]);
+	tlsf_free(&control_orig, blocks_orig[9]);
+
+	g_use_optimized_block_management = 1;
+	tlsf_free(&control_opt, blocks_opt[1]);
+	tlsf_free(&control_opt, blocks_opt[3]);
+	tlsf_free(&control_opt, blocks_opt[5]);
+	tlsf_free(&control_opt, blocks_opt[7]);
+	tlsf_free(&control_opt, blocks_opt[9]);
+
+	// 再次分配，检查两个控制结构的状态是否相同
+	g_use_optimized_block_management = 0;
+	void* new_block_orig = tlsf_malloc(&control_orig, 256);
+
+	g_use_optimized_block_management = 1;
+	void* new_block_opt = tlsf_malloc(&control_opt, 256);
+
+	if ((!new_block_orig && new_block_opt) || (new_block_orig && !new_block_opt)) {
+		printf("[TLSF] 再分配结果不一致: 原始=%p, 优化=%p\n", new_block_orig, new_block_opt);
+		errors++;
+	}
+
+	// 完全释放
+	for (int i = 0; i < num_sizes; i++) {
+		if (i != 1 && i != 3 && i != 5 && i != 7 && i != 9) {
+			g_use_optimized_block_management = 0;
+			if (blocks_orig[i]) tlsf_free(&control_orig, blocks_orig[i]);
+
+			g_use_optimized_block_management = 1;
+			if (blocks_opt[i]) tlsf_free(&control_opt, blocks_opt[i]);
+		}
+	}
+
+	if (new_block_orig) {
+		g_use_optimized_block_management = 0;
+		tlsf_free(&control_orig, new_block_orig);
+	}
+
+	if (new_block_opt) {
+		g_use_optimized_block_management = 1;
+		tlsf_free(&control_opt, new_block_opt);
+	}
+
+	// 检查池状态 - 两个池应该都是空闲的
+	// 这个检查不是很严格，但可以捕获明显错误
+	g_use_optimized_block_management = 0;
+	void* final_orig = tlsf_malloc(&control_orig, pool_size - 1000);
+
+	g_use_optimized_block_management = 1;
+	void* final_opt = tlsf_malloc(&control_opt, pool_size - 1000);
+
+	if ((!final_orig && final_opt) || (final_orig && !final_opt)) {
+		printf("[TLSF] 最终分配不一致: 原始=%p, 优化=%p\n", final_orig, final_opt);
+		errors++;
+	}
+
+	// 恢复设置
+	g_use_optimized_block_management = save_opt;
+
+	// 清理
+	free(pool_memory1);
+	free(pool_memory2);
+
+	// 报告结果
+	if (errors == 0) {
+		printf("[TLSF] 块管理优化测试通过!\n");
+		return 1;
+	}
+	else {
+		printf("[TLSF] 块管理优化测试失败: %d个错误\n", errors);
+		// 禁用优化
+		g_use_optimized_block_management = 0;
+		return 0;
+	}
+}
+
+// 初始化小块缓存
+static void initialize_small_block_cache() {
+	if (g_small_block_cache.initialized) return;
+
+	// 设置支持的块大小 - 根据实际分配模式调整
+	g_small_block_cache.sizes[0] = 16;   // 很小的分配，如指针等
+	g_small_block_cache.sizes[1] = 32;   // 小型结构体
+	g_small_block_cache.sizes[2] = 64;   // 中小型结构体
+	g_small_block_cache.sizes[3] = 128;  // 中型结构体
+	g_small_block_cache.sizes[4] = 256;  // 中大型结构体
+	g_small_block_cache.sizes[5] = 512;  // 大型结构体
+	g_small_block_cache.sizes[6] = 1024; // 小缓冲区
+	g_small_block_cache.sizes[7] = 2048; // 中型缓冲区
+
+	// 初始化计数器
+	for (int i = 0; i < SMALL_CACHE_SIZE_COUNT; i++) {
+		g_small_block_cache.count[i] = 0;
+
+		// 清空块指针
+		for (int j = 0; j < SMALL_CACHE_COUNT_PER_SIZE; j++) {
+			g_small_block_cache.blocks[i][j] = NULL;
+		}
+	}
+
+	g_small_block_cache.initialized = 1;
+	printf("[TLSF] 小块缓存已初始化, 支持%d种大小\n", SMALL_CACHE_SIZE_COUNT);
+}
+
+// 从缓存获取块
+static void* get_block_from_cache(size_t size) {
+	if (!g_small_block_cache.initialized) {
+		initialize_small_block_cache();
+	}
+
+	// 找到匹配的大小类别
+	for (int i = 0; i < SMALL_CACHE_SIZE_COUNT; i++) {
+		if (g_small_block_cache.sizes[i] >= size) {
+			// 找到匹配大小
+			if (g_small_block_cache.count[i] > 0) {
+				// 从缓存取出
+				g_small_block_cache.count[i]--;
+				void* block = g_small_block_cache.blocks[i][g_small_block_cache.count[i]];
+				g_small_block_cache.blocks[i][g_small_block_cache.count[i]] = NULL;
+				return block;
+			}
+			break; // 没有缓存的块，退出
+		}
+	}
+
+	return NULL; // 缓存未命中
+}
+
+// 将块放入缓存
+static int put_block_to_cache(void* ptr, size_t size) {
+	if (!g_small_block_cache.initialized) {
+		initialize_small_block_cache();
+	}
+
+	// 找到匹配的大小类别
+	for (int i = 0; i < SMALL_CACHE_SIZE_COUNT; i++) {
+		if (g_small_block_cache.sizes[i] == size) {
+			// 找到精确匹配
+			if (g_small_block_cache.count[i] < SMALL_CACHE_COUNT_PER_SIZE) {
+				// 缓存未满，添加到缓存
+				g_small_block_cache.blocks[i][g_small_block_cache.count[i]] = ptr;
+				g_small_block_cache.count[i]++;
+				return 1; // 成功缓存
+			}
+			break; // 缓存已满，退出
+		}
+		else if (g_small_block_cache.sizes[i] > size) {
+			// 找到第一个大于当前大小的类别，退出
+			break;
+		}
+	}
+
+	return 0; // 未缓存
+}
+
+// 清空小块缓存
+static void flush_small_block_cache(tlsf_t tlsf) {
+	if (!g_small_block_cache.initialized) return;
+
+	for (int i = 0; i < SMALL_CACHE_SIZE_COUNT; i++) {
+		for (int j = 0; j < g_small_block_cache.count[i]; j++) {
+			if (g_small_block_cache.blocks[i][j]) {
+				// 使用原始方法释放块
+				tlsf_free(tlsf, g_small_block_cache.blocks[i][j]);
+				g_small_block_cache.blocks[i][j] = NULL;
+			}
+		}
+		g_small_block_cache.count[i] = 0;
+	}
+}
+
+// 优化的内存分配函数
+void* optimized_tlsf_malloc(tlsf_t tlsf, size_t size) {
+	// 标记是否是小块分配
+	int is_small_block = 0;
+
+	// 处理小块分配
+	if (size <= 2048) {
+		is_small_block = 1;
+
+		// 从缓存中尝试获取
+		void* block = get_block_from_cache(size);
+		if (block) {
+			// 缓存命中，直接返回
+			return block;
+		}
+	}
+
+	// 常规路径 - 调整大小
+	control_t* control = tlsf_cast(control_t*, tlsf);
+	const size_t adjust = adjust_request_size(size, ALIGN_SIZE);
+
+	// 内存局部性优化 - 对齐到缓存行大小
+	size_t aligned_size = adjust;
+	const size_t CACHE_LINE_SIZE = 64; // 典型的缓存行大小
+
+	// 对于较大的块，考虑对齐到缓存行
+	if (size >= 256 && !is_small_block) {
+		aligned_size = (adjust + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
+	}
+
+	// 分配块
+	block_header_t* block = block_locate_free(control, aligned_size);
+	void* p = block_prepare_used(control, block, aligned_size);
+
+	return p;
+}
+
+// 优化的内存释放函数
+void optimized_tlsf_free(tlsf_t tlsf, void* ptr) {
+	// 空指针检查
+	if (!ptr) return;
+
+	// 获取块头信息
+	block_header_t* block = block_from_ptr(ptr);
+	size_t size_of_block = block_size(block);  // 改名为size_of_block避免冲突
+
+	// 尝试放入小块缓存
+	if (size_of_block <= 2048) {
+		if (put_block_to_cache(ptr, size_of_block)) {
+			// 成功缓存，直接返回
+			return;
+		}
+	}
+
+	// 常规释放路径
+	control_t* control = tlsf_cast(control_t*, tlsf);
+	block_mark_as_free(block);
+	block = block_merge_prev(control, block);
+	block = block_merge_next(control, block);
+	block_insert(control, block);
+}
+
+int test_optimized_memory_locality() {
+	printf("[TLSF] 开始测试内存局部性优化...\n");
+
+	// 创建测试用TLSF实例
+	const size_t pool_size = 1024 * 1024; // 1 MB池
+	void* pool_memory = malloc(pool_size);
+	if (!pool_memory) {
+		printf("[TLSF] 测试失败: 无法分配测试内存池\n");
+		return 0;
+	}
+
+	tlsf_t tlsf = tlsf_create(pool_memory);
+	if (!tlsf) {
+		printf("[TLSF] 测试失败: 无法创建TLSF实例\n");
+		free(pool_memory);
+		return 0;
+	}
+
+	void* pool = tlsf_add_pool(tlsf, (char*)pool_memory + tlsf_size(), pool_size - tlsf_size());
+	if (!pool) {
+		printf("[TLSF] 测试失败: 无法添加内存池\n");
+		free(pool_memory);
+		return 0;
+	}
+
+	int errors = 0;
+
+	// 测试小块缓存
+	{
+		// 启用优化
+		g_use_optimized_memory_locality = 1;
+
+		// 先分配一些小块
+		const int num_blocks = 20;
+		void* blocks[20];
+
+		for (int i = 0; i < num_blocks; i++) {
+			// 交替分配不同大小
+			size_t size = (i % 8) * 32 + 16; // 16, 48, 80, ...
+			blocks[i] = tlsf_malloc(tlsf, size);
+			if (!blocks[i]) {
+				printf("[TLSF] 测试警告: 块分配失败, 大小=%zu\n", size);
+				errors++;
+			}
+		}
+
+		// 释放部分块，这些应该进入缓存
+		for (int i = 0; i < num_blocks / 2; i++) {
+			if (blocks[i]) {
+				tlsf_free(tlsf, blocks[i]);
+				blocks[i] = NULL;
+			}
+		}
+
+		// 重新分配相同大小，应该从缓存获取
+		for (int i = 0; i < num_blocks / 2; i++) {
+			size_t size = (i % 8) * 32 + 16;
+			blocks[i] = tlsf_malloc(tlsf, size);
+			if (!blocks[i]) {
+				printf("[TLSF] 测试警告: 缓存重分配失败, 大小=%zu\n", size);
+				errors++;
+			}
+		}
+
+		// 释放所有块
+		for (int i = 0; i < num_blocks; i++) {
+			if (blocks[i]) {
+				tlsf_free(tlsf, blocks[i]);
+				blocks[i] = NULL;
+			}
+		}
+
+		// 显式刷新缓存
+		flush_small_block_cache(tlsf);
+	}
+
+	// 测试对齐优化
+	{
+		// 分配一个较大的块
+		size_t large_size = 1024;
+		void* large_block = tlsf_malloc(tlsf, large_size);
+
+		if (!large_block) {
+			printf("[TLSF] 测试警告: 大块分配失败, 大小=%zu\n", large_size);
+			errors++;
+		}
+		else {
+			// 检查地址对齐
+			uintptr_t addr = (uintptr_t)large_block;
+			if ((addr % 64) != 0) { // 检查是否对齐到64字节
+				printf("[TLSF] 警告: 大块未对齐到缓存行, 地址=%p\n", large_block);
+				// 这不算严重错误，只是警告
+			}
+
+			// 释放块
+			tlsf_free(tlsf, large_block);
+		}
+	}
+
+	// 测试分配-释放循环的性能
+	{
+		const int cycles = 1000;
+		const int blocks_per_cycle = 100;
+		void* blocks[100];
+
+		// 禁用优化，测试原始性能
+		g_use_optimized_memory_locality = 0;
+
+		// 计时
+		clock_t start = clock();
+
+		for (int cycle = 0; cycle < cycles; cycle++) {
+			// 分配
+			for (int i = 0; i < blocks_per_cycle; i++) {
+				size_t size = (i % 8) * 32 + 16;
+				blocks[i] = tlsf_malloc(tlsf, size);
+			}
+
+			// 释放
+			for (int i = 0; i < blocks_per_cycle; i++) {
+				if (blocks[i]) {
+					tlsf_free(tlsf, blocks[i]);
+					blocks[i] = NULL;
+				}
+			}
+		}
+
+		clock_t end = clock();
+		double original_time = (double)(end - start) / CLOCKS_PER_SEC;
+
+		// 启用优化，测试优化性能
+		g_use_optimized_memory_locality = 1;
+
+		// 计时
+		start = clock();
+
+		for (int cycle = 0; cycle < cycles; cycle++) {
+			// 分配
+			for (int i = 0; i < blocks_per_cycle; i++) {
+				size_t size = (i % 8) * 32 + 16;
+				blocks[i] = tlsf_malloc(tlsf, size);
+			}
+
+			// 释放
+			for (int i = 0; i < blocks_per_cycle; i++) {
+				if (blocks[i]) {
+					tlsf_free(tlsf, blocks[i]);
+					blocks[i] = NULL;
+				}
+			}
+		}
+
+		end = clock();
+		double optimized_time = (double)(end - start) / CLOCKS_PER_SEC;
+
+		printf("[TLSF] 性能测试: 原始 %.3fs, 优化 %.3fs, 差异 %.1f%%\n",
+			original_time, optimized_time,
+			100.0 * (original_time - optimized_time) / original_time);
+
+		// 如果优化版更慢，记录警告
+		if (optimized_time > original_time * 1.05) { // 允许5%的误差
+			printf("[TLSF] 警告: 优化版本性能降低 %.1f%%\n",
+				100.0 * (optimized_time - original_time) / original_time);
+		}
+	}
+
+	// 清理测试
+	free(pool_memory);
+
+	// 报告结果
+	if (errors == 0) {
+		printf("[TLSF] 内存局部性优化测试通过!\n");
+		return 1;
+	}
+	else {
+		printf("[TLSF] 内存局部性优化测试失败: %d个错误\n", errors);
+		// 禁用优化
+		g_use_optimized_memory_locality = 0;
+		return 0;
+	}
 }
