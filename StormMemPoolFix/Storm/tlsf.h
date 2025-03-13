@@ -40,6 +40,20 @@
 
 #include <stddef.h>
 
+// 小块缓存结构定义
+#define SMALL_CACHE_SIZE_COUNT 8   // 支持的小块大小类别数量
+#define SMALL_CACHE_COUNT_PER_SIZE 16  // 每个大小缓存的块数量
+
+typedef struct {
+    void* blocks[SMALL_CACHE_SIZE_COUNT][SMALL_CACHE_COUNT_PER_SIZE];
+    int count[SMALL_CACHE_SIZE_COUNT];
+    size_t sizes[SMALL_CACHE_SIZE_COUNT];
+    int initialized;
+} small_block_cache_t;
+
+// 全局小块缓存
+static small_block_cache_t g_small_block_cache;
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -82,6 +96,8 @@ void tlsf_walk_pool(pool_t pool, tlsf_walker walker, void* user);
 /* Returns nonzero if any internal consistency check fails. */
 int tlsf_check(tlsf_t tlsf);
 int tlsf_check_pool(pool_t pool);
+
+
 
 #if defined(__cplusplus)
 };
