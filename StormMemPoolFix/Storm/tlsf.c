@@ -196,6 +196,208 @@ tlsf_decl int tlsf_fls_sizet(size_t size)
 
 #undef tlsf_decl
 
+static void initialize_mapping_table();
+
+int test_optimized_mapping_thorough();
+
+static void optimize_mapping_search(size_t size, int* fli, int* sli);
+
+
+
+//add by Disaster
+// 优化的向前查找第一个设置位(ffs)
+
+// 全局启用/禁用标志
+static int g_use_optimized_mapping = 1;  // 默认启用
+
+// 切换函数
+void tlsf_toggle_optimized_mapping(int enable) {
+	g_use_optimized_mapping = enable;
+}
+
+static inline int optimized_ffs(unsigned int word) {
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+	// MSVC平台使用内置指令
+	unsigned long index;
+	if (_BitScanForward(&index, word))
+		return index;
+	return -1;
+#elif defined(__GNUC__) || defined(__clang__)
+	// GCC/Clang平台使用内置函数
+	if (word == 0) return -1;
+	return __builtin_ctz(word);  // 直接使用计算后缀零数的内建函数
+#else
+	// 通用优化实现
+	static const unsigned char MultiplyDeBruijnBitPosition[32] = {
+		0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+		31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
+	};
+	return word ? MultiplyDeBruijnBitPosition[((word & -word) * 0x077CB531U) >> 27] : -1;
+#endif
+}
+
+// 优化的向后查找最后一个设置位(fls)
+static inline int optimized_fls(unsigned int word) {
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+	// MSVC平台
+	unsigned long index;
+	if (_BitScanReverse(&index, word))
+		return index;
+	return -1;
+#elif defined(__GNUC__) || defined(__clang__)
+	// GCC/Clang平台
+	if (word == 0) return -1;
+	return 31 - __builtin_clz(word);  // 使用前导零计数
+#else
+	// 优化的通用实现 - 二分查找方法
+	int pos = -1;
+	if (word & 0xFFFF0000) { pos += 16; word >>= 16; }
+	if (word & 0xFF00) { pos += 8; word >>= 8; }
+	if (word & 0xF0) { pos += 4; word >>= 4; }
+	if (word & 0xC) { pos += 2; word >>= 2; }
+	if (word & 0x2) { pos += 1; word >>= 1; }
+	if (word & 0x1) { pos += 1; }
+	return pos;
+#endif
+}
+
+#if defined (TLSF_64BIT)
+// 优化的64位版本fls
+static inline int optimized_fls_sizet(size_t size) {
+	int high = (int)(size >> 32);
+	int bits = 0;
+
+	if (high) {
+#if defined(_MSC_VER) && defined(_M_X64)
+		unsigned long index;
+		_BitScanReverse64(&index, (unsigned __int64)size);
+		return index;
+#elif defined(__GNUC__) || defined(__clang__)
+		return 63 - __builtin_clzll((unsigned long long)size);
+#else
+		bits = 32 + optimized_fls(high);
+#endif
+	}
+	else {
+		bits = optimized_fls((int)size & 0xffffffff);
+	}
+	return bits;
+}
+#else
+#define optimized_fls_sizet optimized_fls
+#endif
+
+// 控制是否使用优化版位操作的全局标志
+static int g_use_optimized_bitops = 1;  // 默认启用
+
+// 切换优化位操作的函数
+void tlsf_toggle_optimized_bitops(int enable) {
+	g_use_optimized_bitops = enable;
+}
+
+// 封装的ffs函数，根据标志选择实现
+static int safe_ffs(unsigned int word) {
+	if (g_use_optimized_bitops) {
+		return optimized_ffs(word);
+	}
+	else {
+		// 使用原始实现
+		// 保留原始tlsf_ffs代码，避免修改可能引入的问题
+		return tlsf_ffs(word);
+	}
+}
+
+// 封装的fls函数，根据标志选择实现
+static int safe_fls(unsigned int word) {
+	if (g_use_optimized_bitops) {
+		return optimized_fls(word);
+	}
+	else {
+		// 使用原始实现
+		return tlsf_fls(word);
+	}
+}
+
+// 封装的fls_sizet函数，根据标志选择实现
+static int safe_fls_sizet(size_t size) {
+	if (g_use_optimized_bitops) {
+		return optimized_fls_sizet(size);
+	}
+	else {
+		// 使用原始实现
+		return tlsf_fls_sizet(size);
+	}
+}
+
+// 验证优化位操作函数的正确性
+int test_optimized_bitops() {
+	// 测试用例数组：{输入值, 预期ffs结果, 预期fls结果}
+	const struct {
+		unsigned int input;
+		int ffs_result;
+		int fls_result;
+	} test_cases[] = {
+		{0, -1, -1},              // 0没有设置位
+		{1, 0, 0},                // 只有最低位设置
+		{0x80000000, 31, 31},     // 只有最高位设置
+		{0x80008000, 15, 31},     // 两个位设置
+		{0x7FFFFFFF, 0, 30},      // 除了最高位外所有位设置
+		{0xFFFFFFFF, 0, 31},      // 所有位设置
+		{0x12345678, 3, 28},      // 随机值
+		{0xA5A5A5A5, 0, 31}       // 交替位设置
+	};
+
+	int errors = 0;
+	for (size_t i = 0; i < sizeof(test_cases) / sizeof(test_cases[0]); i++) {
+		unsigned int input = test_cases[i].input;
+
+		// 测试ffs
+		int orig_ffs = tlsf_ffs(input);
+		int opt_ffs = optimized_ffs(input);
+		if (orig_ffs != opt_ffs || orig_ffs != test_cases[i].ffs_result) {
+			errors++;
+		}
+
+		// 测试fls
+		int orig_fls = tlsf_fls(input);
+		int opt_fls = optimized_fls(input);
+		if (orig_fls != opt_fls || orig_fls != test_cases[i].fls_result) {
+			//LogMessage("[TLSF] fls测试失败: 输入=%u, 原始=%d, 优化=%d, 预期=%d",
+			//	input, orig_fls, opt_fls, test_cases[i].fls_result);
+			errors++;
+		}
+	}
+
+	// 测试大值（仅测试fls_sizet）
+	size_t large_values[] = {
+		(size_t)1 << 32,          // 只有第33位设置
+		((size_t)1 << 32) | 1,    // 第33位和第1位设置
+		(size_t)-1                // 所有位设置
+	};
+
+	for (size_t i = 0; i < sizeof(large_values) / sizeof(large_values[0]); i++) {
+		size_t input = large_values[i];
+		int orig_fls = tlsf_fls_sizet(input);
+		int opt_fls = optimized_fls_sizet(input);
+		if (orig_fls != opt_fls) {
+			//LogMessage("[TLSF] fls_sizet测试失败: 输入=%zu, 原始=%d, 优化=%d",
+			//	input, orig_fls, opt_fls);
+			errors++;
+		}
+	}
+
+	if (errors == 0) {
+		printf("[TLSF] 所有位操作优化测试通过!\n");
+	}
+	else {
+		printf("[TLSF] 位操作优化测试失败: % d个错误\n",errors);
+		// 自动禁用优化
+		g_use_optimized_bitops = 0;
+	}
+
+	return errors == 0;
+}
+
 /*
 ** Constants.
 */
@@ -509,18 +711,15 @@ static size_t adjust_request_size(size_t size, size_t align)
 ** the documentation found in the white paper.
 */
 
-static void mapping_insert(size_t size, int* fli, int* sli)
-{
+static void mapping_insert(size_t size, int* fli, int* sli) {
 	int fl, sl;
-	if (size < SMALL_BLOCK_SIZE)
-	{
+	if (size < SMALL_BLOCK_SIZE) {
 		/* Store small blocks in first list. */
 		fl = 0;
 		sl = tlsf_cast(int, size) / (SMALL_BLOCK_SIZE / SL_INDEX_COUNT);
 	}
-	else
-	{
-		fl = tlsf_fls_sizet(size);
+	else {
+		fl = safe_fls_sizet(size);  // 替换为安全版本
 		sl = tlsf_cast(int, size >> (fl - SL_INDEX_COUNT_LOG2)) ^ (1 << SL_INDEX_COUNT_LOG2);
 		fl -= (FL_INDEX_SHIFT - 1);
 	}
@@ -529,18 +728,21 @@ static void mapping_insert(size_t size, int* fli, int* sli)
 }
 
 /* This version rounds up to the next block size (for allocations) */
-static void mapping_search(size_t size, int* fli, int* sli)
-{
-	if (size >= SMALL_BLOCK_SIZE)
-	{
+static void mapping_search(size_t size, int* fli, int* sli) {
+	if (g_use_optimized_mapping) {
+		optimize_mapping_search(size, fli, sli);
+		return;
+	}
+
+	// 原始实现
+	if (size >= SMALL_BLOCK_SIZE) {
 		const size_t round = (1 << (tlsf_fls_sizet(size) - SL_INDEX_COUNT_LOG2)) - 1;
 		size += round;
 	}
 	mapping_insert(size, fli, sli);
 }
 
-static block_header_t* search_suitable_block(control_t* control, int* fli, int* sli)
-{
+static block_header_t* search_suitable_block(control_t* control, int* fli, int* sli) {
 	int fl = *fli;
 	int sl = *sli;
 
@@ -549,22 +751,20 @@ static block_header_t* search_suitable_block(control_t* control, int* fli, int* 
 	** fl/sl index.
 	*/
 	unsigned int sl_map = control->sl_bitmap[fl] & (~0U << sl);
-	if (!sl_map)
-	{
+	if (!sl_map) {
 		/* No block exists. Search in the next largest first-level list. */
 		const unsigned int fl_map = control->fl_bitmap & (~0U << (fl + 1));
-		if (!fl_map)
-		{
+		if (!fl_map) {
 			/* No free blocks available, memory has been exhausted. */
 			return 0;
 		}
 
-		fl = tlsf_ffs(fl_map);
+		fl = safe_ffs(fl_map);  // 替换为安全版本
 		*fli = fl;
 		sl_map = control->sl_bitmap[fl];
 	}
 	tlsf_assert(sl_map && "internal error - second level bitmap is null");
-	sl = tlsf_ffs(sl_map);
+	sl = safe_ffs(sl_map);  // 替换为安全版本
 	*sli = sl;
 
 	/* Return the first block in the free list. */
@@ -1072,25 +1272,46 @@ int test_ffs_fls()
 }
 #endif
 
-tlsf_t tlsf_create(void* mem)
-{
+tlsf_t tlsf_create(void* mem) {
 #if _DEBUG
-	if (test_ffs_fls())
-	{
-		return 0;
-	}
+    if (test_ffs_fls()) {
+        return 0;
+    }
+    
+    // 添加优化位操作测试
+    if (!test_optimized_bitops()) {
+        // 如果测试失败，日志已经输出，优化已禁用
+        LogMessage("[TLSF] 使用原始位操作函数");
+    } else {
+        LogMessage("[TLSF] 使用优化位操作函数");
+    }
 #endif
-
-	if (((tlsfptr_t)mem % ALIGN_SIZE) != 0)
-	{
-		printf("tlsf_create: Memory must be aligned to %u bytes.\n",
-			(unsigned int)ALIGN_SIZE);
-		return 0;
+	// 添加优化位操作测试
+	if (!test_optimized_bitops()) {
+		// 如果测试失败，日志已经输出，优化已禁用
+		printf("[TLSF] 使用原始位操作函数");
+	}
+	else {
+		printf("[TLSF] 使用优化位操作函数");
 	}
 
-	control_construct(tlsf_cast(control_t*, mem));
+	// 验证映射优化
+	if (!test_optimized_mapping_thorough()) {
+		printf("[TLSF] 使用原始映射函数");
+	}
+	else {
+		printf("[TLSF] 使用优化映射函数");
+	}
 
-	return tlsf_cast(tlsf_t, mem);
+    if (((tlsfptr_t)mem % ALIGN_SIZE) != 0) {
+        printf("tlsf_create: Memory must be aligned to %u bytes.\n",
+            (unsigned int)ALIGN_SIZE);
+        return 0;
+    }
+
+    control_construct(tlsf_cast(control_t*, mem));
+
+    return tlsf_cast(tlsf_t, mem);
 }
 
 tlsf_t tlsf_create_with_pool(void* mem, size_t bytes)
@@ -1260,4 +1481,200 @@ void* tlsf_realloc(tlsf_t tlsf, void* ptr, size_t size)
 	}
 
 	return p;
+}
+
+// 预计算的小尺寸映射表，最大覆盖到4KB
+#define MAX_PRECOMPUTED_SIZE 4096
+static struct {
+	int fl;
+	int sl;
+} g_size_mapping[MAX_PRECOMPUTED_SIZE + 1];
+
+// 初始化预计算表
+static void initialize_mapping_table() {
+	static int initialized = 0;
+	if (initialized) return;
+
+	for (size_t size = 0; size <= MAX_PRECOMPUTED_SIZE; size++) {
+		int fl, sl;
+
+		// 完全复制原始mapping_search函数的逻辑
+		size_t temp_size = size;
+		if (temp_size >= SMALL_BLOCK_SIZE) {
+			// 注意：这里必须使用原始的tlsf_fls_sizet，不是优化版本
+			const size_t round = (1 << (tlsf_fls_sizet(temp_size) - SL_INDEX_COUNT_LOG2)) - 1;
+			temp_size += round;
+		}
+
+		// 调用原始mapping_insert函数
+		if (temp_size < SMALL_BLOCK_SIZE) {
+			fl = 0;
+			sl = tlsf_cast(int, temp_size) / (SMALL_BLOCK_SIZE / SL_INDEX_COUNT);
+		}
+		else {
+			fl = tlsf_fls_sizet(temp_size);
+			sl = tlsf_cast(int, temp_size >> (fl - SL_INDEX_COUNT_LOG2)) ^ (1 << SL_INDEX_COUNT_LOG2);
+			fl -= (FL_INDEX_SHIFT - 1);
+		}
+
+		g_size_mapping[size].fl = fl;
+		g_size_mapping[size].sl = sl;
+	}
+
+	initialized = 1;
+}
+
+
+// 优化的映射搜索函数
+static void optimize_mapping_search(size_t size, int* fli, int* sli) {
+	// 确保表已初始化
+	initialize_mapping_table();
+
+	// 小尺寸直接查表
+	if (size <= MAX_PRECOMPUTED_SIZE) {
+		*fli = g_size_mapping[size].fl;
+		*sli = g_size_mapping[size].sl;
+		return;
+	}
+
+	// 大尺寸完全使用原始函数
+	// 注意：不要自己实现逻辑，直接调用原始函数来确保一致
+
+	// 首先进行舍入
+	if (size >= SMALL_BLOCK_SIZE) {
+		const size_t round = (1 << (tlsf_fls_sizet(size) - SL_INDEX_COUNT_LOG2)) - 1;
+		size += round;
+	}
+
+	// 然后通过原始mapping_insert计算索引
+	if (size < SMALL_BLOCK_SIZE) {
+		*fli = 0;
+		*sli = tlsf_cast(int, size) / (SMALL_BLOCK_SIZE / SL_INDEX_COUNT);
+	}
+	else {
+		*fli = tlsf_fls_sizet(size);
+		*sli = tlsf_cast(int, size >> (*fli - SL_INDEX_COUNT_LOG2)) ^ (1 << SL_INDEX_COUNT_LOG2);
+		*fli -= (FL_INDEX_SHIFT - 1);
+	}
+}
+
+// 更严格的映射函数测试
+void detailed_mapping_test(size_t size) {
+	// 原始函数的计算
+	size_t orig_size = size;
+	if (orig_size >= SMALL_BLOCK_SIZE) {
+		const size_t round = (1 << (tlsf_fls_sizet(orig_size) - SL_INDEX_COUNT_LOG2)) - 1;
+		orig_size += round;
+	}
+	int orig_fl, orig_sl;
+	mapping_insert(orig_size, &orig_fl, &orig_sl);
+
+	// 优化函数的计算
+	int opt_fl, opt_sl;
+	optimize_mapping_search(size, &opt_fl, &opt_sl);
+
+	// 比较并打印详细信息
+	if (orig_fl != opt_fl || orig_sl != opt_sl) {
+		printf("[TLSF] 映射不匹配: 大小=%zu", size);
+		printf("  原始处理: 调整大小=%zu, FL=%d, SL=%d", orig_size, orig_fl, orig_sl);
+		printf("  优化处理: FL=%d, SL=%d", opt_fl, opt_sl);
+
+		// 检查映射表中的值
+		if (size <= MAX_PRECOMPUTED_SIZE) {
+			printf("  映射表值: FL=%d, SL=%d", g_size_mapping[size].fl, g_size_mapping[size].sl);
+		}
+	}
+}
+
+// 诊断函数，用于准确定位映射计算中的差异
+void diagnose_mapping_difference(size_t size) {
+	// 记录每个步骤的中间值
+
+	// 原始算法的步骤
+	size_t orig_size = size;
+	size_t orig_rounded_size = orig_size;
+
+	if (orig_size >= SMALL_BLOCK_SIZE) {
+		int orig_fls = tlsf_fls_sizet(orig_size);
+		int orig_shift = orig_fls - SL_INDEX_COUNT_LOG2;
+		size_t orig_round = (1 << orig_shift) - 1;
+		orig_rounded_size = orig_size + orig_round;
+
+		printf("原始[%zu]: fls=%d, shift=%d, round=%zu, rounded=%zu\n",
+			orig_size, orig_fls, orig_shift, orig_round, orig_rounded_size);
+	}
+
+	int orig_fl, orig_sl;
+	if (orig_rounded_size < SMALL_BLOCK_SIZE) {
+		orig_fl = 0;
+		orig_sl = (int)orig_rounded_size / (SMALL_BLOCK_SIZE / SL_INDEX_COUNT);
+		printf("原始小块[%zu]: division=%d\n",
+			orig_rounded_size, (SMALL_BLOCK_SIZE / SL_INDEX_COUNT));
+	}
+	else {
+		orig_fl = tlsf_fls_sizet(orig_rounded_size);
+		int sl_shift = orig_fl - SL_INDEX_COUNT_LOG2;
+		int sl_unxor = (int)(orig_rounded_size >> sl_shift);
+		orig_sl = sl_unxor ^ (1 << SL_INDEX_COUNT_LOG2);
+		orig_fl -= (FL_INDEX_SHIFT - 1);
+		printf("原始大块[%zu]: fls=%d, sl_shift=%d, sl_unxor=%d, sl_mask=%d\n",
+			orig_rounded_size, orig_fl + (FL_INDEX_SHIFT - 1),
+			sl_shift, sl_unxor, (1 << SL_INDEX_COUNT_LOG2));
+	}
+
+	// 优化算法的步骤 (假设查表)
+	int opt_fl = g_size_mapping[size].fl;
+	int opt_sl = g_size_mapping[size].sl;
+
+	printf("结果比较[%zu]: 原始=[%d,%d], 优化=[%d,%d]\n",
+		size, orig_fl, orig_sl, opt_fl, opt_sl);
+}
+
+// 彻底测试映射函数
+int test_optimized_mapping_thorough() {
+	int errors = 0;
+
+	// 确保映射表已初始化
+	initialize_mapping_table();
+
+	// 测试每一个可能的小尺寸
+	for (size_t size = 0; size <= MAX_PRECOMPUTED_SIZE; size++) {
+		// 保存当前优化状态
+		int save_optimized = g_use_optimized_mapping;
+		g_use_optimized_mapping = 0;
+
+		// 计算原始结果
+		int orig_fl, orig_sl;
+		mapping_search(size, &orig_fl, &orig_sl);
+
+		// 恢复优化状态
+		g_use_optimized_mapping = save_optimized;
+
+		// 获取优化表结果
+		int opt_fl = g_size_mapping[size].fl;
+		int opt_sl = g_size_mapping[size].sl;
+
+		// 比较结果
+		if (orig_fl != opt_fl || orig_sl != opt_sl) {
+			if (errors < 10) { // 限制输出
+				printf("[TLSF] 映射测试失败: 大小=%zu, 原始=[%d,%d], 优化=[%d,%d]",
+					size, orig_fl, orig_sl, opt_fl, opt_sl);
+
+				// 如果需要更详细诊断
+				diagnose_mapping_difference(size);
+			}
+			errors++;
+		}
+	}
+
+	if (errors > 0) {
+		printf("[TLSF] 映射优化测试失败: 在%d个大小中发现%d个错误",
+			MAX_PRECOMPUTED_SIZE + 1, errors);
+		g_use_optimized_mapping = 0;
+	}
+	else {
+		printf("[TLSF] 所有映射优化测试通过!");
+	}
+
+	return errors == 0;
 }

@@ -35,9 +35,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     int featureActivationCount = 0;
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
-        //CreateConsole();
-        std::cout << "Version: 1.0.2" << std::endl; // 更新版本号
+        CreateConsole();
+        std::cout << "Version: 1.0.4" << std::endl; // 更新版本号
 
+        Sleep(500);
         // 初始化内存钩子
         if (InitializeStormMemoryHooks()) {
             std::cout << "StormMemPoolHook 初始化成功！" << std::endl;

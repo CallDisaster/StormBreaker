@@ -381,8 +381,243 @@ namespace MemPool {
     // 内部变量
     static void* g_mainPool = nullptr;
     static tlsf_t g_tlsf = nullptr;
-    static std::mutex g_poolMutex;
-    static std::atomic<bool> g_inTLSFOperation{ false }; // 新增：标记TLSF操作
+
+    // 替换单一锁为分片锁
+    constexpr size_t LOCK_SHARDS = 32;  // 32个锁分片
+    static std::mutex g_poolMutexes[LOCK_SHARDS];
+
+    // 根据内存地址或大小选择锁
+    inline size_t get_shard_index(void* ptr = nullptr, size_t size = 0) {
+        size_t hash;
+        if (ptr) {
+            hash = reinterpret_cast<uintptr_t>(ptr) / 16;  // 对齐到16字节
+        }
+        else {
+            hash = size / 16;  // 使用请求大小
+        }
+        return hash % LOCK_SHARDS;
+    }
+
+    // 加锁辅助函数
+    class MultiLockGuard {
+    private:
+        std::vector<size_t> indices;
+    public:
+        // 锁定一个分片
+        MultiLockGuard(size_t index) {
+            g_poolMutexes[index].lock();
+            indices.push_back(index);
+        }
+
+        // 锁定所有分片
+        MultiLockGuard() {
+            for (size_t i = 0; i < LOCK_SHARDS; ++i) {
+                g_poolMutexes[i].lock();
+                indices.push_back(i);
+            }
+        }
+
+        // 锁定两个分片（防止死锁）
+        MultiLockGuard(size_t index1, size_t index2) {
+            if (index1 != index2) {
+                // 按顺序锁定，避免死锁
+                if (index1 < index2) {
+                    g_poolMutexes[index1].lock();
+                    indices.push_back(index1);
+                    g_poolMutexes[index2].lock();
+                    indices.push_back(index2);
+                }
+                else {
+                    g_poolMutexes[index2].lock();
+                    indices.push_back(index2);
+                    g_poolMutexes[index1].lock();
+                    indices.push_back(index1);
+                }
+            }
+            else {
+                // 相同的分片只锁一次
+                g_poolMutexes[index1].lock();
+                indices.push_back(index1);
+            }
+        }
+
+        ~MultiLockGuard() {
+            // 反向顺序解锁
+            for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
+                g_poolMutexes[*it].unlock();
+            }
+        }
+    };
+
+    static std::atomic<bool> g_inTLSFOperation{ false };
+
+    // 不同类型的内存操作
+    enum TLSFOpType {
+        OpAlloc = 0,
+        OpFree = 1,
+        OpRealloc = 2,
+        OpExtend = 3,
+        OpStat = 4,
+        OpMax = 5  // 用于定义位图大小
+    };
+
+    // 用位图表示活跃操作
+    static std::atomic<uint32_t> g_activeOps{ 0 };
+
+    // 设置/清除操作状态的辅助函数
+    inline bool TrySetOpActive(TLSFOpType opType) {
+        uint32_t expected = g_activeOps.load(std::memory_order_relaxed);
+        uint32_t desired;
+        bool retry_op = false;
+        do {
+            // 检查此类型操作是否已活跃
+            retry_op = (expected & (1u << opType));
+            if (retry_op) break;
+
+            // 设置对应位
+            desired = expected | (1u << opType);
+        } while (!g_activeOps.compare_exchange_weak(expected, desired,
+            std::memory_order_acquire, std::memory_order_relaxed));
+
+        return !retry_op;  // 如果没有重试，则成功
+    }
+
+    inline void SetOpInactive(TLSFOpType opType) {
+        g_activeOps.fetch_and(~(1u << opType), std::memory_order_release);
+    }
+
+    // 检查是否有任何活跃操作
+    inline bool AnyOpActive() {
+        return g_activeOps.load(std::memory_order_acquire) != 0;
+    }
+
+    // 检查特定类型的操作是否活跃
+    inline bool IsOpActive(TLSFOpType opType) {
+        return (g_activeOps.load(std::memory_order_acquire) & (1u << opType)) != 0;
+    }
+
+    // 线程本地缓存结构
+    struct ThreadCache {
+        // 存储不同大小的块缓存
+        struct SizeClass {
+            std::vector<void*> blocks;  // 空闲块列表
+            size_t blockSize;           // 该大小类的块大小
+            size_t maxCount;            // 最大缓存数量
+        };
+
+        // 常用大小的缓存
+        static constexpr size_t NUM_SIZE_CLASSES = 8;
+        static constexpr size_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {
+            16, 32, 64, 128, 256, 512, 1024, 2048
+        };
+
+        SizeClass sizeClasses[NUM_SIZE_CLASSES];
+
+        // 初始化缓存
+        ThreadCache() {
+            for (size_t i = 0; i < NUM_SIZE_CLASSES; i++) {
+                sizeClasses[i].blockSize = SIZE_CLASSES[i];
+                sizeClasses[i].maxCount = 32 / (i + 1); // 大块缓存更少
+            }
+        }
+
+        // 释放所有缓存的块
+        ~ThreadCache() {
+            for (auto& sc : sizeClasses) {
+                for (void* block : sc.blocks) {
+                    if (block) {
+                        // 直接释放到全局池
+                        Free(block);
+                    }
+                }
+                sc.blocks.clear();
+            }
+        }
+    };
+
+    // 存储所有线程缓存的全局列表
+    static std::mutex g_cachesMutex;
+    static std::vector<ThreadCache*> g_allCaches;
+
+    // 线程本地存储
+    thread_local ThreadCache* tls_cache = nullptr;
+
+    // 在创建线程缓存时注册
+    void RegisterThreadCache(ThreadCache* cache) {
+        std::lock_guard<std::mutex> lock(g_cachesMutex);
+        g_allCaches.push_back(cache);
+    }
+
+    // 在销毁线程缓存时注销
+    void UnregisterThreadCache(ThreadCache* cache) {
+        std::lock_guard<std::mutex> lock(g_cachesMutex);
+        auto it = std::find(g_allCaches.begin(), g_allCaches.end(), cache);
+        if (it != g_allCaches.end()) {
+            g_allCaches.erase(it);
+        }
+    }
+
+    // 清理所有线程缓存
+    void CleanupAllThreadCaches() {
+        std::lock_guard<std::mutex> lock(g_cachesMutex);
+        for (auto cache : g_allCaches) {
+            delete cache;
+        }
+        g_allCaches.clear();
+    }
+
+    // 初始化线程缓存
+    void InitThreadCache() {
+        if (!tls_cache) {
+            tls_cache = new ThreadCache();
+            RegisterThreadCache(tls_cache);
+        }
+    }
+
+    // 清理线程缓存
+    void CleanupThreadCache() {
+        if (tls_cache) {
+            UnregisterThreadCache(tls_cache);
+            delete tls_cache;
+            tls_cache = nullptr;
+        }
+    }
+
+    // 从线程缓存分配
+    void* AllocateFromCache(size_t size) {
+        if (!tls_cache) {
+            InitThreadCache();
+        }
+
+        // 查找适合的大小类
+        for (auto& sc : tls_cache->sizeClasses) {
+            if (size <= sc.blockSize && !sc.blocks.empty()) {
+                void* block = sc.blocks.back();
+                sc.blocks.pop_back();
+                return block;
+            }
+        }
+
+        return nullptr; // 缓存中没有合适大小的块
+    }
+
+    // 尝试放入缓存
+    bool TryReturnToCache(void* ptr, size_t size) {
+        if (!tls_cache) {
+            return false;
+        }
+
+        // 查找适合的大小类
+        for (auto& sc : tls_cache->sizeClasses) {
+            if (size == sc.blockSize && sc.blocks.size() < sc.maxCount) {
+                sc.blocks.push_back(ptr);
+                return true;
+            }
+        }
+
+        return false; // 缓存已满或大小不匹配
+    }
+
 
     // 额外内存池结构
     struct ExtraPool {
@@ -399,38 +634,48 @@ namespace MemPool {
     }
 
     // 初始化内存池
-    void Initialize(size_t initialSize = TLSF_MAIN_POOL_SIZE) {
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+    bool Initialize(size_t initialSize) {
+        // 对所有分片加锁
+        std::vector<std::unique_lock<std::mutex>> locks;
+        for (size_t i = 0; i < LOCK_SHARDS; i++) {
+            locks.emplace_back(g_poolMutexes[i]);
+        }
 
         if (g_mainPool) {
             LogMessage("[MemPool] 已初始化");
-            return;
+            return true;
         }
 
         // 分配主内存池
         g_mainPool = VirtualAlloc(NULL, initialSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
         if (!g_mainPool) {
             LogMessage("[MemPool] 无法分配主内存池，大小: %zu", initialSize);
-            return;
+            return false;
         }
 
         // 初始化TLSF
         g_tlsf = tlsf_create_with_pool(g_mainPool, initialSize);
-
         if (!g_tlsf) {
             LogMessage("[MemPool] 无法创建TLSF实例");
             VirtualFree(g_mainPool, 0, MEM_RELEASE);
             g_mainPool = nullptr;
-            return;
+            return false;
         }
 
+        // 初始化线程缓存
+        InitThreadCache();
+
         LogMessage("[MemPool] 已初始化，大小: %zu 字节，地址: %p", initialSize, g_mainPool);
+        return true;
     }
 
-    // 在MemPool命名空间中添加此函数
     void DisableActualFree() {
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 获取所有分片锁，确保全局设置的一致性
+        std::vector<std::unique_lock<std::mutex>> locks;
+        for (size_t i = 0; i < LOCK_SHARDS; i++) {
+            locks.emplace_back(g_poolMutexes[i]);
+        }
+
         g_disableActualFree = true;
         LogMessage("[MemPool] 已禁用实际内存释放");
     }
@@ -443,7 +688,7 @@ namespace MemPool {
 
     // 清理资源
     void Shutdown() {
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        std::vector<std::unique_lock<std::mutex>> locks;
 
         // 仅清理数据结构引用，不释放实际内存
         if (g_disableMemoryReleasing.load()) {
@@ -473,6 +718,9 @@ namespace MemPool {
             g_mainPool = nullptr;
         }
 
+        // 清理线程缓存
+        CleanupThreadCache();
+
         LogMessage("[MemPool] 关闭并释放内存完成");
     }
 
@@ -484,10 +732,10 @@ namespace MemPool {
             return false;
         }
 
-        // 如果调用者已经持有锁，则不需要再获取锁
-        std::unique_ptr<std::lock_guard<std::mutex>> lockPtr;
+        // 如果调用者没有持有锁，我们需要获取锁
+        std::unique_ptr<MultiLockGuard> lockGuard;
         if (!callerHasLock) {
-            lockPtr = std::make_unique<std::lock_guard<std::mutex>>(g_poolMutex);
+            lockGuard = std::make_unique<MultiLockGuard>();  // 锁定所有分片
         }
 
         if (!g_tlsf) {
@@ -524,8 +772,8 @@ namespace MemPool {
 
     // 分配内存 - 保护版
     void* AllocateSafe(size_t size) {
+        // 在不安全期间直接使用系统分配
         if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-            // 在不安全期间使用系统分配
             void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!sysPtr) {
@@ -539,9 +787,15 @@ namespace MemPool {
             return userPtr;
         }
 
-        if (g_inTLSFOperation.exchange(true)) {
-            LogMessage("[MemPool] Allocate: TLSF操作正在进行，回退到系统分配");
-            g_inTLSFOperation = false;
+        // 先尝试从线程缓存分配
+        void* ptr = AllocateFromCache(size);
+        if (ptr) {
+            return ptr;
+        }
+
+        // 尝试设置Alloc操作为活跃
+        if (!TrySetOpActive(TLSFOpType::OpAlloc)) {
+            LogMessage("[MemPool] Allocate: TLSF分配操作正在进行，回退到系统分配");
 
             // 使用系统分配作为备选
             void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
@@ -553,20 +807,27 @@ namespace MemPool {
             return userPtr;
         }
 
-        void* ptr = Allocate(size);
-        g_inTLSFOperation = false;
+        // 成功设置活跃标记，进行正常分配
+        ptr = Allocate(size);
+
+        // 清除活跃标记
+        SetOpInactive(TLSFOpType::OpAlloc);
         return ptr;
     }
+
 
     // 分配内存
     void* Allocate(size_t size) {
         if (!g_tlsf) {
             // 懒初始化
-            Initialize();
+            Initialize(TLSF_MAIN_POOL_SIZE);
             if (!g_tlsf) return nullptr;
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 使用分片锁，根据大小选择锁
+        size_t lockIndex = get_shard_index(nullptr, size);
+        g_poolMutexes[lockIndex].lock();
+        std::vector<size_t> lockedIndices = { lockIndex };
 
         void* ptr = tlsf_malloc(g_tlsf, size);
         if (!ptr) {
@@ -575,12 +836,13 @@ namespace MemPool {
             LogMessage("[MemPool] 分配失败，大小: %zu，扩展内存池: %zu 字节",
                 size, extraSize);
 
-            // 传递callerHasLock=true表示调用者已持有锁
+            // 扩展池，传入当前已锁定的索引
             if (AddExtraPool(extraSize, true)) {
                 ptr = tlsf_malloc(g_tlsf, size);
             }
         }
 
+        g_poolMutexes[lockIndex].unlock();
         return ptr;
     }
 
@@ -602,19 +864,40 @@ namespace MemPool {
                 blockSize = 0;
             }
 
-            // 在不安全期间，加入延迟释放队列而不是直接返回
+            // 在不安全期间，加入延迟释放队列
             g_MemSafety.EnqueueDeferredFree(ptr, blockSize);
             return;
         }
 
-        if (g_inTLSFOperation.exchange(true)) {
-            LogMessage("[MemPool] Free: TLSF操作正在进行，跳过");
-            g_inTLSFOperation = false;
+        // 尝试获取块大小
+        size_t blockSize = 0;
+        try {
+            StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
+                static_cast<char*>(ptr) - sizeof(StormAllocHeader));
+            if (header->Magic == STORM_MAGIC) {
+                blockSize = header->Size;
+            }
+        }
+        catch (...) {
+            blockSize = 0;
+        }
+
+        // 先尝试放入线程缓存
+        if (blockSize > 0 && TryReturnToCache(ptr, blockSize)) {
+            return; // 成功放入缓存
+        }
+
+        // 尝试设置Free操作为活跃
+        if (!TrySetOpActive(TLSFOpType::OpFree)) {
+            LogMessage("[MemPool] Free: TLSF释放操作正在进行，跳过");
             return;
         }
 
+        // 成功设置活跃标记，进行正常释放
         Free(ptr);
-        g_inTLSFOperation = false;
+
+        // 清除活跃标记
+        SetOpInactive(TLSFOpType::OpFree);
     }
 
     // 释放内存
@@ -627,7 +910,9 @@ namespace MemPool {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 使用基于指针地址的分片锁
+        size_t lockIndex = get_shard_index(ptr);
+        MultiLockGuard lock(lockIndex);
 
         // 确保指针来自我们的池
         if (IsFromPool(ptr)) {
@@ -697,9 +982,9 @@ namespace MemPool {
             return newPtr;
         }
 
-        if (g_inTLSFOperation.exchange(true)) {
-            LogMessage("[MemPool] Realloc: TLSF操作正在进行，使用备选策略");
-            g_inTLSFOperation = false;
+        // 尝试设置Realloc操作为活跃
+        if (!TrySetOpActive(TLSFOpType::OpRealloc)) {
+            LogMessage("[MemPool] Realloc: TLSF重分配操作正在进行，使用备选策略");
 
             // 使用分配+复制+释放的备选策略
             void* newPtr = AllocateSafe(newSize);
@@ -727,8 +1012,11 @@ namespace MemPool {
             return newPtr;
         }
 
+        // 成功设置活跃标记，进行正常重分配
         void* ptr = Realloc(oldPtr, newSize);
-        g_inTLSFOperation = false;
+
+        // 清除活跃标记
+        SetOpInactive(TLSFOpType::OpRealloc);
         return ptr;
     }
 
@@ -741,7 +1029,10 @@ namespace MemPool {
             return nullptr;
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 使用两个锁
+        size_t oldLockIndex = get_shard_index(oldPtr);
+        size_t newLockIndex = get_shard_index(nullptr, newSize);
+        MultiLockGuard lock(oldLockIndex, newLockIndex);
 
         // 确保旧指针来自我们的池
         if (!IsFromPool(oldPtr)) {
@@ -756,9 +1047,31 @@ namespace MemPool {
             LogMessage("[MemPool] 重新分配失败，大小: %zu，扩展内存池: %zu 字节",
                 newSize, extraSize);
 
-            // 传递callerHasLock=true表示调用者已持有锁
-            if (AddExtraPool(extraSize, true)) {
-                newPtr = tlsf_realloc(g_tlsf, oldPtr, newSize);
+            // 扩展池需要所有锁
+            // 先解锁当前锁，再获取所有锁
+            if (oldLockIndex != newLockIndex) {
+                g_poolMutexes[oldLockIndex].unlock();
+                g_poolMutexes[newLockIndex].unlock();
+            }
+            else {
+                g_poolMutexes[oldLockIndex].unlock();
+            }
+
+            {
+                MultiLockGuard allLocks;
+                bool poolAdded = AddExtraPool(extraSize, true);  // 传入true表示调用者已持有锁
+                if (poolAdded) {
+                    newPtr = tlsf_realloc(g_tlsf, oldPtr, newSize);
+                }
+            }
+
+            // 重新锁定
+            if (oldLockIndex != newLockIndex) {
+                g_poolMutexes[oldLockIndex].lock();
+                g_poolMutexes[newLockIndex].lock();
+            }
+            else {
+                g_poolMutexes[oldLockIndex].lock();
             }
         }
 
@@ -805,7 +1118,9 @@ namespace MemPool {
             return 0; // 正在进行TLSF操作时返回0
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 不需要锁定特定分片，使用一个临时锁
+        std::mutex tempMutex;
+        std::lock_guard<std::mutex> lock(tempMutex);
 
         PoolUsageStats stats;
 
@@ -834,7 +1149,9 @@ namespace MemPool {
             return 0; // 正在进行TLSF操作时返回0
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 不需要锁定特定分片，使用一个临时锁
+        std::mutex tempMutex;
+        std::lock_guard<std::mutex> lock(tempMutex);
 
         size_t total = TLSF_MAIN_POOL_SIZE;
         for (const auto& pool : g_extraPools) {
@@ -844,6 +1161,7 @@ namespace MemPool {
         g_inTLSFOperation = false;
         return total;
     }
+
 
     // 打印统计信息
     void PrintStats() {
@@ -858,7 +1176,11 @@ namespace MemPool {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 获取所有分片锁，因为我们需要一致的视图
+        std::vector<std::unique_lock<std::mutex>> locks;
+        for (size_t i = 0; i < LOCK_SHARDS; i++) {
+            locks.emplace_back(g_poolMutexes[i]);
+        }
 
         LogMessage("[MemPool] === 内存池统计 ===");
 
@@ -917,7 +1239,12 @@ namespace MemPool {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_poolMutex);
+        // 获取所有分片锁，因为我们需要完全控制所有内存池
+        std::vector<std::unique_lock<std::mutex>> locks;
+        for (size_t i = 0; i < LOCK_SHARDS; i++) {
+            locks.emplace_back(g_poolMutexes[i]);
+        }
+
         bool poolsFreed = false;
 
         // 从后向前扫描，释放完全空闲的扩展池
@@ -926,17 +1253,12 @@ namespace MemPool {
             tlsf_walk_pool(it->memory, GatherUsageCallback, &stats);
 
             if (stats.used == 0) {
-                // 这个池完全空闲，可以释放
                 LogMessage("[MemPool] 释放未使用的额外池: %p (大小: %zu 字节)",
                     it->memory, it->size);
 
-                // 从TLSF中移除
                 tlsf_remove_pool(g_tlsf, it->memory);
-
-                // 释放内存
                 VirtualFree(it->memory, 0, MEM_RELEASE);
 
-                // 从列表中移除(注意反向迭代器的特殊处理)
                 auto normalIt = std::next(it).base();
                 normalIt = g_extraPools.erase(normalIt);
                 it = std::reverse_iterator<decltype(normalIt)>(normalIt);

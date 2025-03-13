@@ -174,4 +174,3 @@ private:
     bool m_initialized;
     std::mutex m_logMutex;
 };
-

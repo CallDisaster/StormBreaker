@@ -129,7 +129,7 @@ void Hooked_StormHeap_CleanupAll();
 
 // TLSF内存池封装
 namespace MemPool {
-    void Initialize(size_t initialSize);
+    bool Initialize(size_t initialSize);
     void Shutdown();
     void* Allocate(size_t size);
     void Free(void* ptr);
