@@ -242,7 +242,7 @@ static inline int optimized_ffs(unsigned int word) {
 #elif defined(__GNUC__) || defined(__clang__)
 	// GCC/Clang平台使用内置函数
 	if (word == 0) return -1;
-	return __builtin_ctz(word);  // 直接使用计算后缀零数的内建函数
+	return __builtin_ctz(word);  // 直接使用计数后缀零数的内建函数
 #else
 	// 通用优化实现
 	static const unsigned char MultiplyDeBruijnBitPosition[32] = {
@@ -414,6 +414,8 @@ int test_optimized_bitops() {
 
 	return errors == 0;
 }
+
+
 
 /*
 ** Constants.
@@ -785,7 +787,7 @@ static void mapping_search(size_t size, int* fli, int* sli) {
 		return;
 	}
 
-	// 原始实现
+	// 原始实现保留为备选
 	if (size >= SMALL_BLOCK_SIZE) {
 		const size_t round = (1 << (tlsf_fls_sizet(size) - SL_INDEX_COUNT_LOG2)) - 1;
 		size += round;
@@ -1675,7 +1677,6 @@ static void initialize_mapping_table() {
 		// 完全复制原始mapping_search函数的逻辑
 		size_t temp_size = size;
 		if (temp_size >= SMALL_BLOCK_SIZE) {
-			// 注意：这里必须使用原始的tlsf_fls_sizet，不是优化版本
 			const size_t round = (1 << (tlsf_fls_sizet(temp_size) - SL_INDEX_COUNT_LOG2)) - 1;
 			temp_size += round;
 		}
@@ -1711,26 +1712,16 @@ static void optimize_mapping_search(size_t size, int* fli, int* sli) {
 		return;
 	}
 
-	// 大尺寸完全使用原始函数
-	// 注意：不要自己实现逻辑，直接调用原始函数来确保一致
-
-	// 首先进行舍入
+	// 大尺寸使用原始算法
 	if (size >= SMALL_BLOCK_SIZE) {
 		const size_t round = (1 << (tlsf_fls_sizet(size) - SL_INDEX_COUNT_LOG2)) - 1;
 		size += round;
 	}
 
 	// 然后通过原始mapping_insert计算索引
-	if (size < SMALL_BLOCK_SIZE) {
-		*fli = 0;
-		*sli = tlsf_cast(int, size) / (SMALL_BLOCK_SIZE / SL_INDEX_COUNT);
-	}
-	else {
-		*fli = tlsf_fls_sizet(size);
-		*sli = tlsf_cast(int, size >> (*fli - SL_INDEX_COUNT_LOG2)) ^ (1 << SL_INDEX_COUNT_LOG2);
-		*fli -= (FL_INDEX_SHIFT - 1);
-	}
+	mapping_insert(size, fli, sli);
 }
+
 
 // 更严格的映射函数测试
 void detailed_mapping_test(size_t size) {

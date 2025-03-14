@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <psapi.h>  // 添加这个头文件
+#include <queue>
 #pragma comment(lib, "psapi.lib")
 
 // Storm结构体定义
@@ -151,6 +152,74 @@ struct TempStabilizerBlock {
     int ttl;  // 生存周期，按 CleanAll 计数
 };
 
+class LargeBlockCache {
+private:
+    struct CachedBlock {
+        void* ptr;
+        size_t size;
+        DWORD timestamp;
+    };
+
+    std::vector<CachedBlock> m_blocks;
+    mutable std::mutex m_mutex;
+    const size_t MAX_CACHE_SIZE = 10;
+
+public:
+    void* GetBlock(size_t size);
+    void ReleaseBlock(void* ptr, size_t size);
+    size_t GetCacheSize() const;
+};
+
+extern LargeBlockCache g_largeBlockCache;
+
+class AsyncMemoryReleaser {
+private:
+    struct DeferredFree {
+        void* ptr;
+        size_t size;
+        DWORD queueTime;
+    };
+
+    std::queue<DeferredFree> m_queue;
+    mutable std::mutex m_mutex;  // 使用mutable关键字
+    std::thread m_thread;
+    std::atomic<bool> m_shouldExit{ false };
+
+    void WorkerThread();
+
+public:
+    AsyncMemoryReleaser();
+    ~AsyncMemoryReleaser();
+
+    void QueueFree(void* ptr, size_t size);
+    size_t GetQueueSize() const;
+};
+
+extern AsyncMemoryReleaser g_asyncReleaser;
+
+class AllocationProfiler {
+private:
+    struct SizeStats {
+        size_t allocCount;
+        size_t totalSize;
+        DWORD lastAllocTime;
+    };
+
+    std::mutex m_mutex;
+    std::unordered_map<size_t, SizeStats> m_stats;
+    std::vector<size_t> m_hotSizes;
+    DWORD m_lastUpdate;
+
+public:
+    AllocationProfiler();
+
+    void RecordAllocation(size_t size);
+    void UpdateHotSizes();
+    const std::vector<size_t>& GetHotSizes();
+    void PrintStats();
+};
+
+extern AllocationProfiler g_allocProfiler;
 
 void GenerateMemoryReport(bool forceWrite = false);
 size_t GetStormVirtualMemoryUsage();
