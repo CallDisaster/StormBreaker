@@ -412,16 +412,18 @@ void MemorySafety::ProcessDeferredFreeQueue() noexcept {
         while (current) {
             // 尝试释放内存
             __try {
-                // 修改：检查是否是mimalloc管理的内存
+                // 判断内存所有权
                 if (MemPool::IsFromPool(current->ptr)) {
                     // 使用mimalloc释放
                     MemPool::FreeSafe(current->ptr);
                 }
                 else {
-                    // 使用系统释放
-                    VirtualFree(current->ptr, 0, MEM_RELEASE);
+                    // 尝试作为系统内存释放
+                    void* rawPtr = static_cast<char*>(current->ptr) - sizeof(StormAllocHeader);
+                    VirtualFree(rawPtr, 0, MEM_RELEASE);
                 }
 
+                LogMessage("[MemorySafety] 处理延迟释放: %p", current->ptr);
                 processedCount++;
 
                 // 移除此项

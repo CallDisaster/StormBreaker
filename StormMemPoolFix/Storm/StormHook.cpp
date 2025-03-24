@@ -43,7 +43,9 @@ std::atomic<bool> g_disableMemoryReleasing{ false };
 HANDLE g_statsThreadHandle = NULL;
 
 // 全局变量定义
-std::atomic<size_t> g_bigThreshold{ 128 * 1024 };      // 默认512KB为大块阈值
+std::atomic<size_t> g_bigThreshold{ 256 * 1024 };      // 默认512KB为大块阈值
+// 主内存池大小: 32MB
+constexpr size_t TLSF_MAIN_POOL_SIZE = 12 * 1024 * 1024;
 std::mutex g_bigBlocksMutex;
 std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
 MemoryStats g_memStats;
@@ -109,69 +111,6 @@ void LargeBlockCache::ReleaseBlock(void* ptr, size_t size) {
 size_t LargeBlockCache::GetCacheSize() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_blocks.size();
-}
-
-AsyncMemoryReleaser g_asyncReleaser;
-
-AsyncMemoryReleaser::AsyncMemoryReleaser() {
-    m_thread = std::thread(&AsyncMemoryReleaser::WorkerThread, this);
-    LogMessage("[异步释放] 工作线程已启动");
-}
-
-AsyncMemoryReleaser::~AsyncMemoryReleaser() {
-    m_shouldExit = true;
-    if (m_thread.joinable()) {
-        m_thread.join();
-    }
-
-    // 释放队列中的所有内存
-    std::lock_guard<std::mutex> lock(m_mutex);
-    while (!m_queue.empty()) {
-        DeferredFree item = m_queue.front();
-        VirtualFree(item.ptr, 0, MEM_RELEASE);
-        m_queue.pop();
-    }
-    LogMessage("[异步释放] 工作线程已关闭");
-}
-
-void AsyncMemoryReleaser::WorkerThread() {
-    while (!m_shouldExit) {
-        std::vector<DeferredFree> itemsToFree;
-
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            // 批量处理，每次最多100个
-            for (int i = 0; i < 100 && !m_queue.empty(); i++) {
-                itemsToFree.push_back(m_queue.front());
-                m_queue.pop();
-            }
-        }
-
-        // 实际释放内存
-        for (const auto& item : itemsToFree) {
-            VirtualFree(item.ptr, 0, MEM_RELEASE);
-        }
-
-        if (itemsToFree.size() > 0) {
-            LogMessage("[异步释放] 释放了%zu个块", itemsToFree.size());
-        }
-
-        // 如果队列为空，休眠一会儿
-        if (itemsToFree.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-}
-
-void AsyncMemoryReleaser::QueueFree(void* ptr, size_t size) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    DeferredFree item{ ptr, size, GetTickCount() };
-    m_queue.push(item);
-}
-
-size_t AsyncMemoryReleaser::GetQueueSize() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_queue.size();
 }
 
 AllocationProfiler g_allocProfiler;
@@ -304,7 +243,6 @@ void GenerateMemoryReport(bool forceWrite) {
     size_t miTotal = GetTLSFPoolTotal();    // 实际使用mimalloc，但函数名保持一致
     size_t managed = g_bigBlocks.size();
     size_t cachedBlocks = g_largeBlockCache.GetCacheSize();
-    size_t asyncQueueSize = g_asyncReleaser.GetQueueSize();
 
     // 计算使用率
     double miUsagePercent = miTotal > 0 ? (miUsed * 100.0 / miTotal) : 0.0;
@@ -335,7 +273,6 @@ void GenerateMemoryReport(bool forceWrite) {
         "mimalloc 内存池: %zu MB / %zu MB (%.1f%%)\n"
         "mimalloc 管理块数量: %zu\n"
         "大块缓存: %zu 个\n"
-        "异步释放队列: %zu 个\n"
         "工作集大小: %zu MB\n"
         "虚拟内存总量: %zu MB\n"
         "========================\n",
@@ -344,7 +281,6 @@ void GenerateMemoryReport(bool forceWrite) {
         miUsed / (1024 * 1024), miTotal / (1024 * 1024), miUsagePercent,
         managed,
         cachedBlocks,
-        asyncQueueSize,
         workingSetMB,
         virtualMemMB
     );
@@ -390,6 +326,15 @@ bool SafeMemCopy(void* dest, const void* src, size_t size) noexcept {
     if (!dest || !src || size == 0) return false;
 
     __try {
+        // 如果是mimalloc管理的内存，先验证指针有效性
+        if (MemPool::IsFromPool(dest) || MemPool::IsFromPool(const_cast<void*>(src))) {
+            // 至少有一个指针来自mimalloc池，验证指针有效
+            if (!MemPool::ValidatePointer(dest) || !MemPool::ValidatePointer(const_cast<void*>(src))) {
+                LogMessage("[SafeMemCopy] 指针验证失败: dest=%p, src=%p", dest, src);
+                return false;
+            }
+        }
+
         // 分块复制，降低崩溃风险
         const size_t CHUNK_SIZE = 4096;
         const char* srcPtr = static_cast<const char*>(src);
@@ -397,16 +342,25 @@ bool SafeMemCopy(void* dest, const void* src, size_t size) noexcept {
 
         for (size_t offset = 0; offset < size; offset += CHUNK_SIZE) {
             size_t bytesToCopy = (offset + CHUNK_SIZE > size) ? (size - offset) : CHUNK_SIZE;
-            memcpy(destPtr + offset, srcPtr + offset, bytesToCopy);
+            __try {
+                memcpy(destPtr + offset, srcPtr + offset, bytesToCopy);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                LogMessage("[SafeMemCopy] 内存复制异常: offset=%zu, 错误=0x%x",
+                    offset, GetExceptionCode());
+                return false;
+            }
         }
+
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogMessage("[SafeMemCopy] 复制失败: dest=%p, src=%p, size=%zu, 错误=0x%x",
+        LogMessage("[SafeMemCopy] 内存复制总异常: dest=%p, src=%p, size=%zu, 错误=0x%x",
             dest, src, size, GetExceptionCode());
         return false;
     }
 }
+
 
 
 // 尝试获取内存块的大小
@@ -562,9 +516,6 @@ void* AllocateJassVMMemory(size_t size) {
     return userPtr;
 }
 
-// 主内存池大小: 64MB
-constexpr size_t TLSF_MAIN_POOL_SIZE = 64 * 1024 * 1024;
-
 ///////////////////////////////////////////////////////////////////////////////
 // 统计信息线程
 ///////////////////////////////////////////////////////////////////////////////
@@ -621,9 +572,6 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
 
             // 大块缓存状态
             LogMessage("[内存状态] 大块缓存大小: %zu", g_largeBlockCache.GetCacheSize());
-
-            // 异步释放队列状态
-            LogMessage("[内存状态] 异步释放队列大小: %zu", g_asyncReleaser.GetQueueSize());
 
             // 大块跟踪统计
             {
@@ -783,13 +731,17 @@ void CreateStabilizingBlocks(int cleanAllCount) {
     while (it != g_tempStabilizers.end()) {
         it->ttl--;
         if (it->ttl <= 0) {
-            // 释放块
-            MemPool::FreeSafe(it->ptr);
+            // 检查指针有效性
+            if (it->ptr) {
+                // 先从big blocks中移除
+                {
+                    std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+                    g_bigBlocks.erase(it->ptr);
+                }
 
-            // 从大块管理中移除
-            {
-                std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
-                g_bigBlocks.erase(it->ptr);
+                // 不直接调用Free，使用VirtualFree
+                void* rawPtr = static_cast<char*>(it->ptr) - sizeof(StormAllocHeader);
+                VirtualFree(rawPtr, 0, MEM_RELEASE);
             }
 
             // 从列表移除
@@ -809,7 +761,6 @@ void CreateStabilizingBlocks(int cleanAllCount) {
 
     // 只创建几个块
     int numBlocks = 2;
-
     LogMessage("[StabilizerBlocks] 创建%d个临时稳定块 (第%d次CleanAll)",
         numBlocks, cleanAllCount);
 
@@ -1041,14 +992,10 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
                     free((void*)blockInfo.source);
                 }
 
-                // 对于大块，考虑放入缓存或异步释放
+                // 对于大块，考虑放入缓存
                 if (blockInfo.size >= g_bigThreshold.load()) {
-                    // 如果在不安全期，使用异步释放
-                    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-                        g_asyncReleaser.QueueFree(blockInfo.rawPtr, blockInfo.size);
-                    }
-                    // 否则尝试放入缓存
-                    else if (g_largeBlockCache.GetCacheSize() < 10) {
+                    // 尝试放入缓存
+                    if (g_largeBlockCache.GetCacheSize() < 10) {
                         g_largeBlockCache.ReleaseBlock(blockInfo.rawPtr, blockInfo.size);
                     }
                     // 缓存已满，直接释放

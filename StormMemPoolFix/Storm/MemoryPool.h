@@ -47,6 +47,7 @@ namespace MemPool {
     void CheckAndFreeUnusedPools();
     void* CreateStabilizingBlock(size_t size, const char* purpose);
     size_t GetBlockSize(void* ptr);
-    void DisableActualFree();  // 添加此声明
+    bool ValidatePointer(void* ptr);
+    void DisableActualFree();
 
 }
