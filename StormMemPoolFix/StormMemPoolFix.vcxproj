@@ -75,7 +75,7 @@
     <OutDir>E:\Work\War3\StormBreaker</OutDir>
     <ExternalIncludePath>$(ProjectDir)Dependencies\Detours\include;$(ProjectDir)Dependencies\mimalloc-dev\include;$(ProjectDir)Dependencies\spdlog\include;$(ProjectDir)Dependencies\tlsf;$(ExternalIncludePath)</ExternalIncludePath>
     <IncludePath>$(ProjectDir);$(IncludePath)</IncludePath>
-    <LibraryPath>E:\Mycode\C++\StormMemPoolFix\StormMemPoolFix\StormMemPoolFix\Dependencies\mimalloc-dev\build\Release;$(ProjectDir)\Dependencies\Detours\lib.X86;$(LibraryPath)</LibraryPath>
+    <LibraryPath>$(ProjectDir)\Dependencies\;$(ProjectDir)\Dependencies\Detours\lib.X86;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -112,7 +112,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>detours.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>detours.lib;mimalloc.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)$(TargetName).asi</OutputFile>
     </Link>
   </ItemDefinitionGroup>
@@ -161,7 +161,6 @@
     <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
-    <ClInclude Include="Storm\tlsf.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Base\MemroySafety.cpp" />
@@ -176,10 +175,6 @@
     <ClCompile Include="Storm\StormHeapHook.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />
-    <ClCompile Include="Storm\tlsf.c">
-      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Default</CompileAs>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
-    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -10,6 +10,7 @@
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include "StormHook.h"
+#include "Base/MemorySafety.h"
 
 
 #pragma comment(lib, "dbghelp.lib")
@@ -42,131 +43,110 @@ static std::atomic<size_t> s_totalUsage{ 0 };
 // 互斥保护
 static std::mutex s_mutex;
 
+// 在适当的头文件中
 namespace JVM_MemPool {
+    // 私有变量
+    static mi_heap_t* g_jvmHeap = nullptr;
+    static std::mutex g_jvmMutex;
+    static std::unordered_map<void*, size_t> g_jvmBlocks;
 
-void Initialize() {
-    // 这里如果你想用动态分配，可以在此处 malloc/VirtualAlloc 大片内存
-    // 再拆分成 PoolCapacity 个块。演示就不写了。
-    std::lock_guard<std::mutex> lock(s_mutex);
-    std::memset(s_usedFlags, false, sizeof(s_usedFlags));
-    s_totalUsage = 0;
-    printf("[MemPool] Initialize done.\n");
-}
-
-void* Allocate(std::size_t size) {
-    // 只处理特定 size
-    if (size != BlockSize) {
-        return nullptr; // 返回空, 让外部去走原来或别的分配器
-    }
-    std::lock_guard<std::mutex> lock(s_mutex);
-
-    // 检查是否会超 0x7FFFFFFF
-    // 注：这里假设每个分配都是 RealBlockSize，如果你想更精确，可以记录已用块 * RealBlockSize
-    if (s_totalUsage.load() + RealBlockSize > 0x7FFFFFFF) {
-        // 超过了 => 分配失败，让外面走原 Storm
-        printf("[MemPool] usage limit exceeded (>=0x7FFFFFFF), fallback.\n");
-        return nullptr;
-    }
-
-    // 找到一个空闲块
-    for (std::size_t i = 0; i < PoolCapacity; i++) {
-        if (!s_usedFlags[i]) {
-            // 占用它
-            s_usedFlags[i] = true;
-            // 写header
-            BlockHeader* header = reinterpret_cast<BlockHeader*>(&s_poolMemory[i][0]);
-            header->magic = POOL_MAGIC;
-            s_totalUsage += RealBlockSize;
-
-            // 用户指针在头部之后
-            unsigned char* userPtr = &s_poolMemory[i][0] + sizeof(BlockHeader);
-            // 清空下用户区(可选)
-            std::memset(userPtr, 0, BlockSize);
-            return userPtr;
+    // 初始化
+    void Initialize() {
+        std::lock_guard<std::mutex> lock(g_jvmMutex);
+        if (!g_jvmHeap) {
+            g_jvmHeap = mi_heap_new();
+            if (g_jvmHeap) {
+                LogMessage("[JVM_MemPool] mimalloc JVM堆创建成功");
+            }
+            else {
+                LogMessage("[JVM_MemPool] mimalloc JVM堆创建失败");
+            }
         }
     }
 
-    // 没有可用空闲块 => 返回 nullptr，走原始分配
-    // 也可以自行扩容或其他策略
-    return nullptr;
-}
+    // 分配
+    void* Allocate(size_t size) {
+        std::lock_guard<std::mutex> lock(g_jvmMutex);
+        if (!g_jvmHeap) {
+            Initialize();
+            if (!g_jvmHeap) return nullptr;
+        }
 
+        void* ptr = mi_heap_malloc(g_jvmHeap, size);
+        if (ptr) {
+            g_jvmBlocks[ptr] = size;
+            //LogMessage("[JVM_MemPool] 分配: %p, 大小: %zu", ptr, size);
+        }
 
-
-void Free(void* p) {
-    if (!p) return;
-    // 找到对应 header
-    unsigned char* rawPtr = reinterpret_cast<unsigned char*>(p) - sizeof(BlockHeader);
-    BlockHeader* header = reinterpret_cast<BlockHeader*>(rawPtr);
-    if (header->magic != POOL_MAGIC) {
-        // 不是我们分配的
-        return;
+        return ptr;
     }
 
-    std::lock_guard<std::mutex> lock(s_mutex);
+    // 释放
+    void Free(void* ptr) {
+        if (!ptr) return;
 
-    // 计算出是第几个块
-    std::ptrdiff_t index = (reinterpret_cast<unsigned char(*)[RealBlockSize]>(rawPtr)
-                           - reinterpret_cast<unsigned char(*)[RealBlockSize]>(&s_poolMemory[0][0]));
-    // 安全检查
-    if (index < 0 || index >= (std::ptrdiff_t)PoolCapacity) {
-        // 理论上不该发生
-        return;
+        std::lock_guard<std::mutex> lock(g_jvmMutex);
+        auto it = g_jvmBlocks.find(ptr);
+        if (it != g_jvmBlocks.end()) {
+            g_jvmBlocks.erase(it);
+            mi_free(ptr);
+            //LogMessage("[JVM_MemPool] 释放: %p", ptr);
+        }
     }
 
-    // 标记为空闲
-    s_usedFlags[index] = false;
-    s_totalUsage -= RealBlockSize; // 释放
-}
+    // 重新分配
+    void* Realloc(void* ptr, size_t newSize) {
+        if (!ptr) return Allocate(newSize);
+        if (newSize == 0) {
+            Free(ptr);
+            return nullptr;
+        }
 
-void* JVM_MemPool::Realloc(void* oldPtr, size_t newSize) {
-    if (!oldPtr) return Allocate(newSize);
-    if (newSize == 0) {
-        Free(oldPtr);
+        std::lock_guard<std::mutex> lock(g_jvmMutex);
+        auto it = g_jvmBlocks.find(ptr);
+        if (it != g_jvmBlocks.end()) {
+            void* newPtr = mi_heap_realloc(g_jvmHeap, ptr, newSize);
+            if (newPtr) {
+                g_jvmBlocks.erase(it);
+                g_jvmBlocks[newPtr] = newSize;
+                //LogMessage("[JVM_MemPool] 重分配: %p -> %p, 大小: %zu",
+                //    ptr, newPtr, newSize);
+                return newPtr;
+            }
+        }
+
         return nullptr;
     }
 
-    // 检查是否来自我们的池
-    if (!IsFromPool(oldPtr)) {
-        return nullptr; // 不是我们的内存，无法重新分配
+    // 检查是否来自此池
+    bool IsFromPool(void* ptr) {
+        if (!ptr || !g_jvmHeap) return false;
+
+        std::lock_guard<std::mutex> lock(g_jvmMutex);
+        return g_jvmBlocks.find(ptr) != g_jvmBlocks.end();
     }
 
-    // 如果新大小不是我们支持的大小，则需要分配并复制
-    if (newSize != BlockSize) {
-        // 分配新块
-        void* newPtr = Allocate(newSize);
-        if (!newPtr) return nullptr;
+    // 清理
+    void Cleanup() {
+        std::lock_guard<std::mutex> lock(g_jvmMutex);
 
-        // 复制数据（注意保守复制最小的大小）
-        size_t copySize = min(newSize, BlockSize);
-        std::memcpy(newPtr, oldPtr, copySize);
+        if (g_jvmHeap) {
+            // 如果设置了不释放内存，则只清理数据结构
+            if (g_disableMemoryReleasing.load()) {
+                LogMessage("[JVM_MemPool] 保留JVM堆内存，仅清理数据结构");
+                g_jvmBlocks.clear();
+                g_jvmHeap = nullptr;
+                return;
+            }
 
-        // 释放旧块
-        Free(oldPtr);
-        return newPtr;
+            // 正常清理
+            mi_heap_destroy(g_jvmHeap);
+            g_jvmHeap = nullptr;
+            g_jvmBlocks.clear();
+            LogMessage("[JVM_MemPool] JVM堆已销毁");
+        }
     }
-
-    // 如果新旧大小都是BlockSize，直接返回原指针（无需实际重新分配）
-    return oldPtr;
 }
-
-bool IsFromPool(void* p) {
-    if (!p) return false;
-    // 检查 magic
-    unsigned char* rawPtr = reinterpret_cast<unsigned char*>(p) - sizeof(BlockHeader);
-    BlockHeader* header = reinterpret_cast<BlockHeader*>(rawPtr);
-    return (header->magic == POOL_MAGIC);
-}
-
-void Cleanup() {
-    std::lock_guard<std::mutex> lock(s_mutex);
-    // 如果是静态数组，这里啥也不用真的 free；把标记置空即可
-    std::memset(s_usedFlags, false, sizeof(s_usedFlags));
-    s_totalUsage = 0;
-    printf("[MemPool] Cleanup done.\n");
-}
-
-} // namespace MemPool
 
 // ------- 小块内存池实现 -------
 namespace SmallBlockPool {
@@ -237,5 +217,399 @@ namespace SmallBlockPool {
 
         // 超过缓存上限，让Storm处理
         return false;
+    }
+}
+
+// 全局变量
+namespace MemPool {
+    // mimalloc堆实例
+    static mi_heap_t* g_mainHeap = nullptr;
+    static mi_heap_t* g_safeHeap = nullptr;  // 安全操作专用堆
+
+    std::atomic<bool> g_inOperation{ false };  // 替代原g_inTLSFOperation
+
+    // 初始总池大小
+    static std::atomic<size_t> g_totalPoolSize{ 0 };
+    static std::atomic<size_t> g_usedSize{ 0 };
+
+    // 分片锁数量
+    constexpr size_t LOCK_SHARDS = 32;
+    static std::mutex g_poolMutexes[LOCK_SHARDS];
+
+    // 控制标志
+    static std::atomic<bool> g_inMiMallocOperation{ false };
+    static std::atomic<bool> g_disableMemoryReleasing{ false };
+
+    // 获取分片索引
+    inline size_t get_shard_index(void* ptr = nullptr, size_t size = 0) {
+        size_t hash;
+        if (ptr) {
+            hash = reinterpret_cast<uintptr_t>(ptr) / 16;
+        }
+        else {
+            hash = size / 16;
+        }
+        return hash % LOCK_SHARDS;
+    }
+
+    // 初始化 mimalloc
+    bool Initialize(size_t initialSize) {
+        // 对所有分片加锁
+        std::vector<std::unique_lock<std::mutex>> locks;
+        for (size_t i = 0; i < LOCK_SHARDS; i++) {
+            locks.emplace_back(g_poolMutexes[i]);
+        }
+
+        if (g_mainHeap) {
+            LogMessage("[MemPool] 已初始化");
+            return true;
+        }
+
+        // 创建主要mimalloc堆
+        g_mainHeap = mi_heap_new();
+        if (!g_mainHeap) {
+            LogMessage("[MemPool] 无法创建mimalloc主堆");
+            return false;
+        }
+
+        // 创建安全操作专用堆
+        g_safeHeap = mi_heap_new();
+        if (!g_safeHeap) {
+            LogMessage("[MemPool] 无法创建mimalloc安全堆");
+            mi_heap_delete(g_mainHeap);
+            g_mainHeap = nullptr;
+            return false;
+        }
+
+        // 设置初始池大小
+        g_totalPoolSize.store(initialSize);
+
+        LogMessage("[MemPool] mimalloc初始化完成，预留大小: %zu 字节", initialSize);
+        return true;
+    }
+
+    // 关闭mimalloc
+    void Shutdown() {
+        if (g_disableMemoryReleasing.load()) {
+            LogMessage("[MemPool] 保留所有内存块，仅清理管理数据");
+            g_mainHeap = nullptr;
+            g_safeHeap = nullptr;
+            return;
+        }
+
+        if (g_mainHeap) {
+            mi_heap_destroy(g_mainHeap);
+            g_mainHeap = nullptr;
+        }
+
+        if (g_safeHeap) {
+            mi_heap_destroy(g_safeHeap);
+            g_safeHeap = nullptr;
+        }
+
+        LogMessage("[MemPool] mimalloc关闭完成");
+    }
+
+    // 分配内存
+    void* Allocate(size_t size) {
+        if (!g_mainHeap) {
+            // 懒初始化
+            Initialize(64 * 1024 * 1024);  // 默认64MB
+            if (!g_mainHeap) return nullptr;
+        }
+
+        size_t lockIndex = get_shard_index(nullptr, size);
+        std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
+
+        void* ptr = mi_heap_malloc(g_mainHeap, size);
+        if (ptr) {
+            g_usedSize.fetch_add(size, std::memory_order_relaxed);
+        }
+
+        return ptr;
+    }
+
+    // 获取块大小 - 适配函数
+    size_t GetBlockSize(void* ptr) {
+        if (!ptr) return 0;
+
+        // 先尝试获取StormHeader信息
+        try {
+            StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
+                static_cast<char*>(ptr) - sizeof(StormAllocHeader));
+
+            if (header->Magic == STORM_MAGIC) {
+                return header->Size;
+            }
+        }
+        catch (...) {}
+
+        // 否则查询mimalloc获取可用大小
+        if (g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr)) {
+            return mi_usable_size(ptr);
+        }
+
+        if (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr)) {
+            return mi_usable_size(ptr);
+        }
+
+        return 0;
+    }
+
+    void DisableActualFree() {
+        DisableMemoryReleasing();  // 调用已实现的函数
+    }
+
+    // 安全分配 - 用于不安全期间
+    void* AllocateSafe(size_t size) {
+        if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+            // 在不安全期直接用系统分配
+            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!sysPtr) {
+                LogMessage("[MemPool] 不安全期间系统内存分配失败: %zu", size);
+                return nullptr;
+            }
+
+            void* userPtr = static_cast<char*>(sysPtr) + sizeof(StormAllocHeader);
+            SetupCompatibleHeader(userPtr, size);
+            LogMessage("[MemPool] 不安全期间使用系统内存: %p, 大小: %zu", userPtr, size);
+            return userPtr;
+        }
+
+        if (!g_safeHeap) {
+            if (!g_mainHeap) {
+                Initialize(64 * 1024 * 1024);
+            }
+            if (!g_safeHeap) return nullptr;
+        }
+
+        void* ptr = mi_heap_malloc(g_safeHeap, size);
+        if (ptr) {
+            g_usedSize.fetch_add(size, std::memory_order_relaxed);
+        }
+
+        return ptr;
+    }
+
+    // 释放内存
+    void Free(void* ptr) {
+        if (!g_mainHeap || !ptr) return;
+
+        // 避免释放永久块
+        if (IsPermanentBlock(ptr)) {
+            LogMessage("[MemPool] 尝试释放永久块: %p，已忽略", ptr);
+            return;
+        }
+
+        // 使用基于指针地址的分片锁
+        size_t lockIndex = get_shard_index(ptr);
+        std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
+
+        // mimalloc可以安全地释放任何它的堆分配的指针
+        size_t size = mi_usable_size(ptr);
+        if (size > 0) {
+            g_usedSize.fetch_sub(size, std::memory_order_relaxed);
+        }
+
+        mi_free(ptr);
+    }
+
+    // 安全释放
+    void FreeSafe(void* ptr) {
+        if (!ptr) return;
+
+        if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+            // 在不安全期使用延迟释放
+            g_MemorySafety.EnqueueDeferredFree(ptr, GetBlockSize(ptr));
+            return;
+        }
+
+        Free(ptr);
+    }
+
+    // 重新分配
+    void* Realloc(void* oldPtr, size_t newSize) {
+        if (!g_mainHeap) return nullptr;
+        if (!oldPtr) return Allocate(newSize);
+        if (newSize == 0) {
+            Free(oldPtr);
+            return nullptr;
+        }
+
+        size_t oldLockIndex = get_shard_index(oldPtr);
+        size_t newLockIndex = get_shard_index(nullptr, newSize);
+
+        // 锁定两个分片
+        if (oldLockIndex != newLockIndex) {
+            // 按顺序锁定，避免死锁
+            if (oldLockIndex < newLockIndex) {
+                std::lock_guard<std::mutex> lock1(g_poolMutexes[oldLockIndex]);
+                std::lock_guard<std::mutex> lock2(g_poolMutexes[newLockIndex]);
+
+                size_t oldSize = mi_usable_size(oldPtr);
+                void* newPtr = mi_heap_realloc(g_mainHeap, oldPtr, newSize);
+
+                if (newPtr) {
+                    if (oldSize > 0) {
+                        g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
+                    }
+                    g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
+                }
+
+                return newPtr;
+            }
+            else {
+                std::lock_guard<std::mutex> lock2(g_poolMutexes[newLockIndex]);
+                std::lock_guard<std::mutex> lock1(g_poolMutexes[oldLockIndex]);
+
+                size_t oldSize = mi_usable_size(oldPtr);
+                void* newPtr = mi_heap_realloc(g_mainHeap, oldPtr, newSize);
+
+                if (newPtr) {
+                    if (oldSize > 0) {
+                        g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
+                    }
+                    g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
+                }
+
+                return newPtr;
+            }
+        }
+        else {
+            std::lock_guard<std::mutex> lock(g_poolMutexes[oldLockIndex]);
+
+            size_t oldSize = mi_usable_size(oldPtr);
+            void* newPtr = mi_heap_realloc(g_mainHeap, oldPtr, newSize);
+
+            if (newPtr) {
+                if (oldSize > 0) {
+                    g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
+                }
+                g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
+            }
+
+            return newPtr;
+        }
+    }
+
+    // 安全重新分配
+    void* ReallocSafe(void* oldPtr, size_t newSize) {
+        if (!oldPtr) return AllocateSafe(newSize);
+        if (newSize == 0) {
+            FreeSafe(oldPtr);
+            return nullptr;
+        }
+
+        if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+            // 不安全期处理: 分配+复制+延迟释放
+            void* newPtr = AllocateSafe(newSize);
+            if (!newPtr) return nullptr;
+
+            // 尝试复制数据
+            size_t oldSize = 0;
+            try {
+                StormAllocHeader* oldHeader = reinterpret_cast<StormAllocHeader*>(
+                    static_cast<char*>(oldPtr) - sizeof(StormAllocHeader));
+
+                if (oldHeader->Magic == STORM_MAGIC) {
+                    oldSize = oldHeader->Size;
+                }
+            }
+            catch (...) {
+                oldSize = newSize; // 无法确定大小，假设相同
+            }
+
+            size_t copySize = min(oldSize, newSize);
+            try {
+                memcpy(newPtr, oldPtr, copySize);
+            }
+            catch (...) {
+                LogMessage("[MemPool] 不安全期间复制数据失败");
+                FreeSafe(newPtr);
+                return nullptr;
+            }
+
+            // 不释放旧指针，而是放入延迟队列
+            g_MemorySafety.EnqueueDeferredFree(oldPtr, oldSize);
+            return newPtr;
+        }
+
+        return Realloc(oldPtr, newSize);
+    }
+
+    // 检查指针是否来自我们的池
+    bool IsFromPool(void* ptr) {
+        if (!ptr || !g_mainHeap) return false;
+
+        // mimalloc提供了检查指针是否属于某个堆的函数
+        return mi_heap_check_owned(g_mainHeap, ptr) ||
+            (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr));
+    }
+
+    // 获取已使用大小
+    size_t GetUsedSize() {
+        return g_usedSize.load(std::memory_order_relaxed);
+    }
+
+    // 获取总大小
+    size_t GetTotalSize() {
+        return g_totalPoolSize.load(std::memory_order_relaxed);
+    }
+
+    // 设置内存不释放
+    void DisableMemoryReleasing() {
+        g_disableMemoryReleasing.store(true);
+        LogMessage("[MemPool] 已禁用内存释放，所有内存将保留到进程结束");
+    }
+
+    // 检查并释放未使用的池 (mimalloc自己管理池，我们这里只做统计和日志)
+    void CheckAndFreeUnusedPools() {
+        LogMessage("[MemPool] mimalloc自动管理内存池，无需手动释放");
+
+        // 强制mimalloc收集可回收的内存
+        if (g_mainHeap) {
+            mi_heap_collect(g_mainHeap, true);
+        }
+
+        if (g_safeHeap) {
+            mi_heap_collect(g_safeHeap, true);
+        }
+    }
+
+    // 创建稳定化块
+    void* CreateStabilizingBlock(size_t size, const char* purpose) {
+        // 使用系统分配确保稳定性
+        void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!rawPtr) {
+            LogMessage("[MemPool] 无法分配稳定化块: %zu", size);
+            return nullptr;
+        }
+
+        void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
+        SetupCompatibleHeader(userPtr, size);
+
+        LogMessage("[MemPool] 创建稳定化块: %p (大小: %zu, 用途: %s)",
+            userPtr, size, purpose ? purpose : "未知");
+
+        return userPtr;
+    }
+
+    // 打印统计信息
+    void PrintStats() {
+        if (!g_mainHeap) {
+            LogMessage("[MemPool] mimalloc未初始化");
+            return;
+        }
+
+        LogMessage("[MemPool] === mimalloc内存池统计 ===");
+        LogMessage("[MemPool] 已用内存: %zu KB", g_usedSize.load() / 1024);
+
+        // 收集mimalloc的统计信息 (mimalloc本身也有统计功能)
+        // 打印mimalloc自己的统计信息
+        mi_stats_print(NULL);
+
+        LogMessage("[MemPool] mimalloc统计完成");
     }
 }

@@ -58,15 +58,6 @@ struct SpecialBlockFilter {
     }
 };
 
-//namespace JassVMMemory {
-//    void Initialize();
-//    void* Allocate(size_t size, const char* source, int line);
-//    void Free(void* ptr);
-//    void* Realloc(void* ptr, size_t newSize);
-//    bool IsJassVMPtr(void* ptr);
-//    void Shutdown();
-//}
-
 // 内存统计结构
 struct MemoryStats {
     std::atomic<size_t> totalAllocated{ 0 };
