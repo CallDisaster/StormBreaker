@@ -163,31 +163,6 @@ public:
 
 extern LargeBlockCache g_largeBlockCache;
 
-class AsyncMemoryReleaser {
-private:
-    struct DeferredFree {
-        void* ptr;
-        size_t size;
-        DWORD queueTime;
-    };
-
-    std::queue<DeferredFree> m_queue;
-    mutable std::mutex m_mutex;  // 使用mutable关键字
-    std::thread m_thread;
-    std::atomic<bool> m_shouldExit{ false };
-
-    void WorkerThread();
-
-public:
-    AsyncMemoryReleaser();
-    ~AsyncMemoryReleaser();
-
-    void QueueFree(void* ptr, size_t size);
-    size_t GetQueueSize() const;
-};
-
-extern AsyncMemoryReleaser g_asyncReleaser;
-
 class AllocationProfiler {
 private:
     struct SizeStats {

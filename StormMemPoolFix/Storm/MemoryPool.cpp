@@ -330,7 +330,7 @@ namespace MemPool {
     }
 
     // 获取块大小 - 适配函数
-    size_t GetBlockSize(void* ptr) {
+    size_t MemPool::GetBlockSize(void* ptr) {
         if (!ptr) return 0;
 
         // 先尝试获取StormHeader信息
@@ -344,15 +344,16 @@ namespace MemPool {
         }
         catch (...) {}
 
-        // 否则查询mimalloc获取可用大小
-        if (g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr)) {
+        // 检查是否为mimalloc管理的内存
+        bool isMainHeapPtr = (g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr));
+        bool isSafeHeapPtr = (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr));
+
+        if (isMainHeapPtr || isSafeHeapPtr) {
+            // 只有确认是mimalloc管理的内存才调用mi_usable_size
             return mi_usable_size(ptr);
         }
 
-        if (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr)) {
-            return mi_usable_size(ptr);
-        }
-
+        // 如果都不是，返回0表示未知大小
         return 0;
     }
 
@@ -406,13 +407,29 @@ namespace MemPool {
         size_t lockIndex = get_shard_index(ptr);
         std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
 
-        // mimalloc可以安全地释放任何它的堆分配的指针
+        // 先检查是否是mimalloc管理的内存
+        bool isMainHeapPtr = mi_heap_check_owned(g_mainHeap, ptr);
+        bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr);
+
+        if (!isMainHeapPtr && !isSafeHeapPtr) {
+            // 如果不是mimalloc管理的内存，记录日志并跳过
+            // LogMessage("[MemPool] 尝试释放非mimalloc内存: %p，已忽略", ptr);
+            return;
+        }
+
+        // 现在安全地获取大小
         size_t size = mi_usable_size(ptr);
         if (size > 0) {
             g_usedSize.fetch_sub(size, std::memory_order_relaxed);
         }
 
-        mi_free(ptr);
+        // 根据所属堆选择释放方式
+        if (isMainHeapPtr) {
+            mi_free(ptr);
+        }
+        else if (isSafeHeapPtr) {
+            mi_free(ptr);  // mimalloc会自动将指针路由到正确的堆
+        }
     }
 
     // 安全释放
@@ -428,13 +445,31 @@ namespace MemPool {
         Free(ptr);
     }
 
-    // 重新分配
-    void* Realloc(void* oldPtr, size_t newSize) {
+    // 重新分配 - 需要添加指针所有权验证
+    void* MemPool::Realloc(void* oldPtr, size_t newSize) {
         if (!g_mainHeap) return nullptr;
         if (!oldPtr) return Allocate(newSize);
         if (newSize == 0) {
             Free(oldPtr);
             return nullptr;
+        }
+
+        // 检查指针所有权
+        bool isMainHeapPtr = mi_heap_check_owned(g_mainHeap, oldPtr);
+        bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, oldPtr);
+
+        if (!isMainHeapPtr && !isSafeHeapPtr) {
+            // 不是我们管理的内存，分配新内存并返回
+            LogMessage("[MemPool] 重新分配非mimalloc内存: %p，分配新内存", oldPtr);
+            void* newPtr = Allocate(newSize);
+            if (newPtr) {
+                // 尝试拷贝一些数据，但我们不知道原块大小，只能保守估计
+                try {
+                    memcpy(newPtr, oldPtr, min(newSize, (size_t)64));
+                }
+                catch (...) {}
+            }
+            return newPtr;
         }
 
         size_t oldLockIndex = get_shard_index(oldPtr);
@@ -494,7 +529,7 @@ namespace MemPool {
     }
 
     // 安全重新分配
-    void* ReallocSafe(void* oldPtr, size_t newSize) {
+    void* MemPool::ReallocSafe(void* oldPtr, size_t newSize) {
         if (!oldPtr) return AllocateSafe(newSize);
         if (newSize == 0) {
             FreeSafe(oldPtr);
@@ -506,18 +541,27 @@ namespace MemPool {
             void* newPtr = AllocateSafe(newSize);
             if (!newPtr) return nullptr;
 
+            // 检查指针所有权
+            bool isOurPtr = IsFromPool(oldPtr);
+
             // 尝试复制数据
             size_t oldSize = 0;
             try {
-                StormAllocHeader* oldHeader = reinterpret_cast<StormAllocHeader*>(
-                    static_cast<char*>(oldPtr) - sizeof(StormAllocHeader));
+                if (isOurPtr) {
+                    oldSize = mi_usable_size(oldPtr);
+                }
+                else {
+                    // 尝试获取 Storm 头部信息
+                    StormAllocHeader* oldHeader = reinterpret_cast<StormAllocHeader*>(
+                        static_cast<char*>(oldPtr) - sizeof(StormAllocHeader));
 
-                if (oldHeader->Magic == STORM_MAGIC) {
-                    oldSize = oldHeader->Size;
+                    if (oldHeader->Magic == STORM_MAGIC) {
+                        oldSize = oldHeader->Size;
+                    }
                 }
             }
             catch (...) {
-                oldSize = newSize; // 无法确定大小，假设相同
+                oldSize = min(newSize, (size_t)64); // 无法确定大小，保守复制
             }
 
             size_t copySize = min(oldSize, newSize);
@@ -535,16 +579,60 @@ namespace MemPool {
             return newPtr;
         }
 
+        // 检查指针所有权
+        bool isMainHeapPtr = g_mainHeap && mi_heap_check_owned(g_mainHeap, oldPtr);
+        bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, oldPtr);
+
+        if (!isMainHeapPtr && !isSafeHeapPtr) {
+            // 不是我们管理的内存，分配新内存并返回
+            void* newPtr = AllocateSafe(newSize);
+            if (newPtr) {
+                // 尝试拷贝一些数据，但我们不知道原块大小，只能保守估计
+                try {
+                    memcpy(newPtr, oldPtr, min(newSize, (size_t)64));
+                }
+                catch (...) {}
+            }
+            return newPtr;
+        }
+
         return Realloc(oldPtr, newSize);
+    }
+
+    // 添加指针验证辅助函数
+    bool ValidatePointer(void* ptr) {
+        if (!ptr) return false;
+
+        __try {
+            // 尝试读取指针的第一个字节，验证可读
+            volatile char test = *static_cast<char*>(ptr);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
     }
 
     // 检查指针是否来自我们的池
     bool IsFromPool(void* ptr) {
-        if (!ptr || !g_mainHeap) return false;
+        if (!ptr) return false;
 
-        // mimalloc提供了检查指针是否属于某个堆的函数
-        return mi_heap_check_owned(g_mainHeap, ptr) ||
-            (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr));
+        __try {
+            // 检查是否为mimalloc管理的内存
+            if (g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr)) {
+                return true;
+            }
+
+            if (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr)) {
+                return true;
+            }
+
+            return false;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // 访问指针出现异常
+            return false;
+        }
     }
 
     // 获取已使用大小
@@ -553,8 +641,19 @@ namespace MemPool {
     }
 
     // 获取总大小
-    size_t GetTotalSize() {
-        return g_totalPoolSize.load(std::memory_order_relaxed);
+    size_t MemPool::GetTotalSize() {
+        size_t currentTotal = g_totalPoolSize.load(std::memory_order_relaxed);
+
+        // 如果使用量超过了记录的总量，更新总量为使用量+预留空间
+        size_t currentUsed = GetUsedSize();
+        if (currentUsed > currentTotal * 0.8) { // 使用超过80%时更新
+            // 更新总大小为当前使用量的150%（提供一些缓冲）
+            size_t newTotal = currentUsed * 3 / 2;
+            g_totalPoolSize.store(newTotal, std::memory_order_relaxed);
+            return newTotal;
+        }
+
+        return currentTotal;
     }
 
     // 设置内存不释放
@@ -565,7 +664,6 @@ namespace MemPool {
 
     // 检查并释放未使用的池 (mimalloc自己管理池，我们这里只做统计和日志)
     void CheckAndFreeUnusedPools() {
-        LogMessage("[MemPool] mimalloc自动管理内存池，无需手动释放");
 
         // 强制mimalloc收集可回收的内存
         if (g_mainHeap) {
@@ -588,7 +686,21 @@ namespace MemPool {
         }
 
         void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
-        SetupCompatibleHeader(userPtr, size);
+
+        // 确保正确设置头部
+        try {
+            StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(rawPtr);
+            header->HeapPtr = SPECIAL_MARKER;  // 特殊标记，表示我们管理的块
+            header->Size = static_cast<DWORD>(size);
+            header->AlignPadding = 0;
+            header->Flags = 0x4;  // 标记为大块VirtualAlloc
+            header->Magic = STORM_MAGIC;
+        }
+        catch (...) {
+            LogMessage("[MemPool] 设置稳定化块头部失败: %p", rawPtr);
+            VirtualFree(rawPtr, 0, MEM_RELEASE);
+            return nullptr;
+        }
 
         LogMessage("[MemPool] 创建稳定化块: %p (大小: %zu, 用途: %s)",
             userPtr, size, purpose ? purpose : "未知");
