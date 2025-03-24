@@ -2,6 +2,7 @@
 #include "MemorySafety.h"
 #include <cstdio>
 #include <cstdarg>
+#include <Storm/StormHook.h>
 
 // 单例访问实现
 MemorySafety& MemorySafety::GetInstance() noexcept {
@@ -411,10 +412,16 @@ void MemorySafety::ProcessDeferredFreeQueue() noexcept {
         while (current) {
             // 尝试释放内存
             __try {
-                // 这里需要调用实际的内存释放函数
-                // 例如 MemPool::FreeSafe 或 VirtualFree
-                // 由于我们没有完整的代码，仅记录日志
-                LogMessageImpl("[MemorySafety] 处理延迟释放: %p", current->ptr);
+                // 修改：检查是否是mimalloc管理的内存
+                if (MemPool::IsFromPool(current->ptr)) {
+                    // 使用mimalloc释放
+                    MemPool::FreeSafe(current->ptr);
+                }
+                else {
+                    // 使用系统释放
+                    VirtualFree(current->ptr, 0, MEM_RELEASE);
+                }
+
                 processedCount++;
 
                 // 移除此项
@@ -431,7 +438,7 @@ void MemorySafety::ProcessDeferredFreeQueue() noexcept {
                 VirtualFree(toFree, 0, MEM_RELEASE);
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                LogMessageImpl("[MemorySafety] 处理延迟释放异常: %p, 错误=0x%x",
+                LogMessage("[MemorySafety] 处理延迟释放异常: %p, 错误=0x%x",
                     current->ptr, GetExceptionCode());
 
                 // 移到下一项
@@ -443,12 +450,12 @@ void MemorySafety::ProcessDeferredFreeQueue() noexcept {
         LeaveCriticalSection(&m_queueLock);
 
         if (processedCount > 0) {
-            LogMessageImpl("[MemorySafety] 处理延迟释放完成: %zu项", processedCount);
+            LogMessage("[MemorySafety] 处理延迟释放完成: %zu项", processedCount);
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         LeaveCriticalSection(&m_queueLock);
-        LogMessageImpl("[MemorySafety] 处理延迟释放总异常: 错误=0x%x", GetExceptionCode());
+        LogMessage("[MemorySafety] 处理延迟释放总异常: 错误=0x%x", GetExceptionCode());
     }
 }
 
@@ -524,7 +531,13 @@ bool MemorySafety::ValidatePointerRange(void* ptr, size_t size) noexcept {
     if (!ptr || size == 0) return false;
 
     __try {
-        // 使用VirtualQuery检查内存状态
+        // 优先检查是否是mimalloc管理的内存
+        if (MemPool::IsFromPool(ptr)) {
+            // mimalloc管理的内存，直接认为有效
+            return true;
+        }
+
+        // 原有的VirtualQuery逻辑保持不变
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) {
             return false;
@@ -536,6 +549,7 @@ bool MemorySafety::ValidatePointerRange(void* ptr, size_t size) noexcept {
             (mbi.Protect & PAGE_GUARD)) {
             return false;
         }
+
 
         // 如果检查范围较大，仅检查开始和结束位置
         if (size > 4096) {
