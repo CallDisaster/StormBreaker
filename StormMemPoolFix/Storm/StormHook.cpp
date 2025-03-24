@@ -49,7 +49,7 @@ std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
 MemoryStats g_memStats;
 std::atomic<bool> g_cleanAllInProgress{ false };
 DWORD g_cleanAllThreadId = 0;
-static std::vector<void*> g_permanentBlocks; // 新增：永久保留块
+static std::vector<void*> g_permanentBlocks;
 std::vector<TempStabilizerBlock> g_tempStabilizers;
 // Storm原始函数指针
 Storm_MemAlloc_t    s_origStormAlloc = nullptr;
@@ -714,11 +714,28 @@ namespace MemPool {
 
         // 释放所有缓存的块
         ~ThreadCache() {
+            // 添加安全释放标记
+            const bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load();
+
             for (auto& sc : sizeClasses) {
                 for (void* block : sc.blocks) {
                     if (block) {
-                        // 直接释放到全局池
-                        Free(block);
+                        try {
+                            // 不直接释放到TLSF池，而是执行两步检查：
+                            if (inUnsafePeriod) {
+                                // 不安全期间：放入延迟队列
+                                g_MemSafety.EnqueueDeferredFree(block, sc.blockSize);
+                            }
+                            else if (IsFromPool(block)) {
+                                // 安全期间：确认是我们的块才释放
+                                tlsf_free(g_tlsf, block);
+                            }
+                            // 否则忽略此块
+                        }
+                        catch (...) {
+                            // 捕获异常但继续处理其他块
+                            LogMessage("[ThreadCache] 释放缓存块异常: %p", block);
+                        }
                     }
                 }
                 sc.blocks.clear();
@@ -759,18 +776,38 @@ namespace MemPool {
 
     // 初始化线程缓存
     void InitThreadCache() {
+        // 如果在不安全期，不创建缓存
+        if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+            return;
+        }
+
         if (!tls_cache) {
             tls_cache = new ThreadCache();
-            RegisterThreadCache(tls_cache);
+
+            // 使用写锁注册缓存
+            std::lock_guard<std::mutex> lock(g_cachesMutex);
+            g_allCaches.push_back(tls_cache);
         }
     }
 
     // 清理线程缓存
     void CleanupThreadCache() {
-        if (tls_cache) {
-            UnregisterThreadCache(tls_cache);
-            delete tls_cache;
+        // 先从全局列表移除，再清理
+        ThreadCache* localCache = tls_cache;
+        if (localCache) {
+            {
+                std::lock_guard<std::mutex> lock(g_cachesMutex);
+                auto it = std::find(g_allCaches.begin(), g_allCaches.end(), localCache);
+                if (it != g_allCaches.end()) {
+                    g_allCaches.erase(it);
+                }
+            }
+
+            // 设置线程局部变量为null，防止重复删除
             tls_cache = nullptr;
+
+            // 安全删除，可能的异常在析构函数内部处理
+            delete localCache;
         }
     }
 
@@ -1042,53 +1079,13 @@ namespace MemPool {
         if (!ptr) return;
 
         if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-            // 获取内存块大小
-            size_t blockSize = 0;
-            try {
-                StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
-                    static_cast<char*>(ptr) - sizeof(StormAllocHeader));
-                if (header->Magic == STORM_MAGIC) {
-                    blockSize = header->Size;
-                }
-            }
-            catch (...) {
-                blockSize = 0;
-            }
-
-            // 在不安全期间，加入延迟释放队列
-            g_MemSafety.EnqueueDeferredFree(ptr, blockSize);
+            // 在不安全期直接入队，不经过异步释放器
+            g_MemSafety.EnqueueDeferredFree(ptr, GetBlockSize(ptr));
             return;
         }
 
-        // 尝试获取块大小
-        size_t blockSize = 0;
-        try {
-            StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
-                static_cast<char*>(ptr) - sizeof(StormAllocHeader));
-            if (header->Magic == STORM_MAGIC) {
-                blockSize = header->Size;
-            }
-        }
-        catch (...) {
-            blockSize = 0;
-        }
-
-        // 先尝试放入线程缓存
-        if (blockSize > 0 && TryReturnToCache(ptr, blockSize)) {
-            return; // 成功放入缓存
-        }
-
-        // 尝试设置Free操作为活跃
-        if (!TrySetOpActive(TLSFOpType::OpFree)) {
-            LogMessage("[MemPool] Free: TLSF释放操作正在进行，跳过");
-            return;
-        }
-
-        // 成功设置活跃标记，进行正常释放
+        // 直接安全释放
         Free(ptr);
-
-        // 清除活跃标记
-        SetOpInactive(TLSFOpType::OpFree);
     }
 
     // 释放内存
@@ -1649,7 +1646,7 @@ void Hooked_StormHeap_CleanupAll() {
     // 时间节流 - 避免频繁CleanAll
     DWORD currentTime = GetTickCount();
     DWORD lastTime = g_lastCleanAllTime.load();
-    if (currentTime - lastTime < 2000) {
+    if (currentTime - lastTime < 5000) {
         //LogMessage("[CleanAll] 触发过于频繁，已跳过");
         return;
     }
@@ -2516,7 +2513,7 @@ void SafelyDetachHooks() {
 
 // 修改 ShutdownStormMemoryHooks 函数，关闭日志系统
 void ShutdownStormMemoryHooks() {
-    LogMessage("[关闭] 开始优雅退出程序...");
+    LogMessage("[关闭] 退出程序...");
 
     // 1. 标记不安全期开始——必须最先执行
     g_insideUnsafePeriod.store(true);

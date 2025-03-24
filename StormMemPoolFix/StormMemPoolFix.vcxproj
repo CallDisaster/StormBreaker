@@ -157,6 +157,7 @@
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
+    <ClInclude Include="Storm\StormFileIO.h" />
     <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
