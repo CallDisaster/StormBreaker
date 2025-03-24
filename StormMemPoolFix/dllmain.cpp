@@ -36,7 +36,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
-        std::cout << "Version: 1.0.3" << std::endl; // 更新版本号
+        std::cout << "StormMemPoolFix v1.1.0 with mimalloc" << std::endl;
 
         Sleep(500);
         // 初始化内存钩子
@@ -62,7 +62,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         // 根据 featureActivationCount 输出最终状态
         if (featureActivationCount == 2) {
             std::cout << "所有系统启动成功！" << std::endl;
-            std::cout << "Hello StormBreaker!" << std::endl;
+            std::cout << "Hello StormBreaker with mimalloc!" << std::endl;
         }
         else if (featureActivationCount == 1) {
             std::cout << "部分功能未启动成功！" << std::endl;
