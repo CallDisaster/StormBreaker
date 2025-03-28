@@ -54,9 +54,6 @@
     <ClInclude Include="Base\MemorySafety.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
-    <ClInclude Include="Storm\StormFileIO.h">
-      <Filter>头文件\Storm</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">

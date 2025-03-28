@@ -43,6 +43,27 @@ static std::atomic<size_t> s_totalUsage{ 0 };
 // 互斥保护
 static std::mutex s_mutex;
 
+// 安全执行功能的辅助函数
+template<typename Func>
+bool SafeExecute(Func func, const char* errorMsg = nullptr) {
+    try {
+        func();
+        return true;
+    }
+    catch (const std::exception& e) {
+        if (errorMsg) {
+            LogMessage("[SAFE] %s: %s", errorMsg, e.what());
+        }
+        return false;
+    }
+    catch (...) {
+        if (errorMsg) {
+            LogMessage("[SAFE] %s: 未知异常", errorMsg);
+        }
+        return false;
+    }
+}
+
 // 在适当的头文件中
 namespace JVM_MemPool {
     // 私有变量
@@ -240,18 +261,6 @@ namespace MemPool {
     static std::atomic<bool> g_inMiMallocOperation{ false };
     static std::atomic<bool> g_disableMemoryReleasing{ false };
 
-    // 获取分片索引
-    inline size_t get_shard_index(void* ptr = nullptr, size_t size = 0) {
-        size_t hash;
-        if (ptr) {
-            hash = reinterpret_cast<uintptr_t>(ptr) / 16;
-        }
-        else {
-            hash = size / 16;
-        }
-        return hash % LOCK_SHARDS;
-    }
-
     // 初始化 mimalloc
     bool Initialize(size_t initialSize) {
         // 对所有分片加锁
@@ -264,6 +273,12 @@ namespace MemPool {
             LogMessage("[MemPool] 已初始化");
             return true;
         }
+
+        // 设置mimalloc选项 - 这些选项可以逐个测试效果
+        mi_option_enable(mi_option_eager_commit);          // 快速提交内存
+        mi_option_set(mi_option_purge_delay, 1000);        // 减少内存归还延迟
+        //mi_option_set(mi_option_segment_cache, 100);       // 增加段缓存
+        mi_option_set(mi_option_arena_reserve, initialSize / 1024); // 预留足够空间
 
         // 创建主要mimalloc堆
         g_mainHeap = mi_heap_new();
@@ -333,7 +348,7 @@ namespace MemPool {
     size_t MemPool::GetBlockSize(void* ptr) {
         if (!ptr) return 0;
 
-        // 先尝试获取StormHeader信息
+        // 尝试获取StormHeader信息
         try {
             StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
                 static_cast<char*>(ptr) - sizeof(StormAllocHeader));
@@ -342,18 +357,104 @@ namespace MemPool {
                 return header->Size;
             }
         }
-        catch (...) {}
+        catch (const std::exception& e) {
+            // 头部访问失败，记录详细异常信息
+            LogMessage("[GetBlockSize] 头部访问异常: %p - %s", ptr, e.what());
+        }
+        catch (...) {
+            // 记录通用异常
+            LogMessage("[GetBlockSize] 头部访问未知异常: %p", ptr);
+        }
 
         // 检查是否为mimalloc管理的内存
-        bool isMainHeapPtr = (g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr));
-        bool isSafeHeapPtr = (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr));
+        bool isMainHeapPtr = false;
+        bool isSafeHeapPtr = false;
+
+        try {
+            if (g_mainHeap) {
+                isMainHeapPtr = mi_heap_check_owned(g_mainHeap, ptr);
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[GetBlockSize] 主堆检查异常: %p - %s", ptr, e.what());
+        }
+        catch (...) {
+            LogMessage("[GetBlockSize] 主堆检查未知异常: %p", ptr);
+        }
+
+        try {
+            if (g_safeHeap) {
+                isSafeHeapPtr = mi_heap_check_owned(g_safeHeap, ptr);
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[GetBlockSize] 安全堆检查异常: %p - %s", ptr, e.what());
+        }
+        catch (...) {
+            LogMessage("[GetBlockSize] 安全堆检查未知异常: %p", ptr);
+        }
 
         if (isMainHeapPtr || isSafeHeapPtr) {
-            // 只有确认是mimalloc管理的内存才调用mi_usable_size
-            return mi_usable_size(ptr);
+            // 使用mimalloc获取块大小
+            try {
+                return mi_usable_size(ptr);
+            }
+            catch (const std::exception& e) {
+                LogMessage("[GetBlockSize] mimalloc大小获取异常: %p - %s", ptr, e.what());
+            }
+            catch (...) {
+                LogMessage("[GetBlockSize] mimalloc大小获取未知异常: %p", ptr);
+            }
+        }
+
+        // 如果有机会，从跟踪信息中查找
+        try {
+            std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+            auto it = g_bigBlocks.find(ptr);
+            if (it != g_bigBlocks.end()) {
+                return it->second.size;
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[GetBlockSize] 块信息查找异常: %p - %s", ptr, e.what());
+        }
+        catch (...) {
+            LogMessage("[GetBlockSize] 块信息查找未知异常: %p", ptr);
+        }
+
+        // 如果都不是，最后尝试从全局变量中查找可能的大小
+        try {
+            // 查看是否在JVM内存池中
+            if (JVM_MemPool::IsFromPool(ptr)) {
+                // 遍历JVM块尝试找到大小（如果JVM池有相关接口）
+                LogMessage("[GetBlockSize] 指针属于JVM池，但无法获取大小: %p", ptr);
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[GetBlockSize] JVM池检查异常: %p - %s", ptr, e.what());
+        }
+        catch (...) {
+            LogMessage("[GetBlockSize] JVM池检查未知异常: %p", ptr);
+        }
+
+        // 最后一次尝试：检查是否为Storm原生内存
+        try {
+            // 假设ptr-8包含Storm格式的块大小（如果你知道Storm的内存布局）
+            DWORD* possibleSizePtr = reinterpret_cast<DWORD*>(static_cast<char*>(ptr) - 8);
+            if (*possibleSizePtr > 0 && *possibleSizePtr < 0x1000000) { // 合理范围检查
+                LogMessage("[GetBlockSize] 可能为Storm内存块: %p, 推测大小: %u", ptr, *possibleSizePtr);
+                return *possibleSizePtr;
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[GetBlockSize] Storm内存检查异常: %p - %s", ptr, e.what());
+        }
+        catch (...) {
+            LogMessage("[GetBlockSize] Storm内存检查未知异常: %p", ptr);
         }
 
         // 如果都不是，返回0表示未知大小
+        LogMessage("[GetBlockSize] 无法确定块大小: %p", ptr);
         return 0;
     }
 
@@ -361,8 +462,57 @@ namespace MemPool {
         DisableMemoryReleasing();  // 调用已实现的函数
     }
 
-    // 安全分配 - 用于不安全期间
+    void Preheat() {
+        LogMessage("[MemPool] 开始预热内存池...");
+
+        // 根据常见分配大小进行预热
+        const std::pair<size_t, int> commonSizes[] = {
+            {4, 50},      // 4字节，预热50个
+            {16, 30},     // 16字节，预热30个
+            {32, 20},     // 32字节，预热20个
+            {72, 15},     // 72字节，预热15个
+            {108, 15},    // 108字节，预热15个
+            {128, 10},    // 128字节，预热10个
+            {192, 10},    // 192字节，预热10个
+            {256, 10},    // 256字节，预热10个
+            {512, 5},     // 512字节，预热5个
+            {1024, 5},    // 1KB，预热5个
+            {4096, 3},    // 4KB，预热3个
+            {16384, 2},   // 16KB，预热2个
+            {65536, 1},   // 64KB，预热1个
+            {262144, 1},  // 256KB，预热1个
+        };
+
+        std::vector<void*> preheatedBlocks;
+
+        for (const auto& [size, count] : commonSizes) {
+            for (int i = 0; i < count; i++) {
+                void* ptr = mi_heap_malloc(g_mainHeap, size);
+                if (ptr) preheatedBlocks.push_back(ptr);
+            }
+        }
+
+        LogMessage("[MemPool] 预热分配了 %zu 个内存块", preheatedBlocks.size());
+
+        // 释放一半预热的块，保留一半在缓存中
+        for (size_t i = 0; i < preheatedBlocks.size() / 2; i++) {
+            mi_free(preheatedBlocks[i]);
+        }
+
+        LogMessage("[MemPool] 内存池预热完成，释放了 %zu 个内存块", preheatedBlocks.size() / 2);
+    }
+
+    // 安全分配 - 用于不安全期间   
     void* AllocateSafe(size_t size) {
+        if (!g_mainHeap) {
+            // 懒初始化
+            Initialize(64 * 1024 * 1024);  // 默认64MB
+            if (!g_mainHeap) return nullptr;
+        }
+
+        // 注意：调用者应该已经持有了相应的分片锁
+        // 此函数假设在锁的保护下被调用
+
         if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
             // 在不安全期直接用系统分配
             void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
@@ -373,9 +523,9 @@ namespace MemPool {
             }
 
             void* userPtr = static_cast<char*>(sysPtr) + sizeof(StormAllocHeader);
-            SetupCompatibleHeader(userPtr, size);
+            SetupCompatibleHeader(userPtr, size - sizeof(StormAllocHeader));
             LogMessage("[MemPool] 不安全期间使用系统内存: %p, 大小: %zu", userPtr, size);
-            return userPtr;
+            return sysPtr;
         }
 
         if (!g_safeHeap) {
@@ -436,17 +586,47 @@ namespace MemPool {
     void FreeSafe(void* ptr) {
         if (!ptr) return;
 
+        // 注意：调用者应该已经持有了相应的分片锁
+        // 此函数假设在锁的保护下被调用
+
+        // 避免释放永久块
+        if (IsPermanentBlock(ptr)) {
+            LogMessage("[MemPool] 尝试释放永久块: %p，已忽略", ptr);
+            return;
+        }
+
         if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-            // 在不安全期使用延迟释放
+            // 不安全期处理: 将指针加入延迟释放队列
             g_MemorySafety.EnqueueDeferredFree(ptr, GetBlockSize(ptr));
             return;
         }
 
-        Free(ptr);
+        // 检查是否是mimalloc管理的内存
+        bool isMainHeapPtr = g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr);
+        bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr);
+
+        if (!isMainHeapPtr && !isSafeHeapPtr) {
+            // 如果不是mimalloc管理的内存，记录日志并跳过
+            return;
+        }
+
+        // 获取大小并更新统计
+        size_t size = mi_usable_size(ptr);
+        if (size > 0) {
+            g_usedSize.fetch_sub(size, std::memory_order_relaxed);
+        }
+
+        // 根据所属堆选择释放方式
+        if (isMainHeapPtr) {
+            mi_free(ptr);
+        }
+        else if (isSafeHeapPtr) {
+            mi_free(ptr);  // mimalloc会自动将指针路由到正确的堆
+        }
     }
 
     // 重新分配 - 需要添加指针所有权验证
-    void* MemPool::Realloc(void* oldPtr, size_t newSize) {
+    void* Realloc(void* oldPtr, size_t newSize) {
         if (!g_mainHeap) return nullptr;
         if (!oldPtr) return Allocate(newSize);
         if (newSize == 0) {
@@ -529,12 +709,17 @@ namespace MemPool {
     }
 
     // 安全重新分配
-    void* MemPool::ReallocSafe(void* oldPtr, size_t newSize) {
+// 在 MemoryPool.cpp 中
+    void* ReallocSafe(void* oldPtr, size_t newSize) {
+        if (!g_mainHeap) return nullptr;
         if (!oldPtr) return AllocateSafe(newSize);
         if (newSize == 0) {
             FreeSafe(oldPtr);
             return nullptr;
         }
+
+        // 注意：调用者应该已经持有了相应的分片锁
+        // 此函数假设在锁的保护下被调用
 
         if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
             // 不安全期处理: 分配+复制+延迟释放
@@ -596,7 +781,22 @@ namespace MemPool {
             return newPtr;
         }
 
-        return Realloc(oldPtr, newSize);
+        // 直接使用mimalloc的realloc功能
+        void* newPtr = mi_heap_realloc(g_mainHeap, oldPtr, newSize);
+
+        if (newPtr) {
+            // 更新统计信息
+            size_t oldSize = 0;
+            if (oldPtr != newPtr) {
+                oldSize = mi_usable_size(oldPtr);
+                if (oldSize > 0) {
+                    g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
+                }
+            }
+            g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
+        }
+
+        return newPtr;
     }
 
     // 添加指针验证辅助函数
@@ -642,18 +842,19 @@ namespace MemPool {
 
     // 获取总大小
     size_t MemPool::GetTotalSize() {
-        size_t currentTotal = g_totalPoolSize.load(std::memory_order_relaxed);
-
-        // 如果使用量超过了记录的总量，更新总量为使用量+预留空间
+        // 确保总大小始终大于已用大小
         size_t currentUsed = GetUsedSize();
-        if (currentUsed > currentTotal * 0.8) { // 使用超过80%时更新
-            // 更新总大小为当前使用量的150%（提供一些缓冲）
+        size_t calculatedTotal = g_totalPoolSize.load(std::memory_order_relaxed);
+
+        // 如果使用量超过了记录的总量
+        if (currentUsed > calculatedTotal) {
+            // 更新总大小为当前使用量的150%
             size_t newTotal = currentUsed * 3 / 2;
             g_totalPoolSize.store(newTotal, std::memory_order_relaxed);
             return newTotal;
         }
 
-        return currentTotal;
+        return calculatedTotal;
     }
 
     // 设置内存不释放

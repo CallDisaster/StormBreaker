@@ -12,6 +12,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+#include "StormHook.h"
     // 定义函数指针类型
 #pragma pack(push, 1)
     typedef DWORD* (__fastcall* StormHeap_Create_t)(char*, int, int, int, size_t, size_t, size_t);
@@ -122,3 +123,124 @@ extern "C" {
 }
 #endif
 
+// 在StormHook.h中
+class PageCacheManager {
+private:
+    struct CachedPage {
+        void* address;
+        size_t size;
+        DWORD timestamp;
+        bool isCommitted;
+    };
+
+    std::vector<CachedPage> m_pages;
+    mutable std::mutex m_mutex;  // 使用mutable允许在const方法中修改
+    const size_t m_pageSize;
+    const size_t MAX_CACHED_PAGES = 20;
+
+public:
+    PageCacheManager() : m_pageSize(GetSystemPageSize()) {}
+
+    size_t GetSystemPageSize() {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return si.dwPageSize;
+    }
+
+    bool TryRecommitPage(void* address, size_t size) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // 检查是否有匹配的已缓存页面
+        for (auto it = m_pages.begin(); it != m_pages.end(); ++it) {
+            if (it->address == address && it->size >= size && !it->isCommitted) {
+                // 重新提交此页面
+                if (VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE)) {
+                    it->isCommitted = true;
+                    it->timestamp = GetTickCount();
+                    return true;
+                }
+
+                // 提交失败
+                m_pages.erase(it);
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    void DecommitPage(void* address, size_t size) {
+        // 确保大小和地址都是页对齐的
+        if ((size % m_pageSize) != 0 || ((uintptr_t)address % m_pageSize) != 0) {
+            return;
+        }
+
+        bool decommitSuccess = false;
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+
+            // 检查缓存是否已满
+            if (m_pages.size() >= MAX_CACHED_PAGES) {
+                // 查找最老的已提交页面
+                auto oldestIt = std::find_if(m_pages.begin(), m_pages.end(),
+                    [](const CachedPage& p) { return p.isCommitted; });
+
+                if (oldestIt != m_pages.end()) {
+                    oldestIt = std::min_element(m_pages.begin(), m_pages.end(),
+                        [](const CachedPage& a, const CachedPage& b) {
+                            // 只比较已提交的页面
+                            if (a.isCommitted != b.isCommitted) return a.isCommitted < b.isCommitted;
+                            return a.timestamp < b.timestamp;
+                        });
+
+                    // 释放最老的页面
+                    VirtualFree(oldestIt->address, 0, MEM_DECOMMIT);
+                    oldestIt->isCommitted = false;
+                }
+            }
+
+            // 尝试释放请求的页面
+            decommitSuccess = (VirtualFree(address, size, MEM_DECOMMIT) != 0);
+
+            if (decommitSuccess) {
+                // 添加到缓存
+                m_pages.push_back({
+                    address,
+                    size,
+                    GetTickCount(),
+                    false  // 刚刚取消提交
+                    });
+            }
+        }
+
+        if (decommitSuccess) {
+            LogMessage("[PageCache] 已取消提交页面: %p, 大小: %zu", address, size);
+        }
+    }
+
+    void CleanupOldPages(DWORD maxAgeMs = 60000) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        DWORD currentTime = GetTickCount();
+
+        // 移除超过一定时间的页面
+        auto it = m_pages.begin();
+        while (it != m_pages.end()) {
+            if (!it->isCommitted && (currentTime - it->timestamp > maxAgeMs)) {
+                LogMessage("[PageCache] 移除过时页面缓存: %p, 大小: %zu", it->address, it->size);
+                it = m_pages.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+    }
+
+    size_t GetCachedPageCount() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_pages.size();
+    }
+};
+
+// 全局实例
+extern PageCacheManager g_pageCache;
