@@ -154,5 +154,5 @@ private:
 #define SAFE_MEMCPY(dest, src, size) g_MemorySafety.SafeMemoryCopy(dest, src, size)
 
 // 辅助函数声明
-bool IsValidPointer(void* ptr);
+bool IsValidPointer(const void* ptr);  // 改为接受 const void*
 uint32_t QuickChecksum(const void* data, size_t len);
