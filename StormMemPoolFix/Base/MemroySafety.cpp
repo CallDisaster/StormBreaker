@@ -2,6 +2,7 @@
 #include "MemorySafety.h"
 #include <cstdio>
 #include <cstdarg>
+#include "Storm/MemoryPool.h"
 #include <Storm/StormHook.h>
 
 // 单例访问实现

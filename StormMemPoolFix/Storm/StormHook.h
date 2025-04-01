@@ -11,6 +11,7 @@
 #include <psapi.h>  // 添加这个头文件
 #include <queue>
 #include <algorithm>
+#include <Base/MemPool/MemoryPoolManager.h>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -126,7 +127,7 @@ bool TrimWorkingSet(bool aggressive = false);
 bool CheckAndTrimWorkingSet();
 
 // 函数声明
-bool InitializeStormMemoryHooks();
+bool InitializeStormMemoryHooks(PoolType poolType);
 bool HookAllStormHeapFunctions();
 void ShutdownStormMemoryHooks();
 void LogMessage(const char* format, ...);

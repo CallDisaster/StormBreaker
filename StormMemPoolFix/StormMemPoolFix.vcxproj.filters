@@ -25,12 +25,6 @@
     <Filter Include="头文件\Base">
       <UniqueIdentifier>{87914a8f-aaf9-459f-ae07-6c18a416f663}</UniqueIdentifier>
     </Filter>
-    <Filter Include="源文件\Graphic">
-      <UniqueIdentifier>{2a7747c5-af5d-4cca-a1a0-271c4f0f936b}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="头文件\Graphic">
-      <UniqueIdentifier>{99d03913-b949-47b9-84fa-4d6e89968c8a}</UniqueIdentifier>
-    </Filter>
     <Filter Include="头文件\MemPool">
       <UniqueIdentifier>{d568b581-d304-4205-be72-395cfbce4cf3}</UniqueIdentifier>
     </Filter>
@@ -69,15 +63,6 @@
     <ClInclude Include="Base\MemorySafety.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
-    <ClInclude Include="Graphic\Core.h">
-      <Filter>头文件\Graphic</Filter>
-    </ClInclude>
-    <ClInclude Include="Graphic\Hooks.h">
-      <Filter>头文件\Graphic</Filter>
-    </ClInclude>
-    <ClInclude Include="Graphic\GameOffsets.h">
-      <Filter>头文件\Graphic</Filter>
-    </ClInclude>
     <ClInclude Include="Base\MemPool\MemoryPoolInterface.h">
       <Filter>头文件\Base\MemPool</Filter>
     </ClInclude>
@@ -88,6 +73,9 @@
       <Filter>头文件\Base\MemPool</Filter>
     </ClInclude>
     <ClInclude Include="Base\MemPool\MemoryPoolManager.h">
+      <Filter>头文件\Base\MemPool</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\MemPool\tlsf.h">
       <Filter>头文件\Base\MemPool</Filter>
     </ClInclude>
   </ItemGroup>
@@ -113,15 +101,6 @@
     <ClCompile Include="Base\MemroySafety.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="Graphic\Core.cpp">
-      <Filter>源文件\Graphic</Filter>
-    </ClCompile>
-    <ClCompile Include="Graphic\Hooks.cpp">
-      <Filter>源文件\Graphic</Filter>
-    </ClCompile>
-    <ClCompile Include="Graphic\GameOffsets.cpp">
-      <Filter>源文件\Graphic</Filter>
-    </ClCompile>
     <ClCompile Include="Base\MemPool\MemoryPoolManager.cpp">
       <Filter>源文件\Base\MemPool</Filter>
     </ClCompile>
@@ -129,6 +108,9 @@
       <Filter>源文件\Base\MemPool</Filter>
     </ClCompile>
     <ClCompile Include="Base\MemPool\MiMallocPool.cpp">
+      <Filter>源文件\Base\MemPool</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\MemPool\tlsf.c">
       <Filter>源文件\Base\MemPool</Filter>
     </ClCompile>
   </ItemGroup>

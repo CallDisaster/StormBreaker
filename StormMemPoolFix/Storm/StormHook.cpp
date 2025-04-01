@@ -1345,7 +1345,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
     }
 
     // 情况2: 我们的块重分配为Storm块（变小）
-    else if (isOurOldBlock && !shouldUseMimalloc) {
+    else if (isOurOldBlock && !shouldUseManagedPool) {
         BigBlockInfo oldInfo = {};
         bool blockFound = false;
 
@@ -1423,7 +1423,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
     }
 
     // 情况3: Storm块重分配为我们的块（变大）
-    else if (!isOurOldBlock && shouldUseMimalloc) {
+    else if (!isOurOldBlock && shouldUseManagedPool) {
         void* newRawPtr = nullptr;
         void* newUserPtr = nullptr;
 
@@ -1523,7 +1523,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 ///////////////////////////////////////////////////////////////////////////////
 
 // 修改InitializeStormMemoryHooks函数
-bool InitializeStormMemoryHooks() {
+bool InitializeStormMemoryHooks(PoolType poolType) {
     // 初始化日志系统
     if (!LogSystem::GetInstance().Initialize()) {
         printf("[错误] 无法初始化日志系统\n");
@@ -1533,7 +1533,7 @@ bool InitializeStormMemoryHooks() {
     LogMessage("[Init] 正在初始化Storm内存钩子...");
 
     // 初始化内存安全系统
-    if (!g_MemSafety.Initialize()) {
+    if (!g_MemorySafety.Initialize()) {
         LogMessage("[Init] 内存安全系统初始化失败");
         return false;
     }
@@ -1563,15 +1563,22 @@ bool InitializeStormMemoryHooks() {
         return false;
     }
 
-    // 初始化JassVM内存管理
-    JVM_MemPool::Initialize();
+    // 初始化内存池 - 使用提供的池类型
+    if (!MemPool::Initialize(128 * 1024 * 1024)) {
+        LogMessage("[Init] 内存池初始化失败");
+        return false;
+    }
 
-    // 初始化内存池 - 改为使用MemPool命名空间
-    // 默认使用mimalloc内存池
-    MemPool::Initialize(128 * 1024 * 1024);
+    // 如果需要切换内存池类型
+    if (poolType != PoolType::Default) {
+        if (!MemPool::SwitchPoolType(poolType)) {
+            LogMessage("[Init] 内存池类型切换失败");
+            // 不退出，使用默认
+        }
+    }
 
     // 创建永久稳定块，使用更广泛的大小分布
-    CreatePermanentStabilizers(25, "全周期保护");
+    //CreatePermanentStabilizers(25, "全周期保护");
 
     // 安装钩子
     DetourTransactionBegin();
@@ -1588,35 +1595,22 @@ bool InitializeStormMemoryHooks() {
         return false;
     }
 
-    // 启动统计线程
-    HANDLE hThread = CreateThread(nullptr, 0, MemoryStatsThread, nullptr, 0, nullptr);
-    if (hThread) {
-        g_statsThreadHandle = hThread;
-    }
-
-    void* stabilizer = MemPool::CreateStabilizingBlock(32, "初始稳定块");
-    if (stabilizer) {
-        LogMessage("[Init] 稳定块分配成功: %p", stabilizer);
-        g_permanentBlocks.push_back(stabilizer);
-    }
-
     // 重置Storm的g_DebugHeapPtr，防止初始CleanAll触发
     Storm_g_DebugHeapPtr = 0;
 
     // 输出初始内存报告
-    GenerateMemoryReport(true);
+    //GenerateMemoryReport(true);
 
     LogMessage("[Init] Storm内存钩子安装成功！");
     return true;
 }
 
-
-// 添加切换内存池类型的函数
+// 添加切换内存池类型的函数实现
 bool SwitchMemoryPoolType(PoolType newType) {
     return MemPool::SwitchPoolType(newType);
 }
 
-// 添加获取当前内存池类型的函数
+// 添加获取当前内存池类型的函数实现
 PoolType GetCurrentMemoryPoolType() {
     return MemPool::GetCurrentPoolType();
 }

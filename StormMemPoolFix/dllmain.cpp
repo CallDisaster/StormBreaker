@@ -19,8 +19,10 @@
 #include <Graphic/GameOffsets.h>
 #include <Graphic/Hooks.h>
 #include <Base/MemPool/MemoryPoolManager.h>
+#include <shlwapi.h> // 添加路径处理库头文件
 
 #pragma comment(lib, "Version.lib")
+#pragma comment(lib, "Shlwapi.lib") // 添加shlwapi库链接
 
 void CreateConsole()
 {
@@ -47,7 +49,7 @@ uint32_t GetGameBuildVersion()
     char* buf = new char[sz];
     if (!GetFileVersionInfoA("Game.dll", dwHandle, sz, &buf[0]))
     {
-        delete buf;
+        delete[] buf;  // 修复内存泄露
         return 0;
     }
 
@@ -55,20 +57,20 @@ uint32_t GetGameBuildVersion()
     sz = sizeof(VS_FIXEDFILEINFO);
     if (!VerQueryValueA(&buf[0], "\\", (LPVOID*)&pvi, (unsigned int*)&sz))
     {
-        delete buf;
+        delete[] buf;  // 修复内存泄露
         return 0;
     }
-    delete buf;
 
-    return pvi->dwFileVersionLS & 0xFFFF;
+    uint32_t version = pvi->dwFileVersionLS & 0xFFFF;
+    delete[] buf;  // 修复内存泄露
+    return version;
 }
-
 
 // 在dllmain.cpp中添加
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    int featureActivationCount = 0;
     switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH:
+    case DLL_PROCESS_ATTACH: {
+        // 移动初始化到花括号内创建块作用域
         CreateConsole();
         std::cout << "StormMemPoolFix v1.2.0 with Dual Memory Pool System" << std::endl;
         std::cout << "Game Build Version: " << GetGameBuildVersion() << std::endl;
@@ -85,6 +87,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         char poolTypeName[32] = { 0 };
         GetPrivateProfileStringA("Memory", "PoolType", "mimalloc", poolTypeName, sizeof(poolTypeName), configPath);
+
+        int featureActivationCount = 0;
 
         if (_stricmp(poolTypeName, "tlsf") == 0) {
             poolType = PoolType::TLSF;
@@ -118,9 +122,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         else {
             std::cout << "StormBreaker 注入失败！" << std::endl;
         }
-
         break;
-
+    }
     case DLL_THREAD_ATTACH:
     case DLL_THREAD_DETACH:
         break;

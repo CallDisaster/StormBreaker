@@ -100,7 +100,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;STORMMEMPOOLFIX_EXPORTS;_WINDOWS;_USRDLL;_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR;MI_STATIC_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
@@ -112,7 +112,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>detours.lib;d3d9.lib;d3dx9.lib;mimalloc.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>detours.lib;mimalloc.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)$(TargetName).asi</OutputFile>
     </Link>
   </ItemDefinitionGroup>
@@ -157,11 +157,9 @@
     <ClInclude Include="Base\MemPool\MemoryPoolInterface.h" />
     <ClInclude Include="Base\MemPool\MemoryPoolManager.h" />
     <ClInclude Include="Base\MemPool\MiMallocPool.h" />
+    <ClInclude Include="Base\MemPool\tlsf.h" />
     <ClInclude Include="Base\MemPool\TLSFPool.h" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="Graphic\Core.h" />
-    <ClInclude Include="Graphic\GameOffsets.h" />
-    <ClInclude Include="Graphic\Hooks.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
     <ClInclude Include="Storm\StormHeap.h" />
@@ -171,12 +169,10 @@
   <ItemGroup>
     <ClCompile Include="Base\MemPool\MemoryPoolManager.cpp" />
     <ClCompile Include="Base\MemPool\MiMallocPool.cpp" />
+    <ClCompile Include="Base\MemPool\tlsf.c" />
     <ClCompile Include="Base\MemPool\TLSFPool.cpp" />
     <ClCompile Include="Base\MemroySafety.cpp" />
     <ClCompile Include="dllmain.cpp" />
-    <ClCompile Include="Graphic\Core.cpp" />
-    <ClCompile Include="Graphic\GameOffsets.cpp" />
-    <ClCompile Include="Graphic\Hooks.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>

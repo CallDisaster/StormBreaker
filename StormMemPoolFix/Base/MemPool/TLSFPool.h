@@ -1,105 +1,43 @@
-// TLSFPool.h
-#pragma once
-#include "MemoryPoolInterface.h"
-#include "tlsf.h"
+ï»¿#pragma once
+#include "pch.h"
+#include <cstddef>
 #include <atomic>
 #include <mutex>
-#include <unordered_map>
 
-class TLSFPool : public MemoryPoolInterface {
-private:
-    // TLSFÄÚ´æ³ØÖ¸Õë
-    tlsf_t m_tlsfPool = nullptr;
-    void* m_poolMemory = nullptr;
-
-    // °²È«²Ù×÷³Ø
-    tlsf_t m_safeTlsfPool = nullptr;
-    void* m_safePoolMemory = nullptr;
-
-    // Í³¼ÆÊı¾İ
-    std::atomic<size_t> m_totalPoolSize{ 0 };
-    std::atomic<size_t> m_usedSize{ 0 };
-
-    // ¿é¸ú×Ù
-    std::mutex m_trackingMutex;
-    std::unordered_map<void*, size_t> m_allocatedBlocks;
-
-    // ¿ØÖÆ±êÖ¾
-    std::atomic<bool> m_disableMemoryReleasing{ false };
-
-    // ·ÖÆ¬Ëø
-    static constexpr size_t LOCK_SHARDS = 32;
-    std::mutex m_poolMutexes[LOCK_SHARDS];
-
-    void* ReallocInternal(void* oldPtr, size_t newSize) {
-        // »ñÈ¡¾É¿é´óĞ¡
-        size_t oldSize = 0;
-        {
-            std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-            auto it = m_allocatedBlocks.find(oldPtr);
-            if (it != m_allocatedBlocks.end()) {
-                oldSize = it->second;
-            }
-        }
-
-        // Ê¹ÓÃTLSFµÄÖØ·ÖÅä
-        void* newPtr = tlsf_realloc(m_tlsfPool, oldPtr, newSize);
-
-        if (newPtr) {
-            // ¸üĞÂÍ³¼ÆºÍ¸ú×ÙĞÅÏ¢
-            std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-
-            // Èç¹ûÖ¸Õë±ä»¯£¬ÒÆ³ı¾É¼ÇÂ¼
-            if (newPtr != oldPtr) {
-                auto it = m_allocatedBlocks.find(oldPtr);
-                if (it != m_allocatedBlocks.end()) {
-                    m_allocatedBlocks.erase(it);
-                }
-
-                if (oldSize > 0) {
-                    m_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
-                }
-            }
-
-            // Ìí¼ÓĞÂ¼ÇÂ¼
-            m_allocatedBlocks[newPtr] = newSize;
-            m_usedSize.fetch_add(newSize, std::memory_order_relaxed);
-        }
-
-        return newPtr;
-    }
-
+// TLSFPoolç±» - ä½¿ç”¨TLSFç®—æ³•çš„å†…å­˜æ± å®ç°
+class TLSFPool {
 public:
     TLSFPool();
     ~TLSFPool();
 
-    // MemoryPoolInterface ÊµÏÖ
-    bool Initialize(size_t initialSize) override;
-    void Shutdown() override;
-    void* Allocate(size_t size) override;
-    void Free(void* ptr) override;
-    void* Realloc(void* oldPtr, size_t newSize) override;
+    // åŸºæœ¬å†…å­˜æ± æ“ä½œ
+    bool Initialize(size_t initialSize = 64 * 1024 * 1024);
+    void Shutdown();
 
-    void* AllocateSafe(size_t size) override;
-    void FreeSafe(void* ptr) override;
-    void* ReallocSafe(void* oldPtr, size_t newSize) override;
+    // å¸¸è§„å†…å­˜æ“ä½œ
+    void* Allocate(size_t size);
+    void Free(void* ptr);
+    void* Realloc(void* oldPtr, size_t newSize);
 
-    size_t GetUsedSize() override;
-    size_t GetTotalSize() override;
-    bool IsFromPool(void* ptr) override;
-    size_t GetBlockSize(void* ptr) override;
+    // å®‰å…¨ç‰ˆå†…å­˜æ“ä½œï¼ˆé€‚ç”¨äºä¸å®‰å…¨æœŸï¼‰
+    void* AllocateSafe(size_t size);
+    void FreeSafe(void* ptr);
+    void* ReallocSafe(void* oldPtr, size_t newSize);
 
-    void PrintStats() override;
-    void CheckAndFreeUnusedPools() override;
-    void DisableMemoryReleasing() override;
-    void HeapCollect() override;
-    void* CreateStabilizingBlock(size_t size, const char* purpose) override;
-    bool ValidatePointer(void* ptr) override;
-    void Preheat() override;
-    void DisableActualFree() override;
+    // è¾…åŠ©åŠŸèƒ½
+    bool IsFromPool(void* ptr);
+    size_t GetBlockSize(void* ptr);
+    size_t GetUsedSize();
+    size_t GetTotalSize();
+    void DisableMemoryReleasing();
+    void CheckAndFreeUnusedPools();
+    void HeapCollect();
+    void PrintStats();
 
-    // ·ÖÆ¬Ë÷Òı¼ÆËãº¯Êı
-    size_t get_shard_index(void* ptr = nullptr, size_t size = 0);
+private:
+    std::mutex m_mutex;
+    bool m_initialized;
 
-
+    // æ‰©å±•å†…å­˜æ± 
+    bool ExpandPool(size_t additionalSize);
 };

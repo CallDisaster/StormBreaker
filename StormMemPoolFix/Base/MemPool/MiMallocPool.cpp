@@ -1,416 +1,447 @@
-// MiMallocPool.cpp
+ï»¿#include "pch.h"
 #include "MiMallocPool.h"
-#include "Base/Logger.h"
-#include "../../Storm/StormHook.h"
 #include <Windows.h>
-#include <Base/MemorySafety.h>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+#include <cassert>
+#include <iostream>
+#include "Storm/StormHook.h"
+#include "Base/MemorySafety.h"
+#include <mimalloc.h>
 
-MiMallocPool::MiMallocPool() {
-    // ¹¹Ôìº¯Êı²»×öÊµ¼Ê³õÊ¼»¯£¬µÈ´ıInitializeµ÷ÓÃ
+// MiMallocPoolç±»å®ç°
+namespace {
+    // mimallocå †å®ä¾‹
+    mi_heap_t* g_mainHeap = nullptr;
+    mi_heap_t* g_safeHeap = nullptr;  // å®‰å…¨æ“ä½œä¸“ç”¨å †
+
+    // æ§åˆ¶æ ‡å¿—
+    std::atomic<bool> g_inMiMallocOperation{ false };
+    std::atomic<bool> g_disableMemoryReleasing{ false };
+    std::atomic<bool> g_miMallocDisableMemoryReleasing{ false };
+
+    // æ± ç»Ÿè®¡
+    std::atomic<size_t> g_totalPoolSize{ 0 };
+    std::atomic<size_t> g_usedSize{ 0 };
 }
 
-MiMallocPool::~MiMallocPool() {
-    // È·±£Shutdown±»µ÷ÓÃ
+MiMallocPool::MiMallocPool()
+    : m_initialized(false)
+{
+}
+
+MiMallocPool::~MiMallocPool()
+{
     Shutdown();
 }
 
-bool MiMallocPool::Initialize(size_t initialSize) {
-    if (m_mainHeap) {
-        LogMessage("[MiMallocPool] ÒÑ³õÊ¼»¯");
+bool MiMallocPool::Initialize(size_t initialSize)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_initialized) {
+        LogMessage("[MiMallocPool] å·²åˆå§‹åŒ–");
         return true;
     }
 
-    // 1. ½ûÓÃ¼±ÓÚÌá½»ÄÚ´æ - ÕâÓĞÖúÓÚ¼õÉÙĞéÄâÄÚ´æÕ¼ÓÃ
+    // 1. ç¦ç”¨æ€¥äºæäº¤å†…å­˜ - è¿™æœ‰åŠ©äºå‡å°‘è™šæ‹Ÿå†…å­˜å ç”¨
     mi_option_set(mi_option_arena_eager_commit, 0);
 
-    // 2. ¼õÉÙÄÚ´æ¹é»¹ÑÓ³Ù - ÈÃÎ´Ê¹ÓÃÄÚ´æ¸ü¿ì¹é»¹ÏµÍ³
+    // 2. å‡å°‘å†…å­˜å½’è¿˜å»¶è¿Ÿ - è®©æœªä½¿ç”¨å†…å­˜æ›´å¿«å½’è¿˜ç³»ç»Ÿ
     mi_option_set(mi_option_purge_delay, 10);
 
-    // 3. ÉèÖÃ½ÏĞ¡µÄÔ¤Áô¿Õ¼ä - Èç¹û×ÜĞéÄâÄÚ´æ¹ı¸ß£¬ÕâºÜ¹Ø¼ü
+    // 3. è®¾ç½®è¾ƒå°çš„é¢„ç•™ç©ºé—´ - å¦‚æœæ€»è™šæ‹Ÿå†…å­˜è¿‡é«˜ï¼Œè¿™å¾ˆå…³é”®
     mi_option_set(mi_option_arena_reserve, 16 * 1024);
 
-    // ÑÓ³ÙÌá½» - Õâ¿ÉÄÜ»á¸ÄÉÆÄÚ´æ·ÖÅäÄ£Ê½
+    // å»¶è¿Ÿæäº¤ - è¿™å¯èƒ½ä¼šæ”¹å–„å†…å­˜åˆ†é…æ¨¡å¼
     mi_option_set(mi_option_eager_commit_delay, 8);
 
     mi_option_set(mi_option_reset_decommits, 1);
 
-    // ´´½¨Ö÷Òªmimalloc¶Ñ
-    m_mainHeap = mi_heap_new();
-    if (!m_mainHeap) {
-        LogMessage("[MiMallocPool] ÎŞ·¨´´½¨mimallocÖ÷¶Ñ");
+    // åˆ›å»ºä¸»è¦mimallocå †
+    g_mainHeap = mi_heap_new();
+    if (!g_mainHeap) {
+        LogMessage("[MiMallocPool] æ— æ³•åˆ›å»ºmimallocä¸»å †");
         return false;
     }
 
-    // ´´½¨°²È«²Ù×÷×¨ÓÃ¶Ñ
-    m_safeHeap = mi_heap_new();
-    if (!m_safeHeap) {
-        LogMessage("[MiMallocPool] ÎŞ·¨´´½¨mimalloc°²È«¶Ñ");
-        mi_heap_delete(m_mainHeap);
-        m_mainHeap = nullptr;
+    // åˆ›å»ºå®‰å…¨æ“ä½œä¸“ç”¨å †
+    g_safeHeap = mi_heap_new();
+    if (!g_safeHeap) {
+        LogMessage("[MiMallocPool] æ— æ³•åˆ›å»ºmimallocå®‰å…¨å †");
+        mi_heap_delete(g_mainHeap);
+        g_mainHeap = nullptr;
         return false;
     }
 
-    // ÉèÖÃ³õÊ¼³Ø´óĞ¡
-    m_totalPoolSize.store(initialSize);
+    // è®¾ç½®åˆå§‹æ± å¤§å°
+    g_totalPoolSize.store(initialSize);
+    m_initialized = true;
 
-    LogMessage("[MiMallocPool] mimalloc³õÊ¼»¯Íê³É£¬Ô¤Áô´óĞ¡: %zu ×Ö½Ú", initialSize);
+    LogMessage("[MiMallocPool] mimallocåˆå§‹åŒ–å®Œæˆï¼Œé¢„ç•™å¤§å°: %zu å­—èŠ‚", initialSize);
     return true;
 }
 
-void MiMallocPool::Shutdown() {
-    if (m_disableMemoryReleasing.load()) {
-        LogMessage("[MiMallocPool] ±£ÁôËùÓĞÄÚ´æ¿é£¬½öÇåÀí¹ÜÀíÊı¾İ");
-        m_mainHeap = nullptr;
-        m_safeHeap = nullptr;
+void MiMallocPool::Shutdown()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!m_initialized) {
         return;
     }
 
-    if (m_mainHeap) {
-        mi_heap_destroy(m_mainHeap);
-        m_mainHeap = nullptr;
+    if (g_miMallocDisableMemoryReleasing.load()) {
+        LogMessage("[MiMallocPool] ä¿ç•™æ‰€æœ‰å†…å­˜å—ï¼Œä»…æ¸…ç†ç®¡ç†æ•°æ®");
+        g_mainHeap = nullptr;
+        g_safeHeap = nullptr;
+        m_initialized = false;
+        return;
     }
 
-    if (m_safeHeap) {
-        mi_heap_destroy(m_safeHeap);
-        m_safeHeap = nullptr;
+    if (g_mainHeap) {
+        mi_heap_destroy(g_mainHeap);
+        g_mainHeap = nullptr;
     }
 
-    LogMessage("[MiMallocPool] mimalloc¹Ø±ÕÍê³É");
+    if (g_safeHeap) {
+        mi_heap_destroy(g_safeHeap);
+        g_safeHeap = nullptr;
+    }
+
+    m_initialized = false;
+    LogMessage("[MiMallocPool] mimallocå…³é—­å®Œæˆ");
 }
 
-void* MiMallocPool::Allocate(size_t size) {
-    if (!m_mainHeap) {
-        // ÀÁ³õÊ¼»¯
-        Initialize(64 * 1024 * 1024);  // Ä¬ÈÏ64MB
-        if (!m_mainHeap) return nullptr;
+void* MiMallocPool::Allocate(size_t size)
+{
+    if (!g_mainHeap) {
+        // æ‡’åˆå§‹åŒ–
+        if (!Initialize(64 * 1024 * 1024)) {  // é»˜è®¤64MB
+            return nullptr;
+        }
     }
 
-    size_t lockIndex = get_shard_index(nullptr, size);
-    std::lock_guard<std::mutex> lock(m_poolMutexes[lockIndex]);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inMiMallocOperation.store(true);
 
-    void* ptr = mi_heap_malloc(m_mainHeap, size);
+    void* ptr = mi_heap_malloc(g_mainHeap, size);
     if (ptr) {
-        m_usedSize.fetch_add(size, std::memory_order_relaxed);
+        g_usedSize.fetch_add(size, std::memory_order_relaxed);
     }
 
+    g_inMiMallocOperation.store(false);
     return ptr;
 }
 
-void MiMallocPool::Free(void* ptr) {
-    if (!m_mainHeap || !ptr) return;
-
-    // ±ÜÃâÊÍ·ÅÓÀ¾Ã¿é
-    if (IsPermanentBlock(ptr)) {
-        LogMessage("[MiMallocPool] ³¢ÊÔÊÍ·ÅÓÀ¾Ã¿é: %p£¬ÒÑºöÂÔ", ptr);
-        return;
+void* MiMallocPool::AllocateSafe(size_t size)
+{
+    if (!g_mainHeap) {
+        // æ‡’åˆå§‹åŒ–
+        if (!Initialize(64 * 1024 * 1024)) {  // é»˜è®¤64MB
+            return nullptr;
+        }
     }
 
-    // Ê¹ÓÃ»ùÓÚÖ¸ÕëµØÖ·µÄ·ÖÆ¬Ëø
-    size_t lockIndex = get_shard_index(ptr);
-    std::lock_guard<std::mutex> lock(m_poolMutexes[lockIndex]);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inMiMallocOperation.store(true);
 
-    // ÏÈ¼ì²éÊÇ·ñÊÇmimalloc¹ÜÀíµÄÄÚ´æ
-    bool isMainHeapPtr = mi_heap_check_owned(m_mainHeap, ptr);
-    bool isSafeHeapPtr = m_safeHeap && mi_heap_check_owned(m_safeHeap, ptr);
+    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+        // åœ¨ä¸å®‰å…¨æœŸç›´æ¥ç”¨ç³»ç»Ÿåˆ†é…
+        void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        g_inMiMallocOperation.store(false);
 
-    if (!isMainHeapPtr && !isSafeHeapPtr) {
-        // Èç¹û²»ÊÇmimalloc¹ÜÀíµÄÄÚ´æ£¬¼ÇÂ¼ÈÕÖ¾²¢Ìø¹ı
-        return;
+        if (!sysPtr) {
+            LogMessage("[MiMallocPool] ä¸å®‰å…¨æœŸé—´ç³»ç»Ÿå†…å­˜åˆ†é…å¤±è´¥: %zu", size);
+            return nullptr;
+        }
+
+        void* userPtr = static_cast<char*>(sysPtr) + sizeof(StormAllocHeader);
+        SetupCompatibleHeader(userPtr, size - sizeof(StormAllocHeader));
+        LogMessage("[MiMallocPool] ä¸å®‰å…¨æœŸé—´ä½¿ç”¨ç³»ç»Ÿå†…å­˜: %p, å¤§å°: %zu", userPtr, size);
+        return sysPtr;
     }
 
-    // ÏÖÔÚ°²È«µØ»ñÈ¡´óĞ¡
-    size_t size = mi_usable_size(ptr);
-    if (size > 0) {
-        m_usedSize.fetch_sub(size, std::memory_order_relaxed);
+    if (!g_safeHeap) {
+        if (!g_mainHeap) {
+            Initialize(64 * 1024 * 1024);
+        }
+        if (!g_safeHeap) {
+            g_inMiMallocOperation.store(false);
+            return nullptr;
+        }
     }
 
-    // ¸ù¾İËùÊô¶ÑÑ¡ÔñÊÍ·Å·½Ê½
-    if (isMainHeapPtr) {
-        mi_free(ptr);
+    void* ptr = mi_heap_malloc(g_safeHeap, size);
+    if (ptr) {
+        g_usedSize.fetch_add(size, std::memory_order_relaxed);
     }
-    else if (isSafeHeapPtr) {
-        mi_free(ptr);  // mimalloc»á×Ô¶¯½«Ö¸ÕëÂ·ÓÉµ½ÕıÈ·µÄ¶Ñ
-    }
+
+    g_inMiMallocOperation.store(false);
+    return ptr;
 }
 
-void* MiMallocPool::Realloc(void* oldPtr, size_t newSize) {
-    if (!m_mainHeap) return nullptr;
+void MiMallocPool::Free(void* ptr)
+{
+    if (!g_mainHeap || !ptr) return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inMiMallocOperation.store(true);
+
+    // é¿å…é‡Šæ”¾æ°¸ä¹…å—
+    if (IsPermanentBlock(ptr)) {
+        LogMessage("[MiMallocPool] å°è¯•é‡Šæ”¾æ°¸ä¹…å—: %pï¼Œå·²å¿½ç•¥", ptr);
+        g_inMiMallocOperation.store(false);
+        return;
+    }
+
+    // æ£€æŸ¥æ˜¯å¦æ˜¯mimallocç®¡ç†çš„å†…å­˜
+    bool isMainHeapPtr = mi_heap_check_owned(g_mainHeap, ptr);
+    bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr);
+
+    if (!isMainHeapPtr && !isSafeHeapPtr) {
+        g_inMiMallocOperation.store(false);
+        return;
+    }
+
+    // è·å–å¤§å°å¹¶æ›´æ–°ç»Ÿè®¡
+    size_t size = mi_usable_size(ptr);
+    if (size > 0) {
+        g_usedSize.fetch_sub(size, std::memory_order_relaxed);
+    }
+
+    // æ ¹æ®æ‰€å±å †é€‰æ‹©é‡Šæ”¾æ–¹å¼
+    mi_free(ptr);  // mimallocä¼šè‡ªåŠ¨å°†æŒ‡é’ˆè·¯ç”±åˆ°æ­£ç¡®çš„å †
+
+    g_inMiMallocOperation.store(false);
+}
+
+void MiMallocPool::FreeSafe(void* ptr)
+{
+    if (!ptr) return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inMiMallocOperation.store(true);
+
+    // é¿å…é‡Šæ”¾æ°¸ä¹…å—
+    if (IsPermanentBlock(ptr)) {
+        LogMessage("[MiMallocPool] å°è¯•é‡Šæ”¾æ°¸ä¹…å—: %pï¼Œå·²å¿½ç•¥", ptr);
+        g_inMiMallocOperation.store(false);
+        return;
+    }
+
+    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+        // ä¸å®‰å…¨æœŸå¤„ç†: å°†æŒ‡é’ˆåŠ å…¥å»¶è¿Ÿé‡Šæ”¾é˜Ÿåˆ—
+        g_MemorySafety.EnqueueDeferredFree(ptr, GetBlockSize(ptr));
+        g_inMiMallocOperation.store(false);
+        return;
+    }
+
+    // æ£€æŸ¥æ˜¯å¦æ˜¯mimallocç®¡ç†çš„å†…å­˜
+    bool isMainHeapPtr = g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr);
+    bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr);
+
+    if (!isMainHeapPtr && !isSafeHeapPtr) {
+        g_inMiMallocOperation.store(false);
+        return;
+    }
+
+    // è·å–å¤§å°å¹¶æ›´æ–°ç»Ÿè®¡
+    size_t size = mi_usable_size(ptr);
+    if (size > 0) {
+        g_usedSize.fetch_sub(size, std::memory_order_relaxed);
+    }
+
+    // é‡Šæ”¾å†…å­˜
+    mi_free(ptr);  // mimallocä¼šè‡ªåŠ¨å°†æŒ‡é’ˆè·¯ç”±åˆ°æ­£ç¡®çš„å †
+
+    g_inMiMallocOperation.store(false);
+}
+
+void* MiMallocPool::Realloc(void* oldPtr, size_t newSize)
+{
+    if (!g_mainHeap) return nullptr;
     if (!oldPtr) return Allocate(newSize);
     if (newSize == 0) {
         Free(oldPtr);
         return nullptr;
     }
 
-    size_t oldLockIndex = get_shard_index(oldPtr);
-    size_t newLockIndex = get_shard_index(nullptr, newSize);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inMiMallocOperation.store(true);
 
-    // Ëø¶¨Á½¸ö·ÖÆ¬
-    if (oldLockIndex != newLockIndex) {
-        // °´Ë³ĞòËø¶¨£¬±ÜÃâËÀËø
-        if (oldLockIndex < newLockIndex) {
-            std::lock_guard<std::mutex> lock1(m_poolMutexes[oldLockIndex]);
-            std::lock_guard<std::mutex> lock2(m_poolMutexes[newLockIndex]);
-
-            size_t oldSize = mi_usable_size(oldPtr);
-            void* newPtr = mi_heap_realloc(m_mainHeap, oldPtr, newSize);
-
-            if (newPtr) {
-                if (oldSize > 0) {
-                    m_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
-                }
-                m_usedSize.fetch_add(newSize, std::memory_order_relaxed);
-            }
-
-            return newPtr;
-        }
-        else {
-            std::lock_guard<std::mutex> lock2(m_poolMutexes[newLockIndex]);
-            std::lock_guard<std::mutex> lock1(m_poolMutexes[oldLockIndex]);
-
-            size_t oldSize = mi_usable_size(oldPtr);
-            void* newPtr = mi_heap_realloc(m_mainHeap, oldPtr, newSize);
-
-            if (newPtr) {
-                if (oldSize > 0) {
-                    m_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
-                }
-                m_usedSize.fetch_add(newSize, std::memory_order_relaxed);
-            }
-
-            return newPtr;
-        }
-    }
-    else {
-        std::lock_guard<std::mutex> lock(m_poolMutexes[oldLockIndex]);
-
-        size_t oldSize = mi_usable_size(oldPtr);
-        void* newPtr = mi_heap_realloc(m_mainHeap, oldPtr, newSize);
-
-        if (newPtr) {
-            if (oldSize > 0) {
-                m_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
-            }
-            m_usedSize.fetch_add(newSize, std::memory_order_relaxed);
-        }
-
-        return newPtr;
-    }
-}
-
-void* MiMallocPool::AllocateSafe(size_t size) {
-    if (!m_mainHeap) {
-        // ÀÁ³õÊ¼»¯
-        Initialize(64 * 1024 * 1024);  // Ä¬ÈÏ64MB
-        if (!m_mainHeap) return nullptr;
-    }
-
-    // ×¢Òâ£ºµ÷ÓÃÕßÓ¦¸ÃÒÑ¾­³ÖÓĞÁËÏàÓ¦µÄ·ÖÆ¬Ëø
-
-    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-        // ÔÚ²»°²È«ÆÚÖ±½ÓÓÃÏµÍ³·ÖÅä
-        void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!sysPtr) {
-            LogMessage("[MiMallocPool] ²»°²È«ÆÚ¼äÏµÍ³ÄÚ´æ·ÖÅäÊ§°Ü: %zu", size);
-            return nullptr;
-        }
-
-        void* userPtr = static_cast<char*>(sysPtr) + sizeof(StormAllocHeader);
-        SetupCompatibleHeader(userPtr, size - sizeof(StormAllocHeader));
-        LogMessage("[MiMallocPool] ²»°²È«ÆÚ¼äÊ¹ÓÃÏµÍ³ÄÚ´æ: %p, ´óĞ¡: %zu", userPtr, size);
-        return sysPtr;
-    }
-
-    if (!m_safeHeap) {
-        if (!m_mainHeap) {
-            Initialize(64 * 1024 * 1024);
-        }
-        if (!m_safeHeap) return nullptr;
-    }
-
-    void* ptr = mi_heap_malloc(m_safeHeap, size);
-    if (ptr) {
-        m_usedSize.fetch_add(size, std::memory_order_relaxed);
-    }
-
-    return ptr;
-}
-
-void MiMallocPool::FreeSafe(void* ptr) {
-    if (!ptr) return;
-
-    // ×¢Òâ£ºµ÷ÓÃÕßÓ¦¸ÃÒÑ¾­³ÖÓĞÁËÏàÓ¦µÄ·ÖÆ¬Ëø
-
-    // ±ÜÃâÊÍ·ÅÓÀ¾Ã¿é
-    if (IsPermanentBlock(ptr)) {
-        LogMessage("[MiMallocPool] ³¢ÊÔÊÍ·ÅÓÀ¾Ã¿é: %p£¬ÒÑºöÂÔ", ptr);
-        return;
-    }
-
-    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-        // ²»°²È«ÆÚ´¦Àí: ½«Ö¸Õë¼ÓÈëÑÓ³ÙÊÍ·Å¶ÓÁĞ
-        g_MemorySafety.EnqueueDeferredFree(ptr, GetBlockSize(ptr));
-        return;
-    }
-
-    // ¼ì²éÊÇ·ñÊÇmimalloc¹ÜÀíµÄÄÚ´æ
-    bool isMainHeapPtr = g_mainHeap && mi_heap_check_owned(m_mainHeap, ptr);
-    bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(m_safeHeap, ptr);
+    // æ£€æŸ¥æŒ‡é’ˆæ‰€æœ‰æƒ
+    bool isMainHeapPtr = mi_heap_check_owned(g_mainHeap, oldPtr);
+    bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, oldPtr);
 
     if (!isMainHeapPtr && !isSafeHeapPtr) {
-        // Èç¹û²»ÊÇmimalloc¹ÜÀíµÄÄÚ´æ£¬¼ÇÂ¼ÈÕÖ¾²¢Ìø¹ı
-        return;
+        // ä¸æ˜¯æˆ‘ä»¬ç®¡ç†çš„å†…å­˜ï¼Œåˆ†é…æ–°å†…å­˜å¹¶è¿”å›
+        g_inMiMallocOperation.store(false);
+        void* newPtr = Allocate(newSize);
+        if (newPtr) {
+            // å°è¯•æ‹·è´ä¸€äº›æ•°æ®ï¼Œä½†æˆ‘ä»¬ä¸çŸ¥é“åŸå—å¤§å°ï¼Œåªèƒ½ä¿å®ˆä¼°è®¡
+            try {
+                memcpy(newPtr, oldPtr, min(newSize, (size_t)64));
+            }
+            catch (...) {}
+        }
+        return newPtr;
     }
 
-    // »ñÈ¡´óĞ¡²¢¸üĞÂÍ³¼Æ
-    size_t size = mi_usable_size(ptr);
-    if (size > 0) {
-        m_usedSize.fetch_sub(size, std::memory_order_relaxed);
+    size_t oldSize = mi_usable_size(oldPtr);
+    void* newPtr = mi_heap_realloc(g_mainHeap, oldPtr, newSize);
+
+    if (newPtr) {
+        if (oldSize > 0) {
+            g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
+        }
+        g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
     }
 
-    // ¸ù¾İËùÊô¶ÑÑ¡ÔñÊÍ·Å·½Ê½
-    if (isMainHeapPtr) {
-        mi_free(ptr);
-    }
-    else if (isSafeHeapPtr) {
-        mi_free(ptr);  // mimalloc»á×Ô¶¯½«Ö¸ÕëÂ·ÓÉµ½ÕıÈ·µÄ¶Ñ
-    }
+    g_inMiMallocOperation.store(false);
+    return newPtr;
 }
 
-void* MiMallocPool::ReallocSafe(void* oldPtr, size_t newSize) {
-    if (!m_mainHeap) return nullptr;
+void* MiMallocPool::ReallocSafe(void* oldPtr, size_t newSize)
+{
+    if (!g_mainHeap) return nullptr;
     if (!oldPtr) return AllocateSafe(newSize);
     if (newSize == 0) {
         FreeSafe(oldPtr);
         return nullptr;
     }
 
-    // ×¢Òâ£ºµ÷ÓÃÕßÓ¦¸ÃÒÑ¾­³ÖÓĞÁËÏàÓ¦µÄ·ÖÆ¬Ëø
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inMiMallocOperation.store(true);
 
     if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-        // ²»°²È«ÆÚ´¦Àí: ·ÖÅä+¸´ÖÆ+ÑÓ³ÙÊÍ·Å
+        // ä¸å®‰å…¨æœŸå¤„ç†: åˆ†é…+å¤åˆ¶+å»¶è¿Ÿé‡Šæ”¾
         void* newPtr = AllocateSafe(newSize);
+        g_inMiMallocOperation.store(false);
+
         if (!newPtr) return nullptr;
 
-        // ³¢ÊÔ°²È«¸´ÖÆ
-        size_t oldSize = mi_usable_size(oldPtr);
-        if (oldSize > 0) {
-            size_t copySize = min(oldSize, newSize);
-            try {
-                memcpy(newPtr, oldPtr, copySize);
-            }
-            catch (...) {
-                LogMessage("[MiMallocPool] ²»°²È«ÆÚ¼ä¸´ÖÆÊı¾İÊ§°Ü");
-                return nullptr;
-            }
+        // æ£€æŸ¥æŒ‡é’ˆæ‰€æœ‰æƒ
+        bool isOurPtr = false;
+
+        // å°è¯•è·å–mimallocæ‰€æœ‰æƒ
+        if (g_mainHeap) {
+            isOurPtr = mi_heap_check_owned(g_mainHeap, oldPtr);
         }
-        else {
-            // Èç¹ûÎŞ·¨»ñÈ¡´óĞ¡£¬Ö»¸´ÖÆÉÙÁ¿Êı¾İ
-            try {
-                memcpy(newPtr, oldPtr, min(64, newSize));
-            }
-            catch (...) {
-                LogMessage("[MiMallocPool] ²»°²È«ÆÚ¼ä¸´ÖÆÊı¾İÊ§°Ü");
-                return nullptr;
-            }
+        if (!isOurPtr && g_safeHeap) {
+            isOurPtr = mi_heap_check_owned(g_safeHeap, oldPtr);
         }
 
-        // ½«oldPtr·ÅÈëÑÓ³ÙÊÍ·Å¶ÓÁĞ£¨²»ÊÍ·Å£¬Ö»¼ÇÂ¼£©
+        // å°è¯•å¤åˆ¶æ•°æ®
+        size_t oldSize = 0;
+        try {
+            if (isOurPtr) {
+                oldSize = mi_usable_size(oldPtr);
+            }
+            else {
+                // å°è¯•è·å– Storm å¤´éƒ¨ä¿¡æ¯
+                StormAllocHeader* oldHeader = reinterpret_cast<StormAllocHeader*>(
+                    static_cast<char*>(oldPtr) - sizeof(StormAllocHeader));
+
+                if (oldHeader->Magic == STORM_MAGIC) {
+                    oldSize = oldHeader->Size;
+                }
+            }
+        }
+        catch (...) {
+            oldSize = min(newSize, (size_t)64); // æ— æ³•ç¡®å®šå¤§å°ï¼Œä¿å®ˆå¤åˆ¶
+        }
+
+        size_t copySize = min(oldSize, newSize);
+        try {
+            memcpy(newPtr, oldPtr, copySize);
+        }
+        catch (...) {
+            LogMessage("[MiMallocPool] ä¸å®‰å…¨æœŸé—´å¤åˆ¶æ•°æ®å¤±è´¥");
+            FreeSafe(newPtr);
+            return nullptr;
+        }
+
+        // ä¸é‡Šæ”¾æ—§æŒ‡é’ˆï¼Œè€Œæ˜¯æ”¾å…¥å»¶è¿Ÿé˜Ÿåˆ—
         g_MemorySafety.EnqueueDeferredFree(oldPtr, oldSize);
-
         return newPtr;
     }
 
-    // Ö±½ÓÊ¹ÓÃmimallocµÄrealloc¹¦ÄÜ
-    void* newPtr = nullptr;
+    // æ£€æŸ¥æŒ‡é’ˆæ‰€æœ‰æƒ
+    bool isMainHeapPtr = g_mainHeap && mi_heap_check_owned(g_mainHeap, oldPtr);
+    bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, oldPtr);
 
-    // ¼ì²éÊÇ·ñÊÇmimalloc¹ÜÀíµÄÄÚ´æ
-    bool isMainHeapPtr = g_mainHeap && mi_heap_check_owned(m_mainHeap, oldPtr);
-    bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(m_safeHeap, oldPtr);
-
-    if (isMainHeapPtr) {
-        size_t oldSize = mi_usable_size(oldPtr);
-        newPtr = mi_heap_realloc(m_mainHeap, oldPtr, newSize);
-
+    if (!isMainHeapPtr && !isSafeHeapPtr) {
+        // ä¸æ˜¯æˆ‘ä»¬ç®¡ç†çš„å†…å­˜ï¼Œåˆ†é…æ–°å†…å­˜å¹¶è¿”å›
+        g_inMiMallocOperation.store(false);
+        void* newPtr = AllocateSafe(newSize);
         if (newPtr) {
-            if (oldSize > 0) {
-                m_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
-            }
-            m_usedSize.fetch_add(newSize, std::memory_order_relaxed);
-        }
-    }
-    else if (isSafeHeapPtr) {
-        size_t oldSize = mi_usable_size(oldPtr);
-        newPtr = mi_heap_realloc(m_safeHeap, oldPtr, newSize);
-
-        if (newPtr) {
-            if (oldSize > 0) {
-                m_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
-            }
-            m_usedSize.fetch_add(newSize, std::memory_order_relaxed);
-        }
-    }
-    else {
-        // ²»ÊÇÎÒÃÇ¹ÜÀíµÄÄÚ´æ£¬·ÖÅäĞÂÄÚ´æ²¢¸´ÖÆ
-        newPtr = AllocateSafe(newSize);
-        if (newPtr && oldPtr) {
-            // ³¢ÊÔ¿½±´Ò»Ğ©Êı¾İ£¬µ«ÎÒÃÇ²»ÖªµÀÔ­¿é´óĞ¡£¬Ö»ÄÜ±£ÊØ¹À¼Æ
+            // å°è¯•æ‹·è´ä¸€äº›æ•°æ®ï¼Œä½†æˆ‘ä»¬ä¸çŸ¥é“åŸå—å¤§å°ï¼Œåªèƒ½ä¿å®ˆä¼°è®¡
             try {
                 memcpy(newPtr, oldPtr, min(newSize, (size_t)64));
             }
             catch (...) {}
         }
+        return newPtr;
     }
 
+    // ç›´æ¥ä½¿ç”¨mimallocçš„reallocåŠŸèƒ½
+    void* newPtr = mi_heap_realloc(g_mainHeap, oldPtr, newSize);
+
+    if (newPtr) {
+        // æ›´æ–°ç»Ÿè®¡ä¿¡æ¯
+        size_t oldSize = 0;
+        if (oldPtr != newPtr) {
+            oldSize = mi_usable_size(oldPtr);
+            if (oldSize > 0) {
+                g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
+            }
+        }
+        g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
+    }
+
+    g_inMiMallocOperation.store(false);
     return newPtr;
 }
 
-size_t MiMallocPool::GetUsedSize() {
-    return m_usedSize.load(std::memory_order_relaxed);
-}
-
-size_t MiMallocPool::GetTotalSize() {
-    // È·±£×Ü´óĞ¡Ê¼ÖÕ´óÓÚÒÑÓÃ´óĞ¡
-    size_t currentUsed = GetUsedSize();
-    size_t calculatedTotal = m_totalPoolSize.load(std::memory_order_relaxed);
-
-    // Èç¹ûÊ¹ÓÃÁ¿³¬¹ıÁË¼ÇÂ¼µÄ×ÜÁ¿
-    if (currentUsed > calculatedTotal) {
-        // ¸üĞÂ×Ü´óĞ¡Îªµ±Ç°Ê¹ÓÃÁ¿µÄ150%
-        size_t newTotal = currentUsed * 3 / 2;
-        m_totalPoolSize.store(newTotal, std::memory_order_relaxed);
-        return newTotal;
-    }
-
-    return calculatedTotal;
-}
-
-bool MiMallocPool::IsFromPool(void* ptr) {
+bool MiMallocPool::IsFromPool(void* ptr)
+{
     if (!ptr) return false;
 
     __try {
-        // ¼ì²éÊÇ·ñÎªmimalloc¹ÜÀíµÄÄÚ´æ
-        if (m_mainHeap && mi_heap_check_owned(m_mainHeap, ptr)) {
+        // æ£€æŸ¥æ˜¯å¦ä¸ºmimallocç®¡ç†çš„å†…å­˜
+        if (g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr)) {
             return true;
         }
 
-        if (m_safeHeap && mi_heap_check_owned(m_safeHeap, ptr)) {
+        if (g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr)) {
             return true;
         }
 
         return false;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        // ·ÃÎÊÖ¸Õë³öÏÖÒì³£
+        // è®¿é—®æŒ‡é’ˆå‡ºç°å¼‚å¸¸
         return false;
     }
 }
 
-size_t MiMallocPool::GetBlockSize(void* ptr) {
+size_t MiMallocPool::GetBlockSize(void* ptr)
+{
     if (!ptr) return 0;
 
     __try {
-        // ³¢ÊÔ»ñÈ¡StormHeaderĞÅÏ¢
+        // æ£€æŸ¥æ˜¯å¦ä¸ºmimallocç®¡ç†çš„å†…å­˜
+        bool isMainHeapPtr = g_mainHeap && mi_heap_check_owned(g_mainHeap, ptr);
+        bool isSafeHeapPtr = g_safeHeap && mi_heap_check_owned(g_safeHeap, ptr);
+
+        if (isMainHeapPtr || isSafeHeapPtr) {
+            return mi_usable_size(ptr);
+        }
+
+        // å°è¯•è·å–StormHeaderä¿¡æ¯
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(StormAllocHeader));
 
@@ -418,187 +449,72 @@ size_t MiMallocPool::GetBlockSize(void* ptr) {
             return header->Size;
         }
     }
-    catch (...) {
-        // Í·²¿·ÃÎÊÊ§°Ü
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // æŒ‡é’ˆè®¿é—®å¼‚å¸¸
     }
 
-    // ¼ì²éÊÇ·ñÎªmimalloc¹ÜÀíµÄÄÚ´æ
-    bool isMainHeapPtr = false;
-    bool isSafeHeapPtr = false;
-
-    try {
-        if (m_mainHeap) {
-            isMainHeapPtr = mi_heap_check_owned(m_mainHeap, ptr);
-        }
-    }
-    catch (...) {}
-
-    try {
-        if (m_safeHeap) {
-            isSafeHeapPtr = mi_heap_check_owned(m_safeHeap, ptr);
-        }
-    }
-    catch (...) {}
-
-    if (isMainHeapPtr || isSafeHeapPtr) {
-        // Ê¹ÓÃmimalloc»ñÈ¡¿é´óĞ¡
-        try {
-            return mi_usable_size(ptr);
-        }
-        catch (...) {}
-    }
-
-    // Èç¹û¶¼²»ÊÇ£¬·µ»Ø0±íÊ¾Î´Öª´óĞ¡
     return 0;
 }
 
-void MiMallocPool::PrintStats() {
-    if (!m_mainHeap) {
-        LogMessage("[MiMallocPool] mimallocÎ´³õÊ¼»¯");
+size_t MiMallocPool::GetUsedSize()
+{
+    return g_usedSize.load(std::memory_order_relaxed);
+}
+
+size_t MiMallocPool::GetTotalSize()
+{
+    // ç¡®ä¿æ€»å¤§å°å§‹ç»ˆå¤§äºå·²ç”¨å¤§å°
+    size_t currentUsed = GetUsedSize();
+    size_t calculatedTotal = g_totalPoolSize.load(std::memory_order_relaxed);
+
+    // å¦‚æœä½¿ç”¨é‡è¶…è¿‡äº†è®°å½•çš„æ€»é‡
+    if (currentUsed > calculatedTotal) {
+        // æ›´æ–°æ€»å¤§å°ä¸ºå½“å‰ä½¿ç”¨é‡çš„150%
+        size_t newTotal = currentUsed * 3 / 2;
+        g_totalPoolSize.store(newTotal, std::memory_order_relaxed);
+        return newTotal;
+    }
+
+    return calculatedTotal;
+}
+
+void MiMallocPool::DisableMemoryReleasing()
+{
+    g_miMallocDisableMemoryReleasing.store(true);
+    LogMessage("[MiMallocPool] å·²ç¦ç”¨å†…å­˜é‡Šæ”¾ï¼Œæ‰€æœ‰å†…å­˜å°†ä¿ç•™åˆ°è¿›ç¨‹ç»“æŸ");
+}
+
+void MiMallocPool::CheckAndFreeUnusedPools()
+{
+    if (g_mainHeap) {
+        mi_heap_collect(g_mainHeap, true);
+    }
+
+    if (g_safeHeap) {
+        mi_heap_collect(g_safeHeap, true);
+    }
+}
+
+void MiMallocPool::HeapCollect()
+{
+    if (g_mainHeap) {
+        mi_heap_collect(g_mainHeap, true);
+    }
+}
+
+void MiMallocPool::PrintStats()
+{
+    if (!g_mainHeap) {
+        LogMessage("[MiMallocPool] mimallocæœªåˆå§‹åŒ–");
         return;
     }
 
-    LogMessage("[MiMallocPool] === mimallocÄÚ´æ³ØÍ³¼Æ ===");
-    LogMessage("[MiMallocPool] ÒÑÓÃÄÚ´æ: %zu KB", m_usedSize.load() / 1024);
+    LogMessage("[MiMallocPool] === mimallocå†…å­˜æ± ç»Ÿè®¡ ===");
+    LogMessage("[MiMallocPool] å·²ç”¨å†…å­˜: %zu KB", g_usedSize.load() / 1024);
 
-    // ÊÕ¼¯mimallocµÄÍ³¼ÆĞÅÏ¢ (mimalloc±¾ÉíÒ²ÓĞÍ³¼Æ¹¦ÄÜ)
-    // ´òÓ¡mimalloc×Ô¼ºµÄÍ³¼ÆĞÅÏ¢
+    // æ”¶é›†mimallocçš„ç»Ÿè®¡ä¿¡æ¯ (mimallocæœ¬èº«ä¹Ÿæœ‰ç»Ÿè®¡åŠŸèƒ½)
+    // æ‰“å°mimallocè‡ªå·±çš„ç»Ÿè®¡ä¿¡æ¯
     mi_stats_print(NULL);
 
-    LogMessage("[MiMallocPool] mimallocÍ³¼ÆÍê³É");
-}
-
-void MiMallocPool::CheckAndFreeUnusedPools() {
-    // Ç¿ÖÆmimallocÊÕ¼¯¿É»ØÊÕµÄÄÚ´æ
-    if (m_mainHeap) {
-        mi_heap_collect(m_mainHeap, true);
-    }
-
-    if (m_safeHeap) {
-        mi_heap_collect(m_safeHeap, true);
-    }
-}
-
-void MiMallocPool::DisableMemoryReleasing() {
-    m_disableMemoryReleasing.store(true);
-    LogMessage("[MiMallocPool] ÒÑ½ûÓÃÄÚ´æÊÍ·Å£¬ËùÓĞÄÚ´æ½«±£Áôµ½½ø³Ì½áÊø");
-}
-
-void MiMallocPool::HeapCollect() {
-    if (m_mainHeap) {
-        mi_heap_collect(m_mainHeap, true);
-    }
-}
-
-void* MiMallocPool::CreateStabilizingBlock(size_t size, const char* purpose) {
-    // Ê¹ÓÃÏµÍ³·ÖÅäÈ·±£ÎÈ¶¨ĞÔ
-    void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!rawPtr) {
-        LogMessage("[MiMallocPool] ÎŞ·¨·ÖÅäÎÈ¶¨»¯¿é: %zu", size);
-        return nullptr;
-    }
-
-    void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
-
-    // È·±£ÕıÈ·ÉèÖÃÍ·²¿
-    try {
-        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(rawPtr);
-        header->HeapPtr = SPECIAL_MARKER;  // ÌØÊâ±ê¼Ç£¬±íÊ¾ÎÒÃÇ¹ÜÀíµÄ¿é
-        header->Size = static_cast<DWORD>(size);
-        header->AlignPadding = 0;
-        header->Flags = 0x4;  // ±ê¼ÇÎª´ó¿éVirtualAlloc
-        header->Magic = STORM_MAGIC;
-    }
-    catch (...) {
-        LogMessage("[MiMallocPool] ÉèÖÃÎÈ¶¨»¯¿éÍ·²¿Ê§°Ü: %p", rawPtr);
-        VirtualFree(rawPtr, 0, MEM_RELEASE);
-        return nullptr;
-    }
-
-    LogMessage("[MiMallocPool] ´´½¨ÎÈ¶¨»¯¿é: %p (´óĞ¡: %zu, ÓÃÍ¾: %s)",
-        userPtr, size, purpose ? purpose : "Î´Öª");
-
-    return userPtr;
-}
-
-bool MiMallocPool::ValidatePointer(void* ptr) {
-    if (!ptr) return false;
-
-    __try {
-        // ³¢ÊÔ¶ÁÈ¡Ö¸ÕëµÄµÚÒ»¸ö×Ö½Ú£¬ÑéÖ¤¿É¶Á
-        volatile char test = *static_cast<char*>(ptr);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-void MiMallocPool::Preheat() {
-    LogMessage("[MiMallocPool] ¿ªÊ¼Ô¤ÈÈÄÚ´æ³Ø...");
-
-    // ¸ù¾İ³£¼û·ÖÅä´óĞ¡½øĞĞÔ¤ÈÈ
-    const std::pair<size_t, int> commonSizes[] = {
-        {4, 50},      // 4×Ö½Ú£¬Ô¤ÈÈ50¸ö
-        {16, 30},     // 16×Ö½Ú£¬Ô¤ÈÈ30¸ö
-        {32, 20},     // 32×Ö½Ú£¬Ô¤ÈÈ20¸ö
-        {72, 15},     // 72×Ö½Ú£¬Ô¤ÈÈ15¸ö
-        {108, 15},    // 108×Ö½Ú£¬Ô¤ÈÈ15¸ö
-        {128, 10},    // 128×Ö½Ú£¬Ô¤ÈÈ10¸ö
-        {192, 10},    // 192×Ö½Ú£¬Ô¤ÈÈ10¸ö
-        {256, 10},    // 256×Ö½Ú£¬Ô¤ÈÈ10¸ö
-        {512, 5},     // 512×Ö½Ú£¬Ô¤ÈÈ5¸ö
-        {1024, 5},    // 1KB£¬Ô¤ÈÈ5¸ö
-        {4096, 3},    // 4KB£¬Ô¤ÈÈ3¸ö
-        {16384, 2},   // 16KB£¬Ô¤ÈÈ2¸ö
-        {65536, 1},   // 64KB£¬Ô¤ÈÈ1¸ö
-        {262144, 1},  // 256KB£¬Ô¤ÈÈ1¸ö
-    };
-
-    std::vector<void*> preheatedBlocks;
-
-    for (const auto& [size, count] : commonSizes) {
-        for (int i = 0; i < count; i++) {
-            void* ptr = mi_heap_malloc(m_mainHeap, size);
-            if (ptr) preheatedBlocks.push_back(ptr);
-        }
-    }
-
-    LogMessage("[MiMallocPool] Ô¤ÈÈ·ÖÅäÁË %zu ¸öÄÚ´æ¿é", preheatedBlocks.size());
-
-    // ÊÍ·ÅÒ»°ëÔ¤ÈÈµÄ¿é£¬±£ÁôÒ»°ëÔÚ»º´æÖĞ
-    for (size_t i = 0; i < preheatedBlocks.size() / 2; i++) {
-        mi_free(preheatedBlocks[i]);
-    }
-
-    LogMessage("[MiMallocPool] ÄÚ´æ³ØÔ¤ÈÈÍê³É£¬ÊÍ·ÅÁË %zu ¸öÄÚ´æ¿é", preheatedBlocks.size() / 2);
-}
-
-void MiMallocPool::DisableActualFree() {
-    DisableMemoryReleasing();  // µ÷ÓÃÒÑÊµÏÖµÄº¯Êı
-}
-
-size_t MiMallocPool::get_shard_index(void* ptr, size_t size) {
-    size_t hash;
-    if (ptr) {
-        // FNV-1a¹şÏ£µÄ¼ò»¯°æ
-        hash = (reinterpret_cast<uintptr_t>(ptr) * 2654435761) >> 16;
-    }
-    else {
-        // ¶ÔÓÚ²»Í¬´óĞ¡µÄ·ÖÅäÊ¹ÓÃ¸ü¿ÆÑ§µÄ·Ö²¼
-        if (size <= 128) {
-            hash = size / 16;
-        }
-        else if (size <= 4096) {
-            hash = 8 + (size - 128) / 64;
-        }
-        else if (size <= 65536) {
-            hash = 70 + (size / 1024);
-        }
-        else {
-            hash = 134 + (size / 16384);
-        }
-    }
-    return hash % LOCK_SHARDS;
+    LogMessage("[MiMallocPool] mimallocç»Ÿè®¡å®Œæˆ");
 }

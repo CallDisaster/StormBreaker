@@ -1,30 +1,31 @@
-// MemoryPoolInterface.h
+ï»¿// MemoryPoolInterface.h
 #pragma once
+#include "pch.h"
 #include <cstddef>
 
 class MemoryPoolInterface {
 public:
     virtual ~MemoryPoolInterface() = default;
 
-    // ºËĞÄ·ÖÅä/ÊÍ·Å½Ó¿Ú
+    // æ ¸å¿ƒåˆ†é…/é‡Šæ”¾æ¥å£
     virtual bool Initialize(size_t initialSize) = 0;
     virtual void Shutdown() = 0;
     virtual void* Allocate(size_t size) = 0;
     virtual void Free(void* ptr) = 0;
     virtual void* Realloc(void* oldPtr, size_t newSize) = 0;
 
-    // °²È«²Ù×÷½Ó¿Ú
+    // å®‰å…¨æ“ä½œæ¥å£
     virtual void* AllocateSafe(size_t size) = 0;
     virtual void FreeSafe(void* ptr) = 0;
     virtual void* ReallocSafe(void* oldPtr, size_t newSize) = 0;
 
-    // ²éÑ¯½Ó¿Ú
+    // æŸ¥è¯¢æ¥å£
     virtual size_t GetUsedSize() = 0;
     virtual size_t GetTotalSize() = 0;
     virtual bool IsFromPool(void* ptr) = 0;
     virtual size_t GetBlockSize(void* ptr) = 0;
 
-    // ÆäËû¹¦ÄÜ
+    // å…¶ä»–åŠŸèƒ½
     virtual void PrintStats() = 0;
     virtual void CheckAndFreeUnusedPools() = 0;
     virtual void DisableMemoryReleasing() = 0;

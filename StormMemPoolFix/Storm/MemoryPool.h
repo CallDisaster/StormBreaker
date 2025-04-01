@@ -2,8 +2,23 @@
 #pragma once
 #include <Base/MemPool/MemoryPoolManager.h>
 
+// JVM内存池命名空间
+namespace JVM_MemPool {
+    void Initialize();
+    void* Allocate(std::size_t size);
+    void Free(void* p);
+    void* Realloc(void* oldPtr, std::size_t newSize);
+    bool IsFromPool(void* p);
+    void Cleanup();
+}
+
+#include <atomic>
+
 // 内存池命名空间
 namespace MemPool {
+    // 常量定义
+    constexpr size_t LOCK_SHARDS = 64;  // 分片锁数量定义
+
     // 导出适配变量
     extern std::atomic<bool> g_inOperation;  // 替代原来的g_inTLSFOperation
 
@@ -88,7 +103,7 @@ namespace MemPool {
         MemoryPoolManager::HeapCollect();
     }
 
-    // 原有的分片索引计算函数
+    // 分片索引计算函数
     inline size_t get_shard_index(void* ptr = nullptr, size_t size = 0) {
         size_t hash;
         if (ptr) {
@@ -113,12 +128,12 @@ namespace MemPool {
         return hash % LOCK_SHARDS;
     }
 
-    // 新增函数 - 切换内存池类型
+    // 切换内存池类型
     inline bool SwitchPoolType(PoolType newType) {
         return MemoryPoolManager::SwitchPoolType(newType);
     }
 
-    // 新增函数 - 获取当前内存池类型
+    // 获取当前内存池类型
     inline PoolType GetCurrentPoolType() {
         return MemoryPoolManager::GetActivePoolType();
     }

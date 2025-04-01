@@ -1,60 +1,54 @@
-// MemoryPoolManager.h
-#pragma once
-#include "MemoryPoolInterface.h"
+ï»¿#pragma once
+#include "pch.h"
+#include <cstddef>
 #include <atomic>
-#include <memory>
+#include <mutex>
 
+// å†…å­˜æ± ç±»å‹æšä¸¾
 enum class PoolType {
-    TLSF,
-    MiMalloc
+    TLSF,       // Two Level Segregated Fit
+    MiMalloc,   // mimalloc
+    Default = MiMalloc // é»˜è®¤ä½¿ç”¨mimalloc
 };
 
-class MemoryPoolManager {
-private:
-    static std::unique_ptr<MemoryPoolInterface> s_currentPool;
-    static std::atomic<PoolType> s_activePoolType;
-    static std::atomic<bool> g_inSwapOperation;
+// å†…å­˜æ± ç®¡ç†å™¨ - ç»Ÿä¸€ç®¡ç†ä¸åŒç±»å‹çš„å†…å­˜æ± 
+namespace MemoryPoolManager {
+    // åˆå§‹åŒ–å†…å­˜æ±  - æ³¨æ„å‚æ•°é¡ºåºå’Œé»˜è®¤å€¼
+    bool Initialize(size_t initialSize = 64 * 1024 * 1024, PoolType poolType = PoolType::Default);
 
-    // ½ûÖ¹Ö±½ÓÊµÀı»¯
-    MemoryPoolManager() = delete;
+    // æ— å‚æ•°çš„åˆå§‹åŒ–é‡è½½ï¼Œç”¨äºæ–¹ä¾¿è°ƒç”¨
+    bool Initialize();
 
-public:
-    // ³õÊ¼»¯Ö¸¶¨ÀàĞÍµÄÄÚ´æ³Ø
-    static bool Initialize(PoolType poolType, size_t initialSize);
+    // å…³é—­å†…å­˜æ± 
+    void Shutdown();
 
-    // ÇĞ»»ÄÚ´æ³ØÀàĞÍ (»áÍ¬²½ËùÓĞÏÖÓĞÄÚ´æ)
-    static bool SwitchPoolType(PoolType newType);
+    // åˆ‡æ¢å†…å­˜æ± ç±»å‹
+    bool SwitchPoolType(PoolType newType);
 
-    // »ñÈ¡µ±Ç°»î¶¯µÄÄÚ´æ³Ø
-    static MemoryPoolInterface* GetActivePool();
+    // è·å–å½“å‰æ´»è·ƒçš„å†…å­˜æ± ç±»å‹
+    PoolType GetActivePoolType();
 
-    // »ñÈ¡µ±Ç°»î¶¯µÄÄÚ´æ³ØÀàĞÍ
-    static PoolType GetActivePoolType();
+    // å¸¸è§„å†…å­˜æ“ä½œ
+    void* Allocate(size_t size);
+    void Free(void* ptr);
+    void* Realloc(void* oldPtr, size_t newSize);
 
-    // ¹Ø±ÕËùÓĞÄÚ´æ³Ø
-    static void Shutdown();
+    // å®‰å…¨ç‰ˆå†…å­˜æ“ä½œï¼ˆé€‚ç”¨äºä¸å®‰å…¨æœŸï¼‰
+    void* AllocateSafe(size_t size);
+    void FreeSafe(void* ptr);
+    void* ReallocSafe(void* oldPtr, size_t newSize);
 
-    // µ¼³öÔ­À´µÄMemPoolÃüÃû¿Õ¼äÖĞµÄËùÓĞ½Ó¿Ú
-    static bool Initialize(size_t initialSize);
-    static void* Allocate(size_t size);
-    static void Free(void* ptr);
-    static void* Realloc(void* oldPtr, size_t newSize);
-
-    static void* AllocateSafe(size_t size);
-    static void FreeSafe(void* ptr);
-    static void* ReallocSafe(void* oldPtr, size_t newSize);
-
-    static size_t GetUsedSize();
-    static size_t GetTotalSize();
-    static bool IsFromPool(void* ptr);
-    static size_t GetBlockSize(void* ptr);
-
-    static void PrintStats();
-    static void CheckAndFreeUnusedPools();
-    static void DisableMemoryReleasing();
-    static void HeapCollect();
-    static void* CreateStabilizingBlock(size_t size, const char* purpose);
-    static bool ValidatePointer(void* ptr);
-    static void Preheat();
-    static void DisableActualFree();
-};
+    // è¾…åŠ©åŠŸèƒ½
+    bool IsFromPool(void* ptr);
+    size_t GetBlockSize(void* ptr);
+    size_t GetUsedSize();
+    size_t GetTotalSize();
+    void DisableMemoryReleasing();
+    void CheckAndFreeUnusedPools();
+    void* CreateStabilizingBlock(size_t size, const char* purpose);
+    bool ValidatePointer(void* ptr);
+    void DisableActualFree();
+    void Preheat();
+    void HeapCollect();
+    void PrintStats();
+}

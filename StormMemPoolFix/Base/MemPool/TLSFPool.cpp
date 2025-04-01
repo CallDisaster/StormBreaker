@@ -1,619 +1,532 @@
-// TLSFPool.cpp
+ï»¿#include "pch.h"
 #include "TLSFPool.h"
-#include "Base/Logger.h"
-#include "StormHook.h"
 #include <Windows.h>
-#include <Storm/StormHook.h>
-#include <Base/MemorySafety.h>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <cassert>
+#include <iostream>
+#include "Storm/StormHook.h"
+#include "Base/MemorySafety.h"
+#include "Base/MemPool/tlsf.h"
 
-TLSFPool::TLSFPool() {
-    // ¹¹Ôìº¯Êı²»×öÊµ¼Ê³õÊ¼»¯£¬µÈ´ıInitializeµ÷ÓÃ
+namespace {
+    // TLSFç›¸å…³
+    tlsf_t g_tlsfInstance = nullptr;
+    pool_t g_initialPool = nullptr;
+    std::vector<std::pair<void*, size_t>> g_additionalPools;
+
+    // æ§åˆ¶æ ‡å¿—
+    std::atomic<bool> g_inTLSFOperation{ false };
+    std::atomic<bool> g_tlsfDisableMemoryReleasing{ false };
+
+    // ç»Ÿè®¡
+    std::atomic<size_t> g_totalPoolSize{ 0 };
+    std::atomic<size_t> g_usedSize{ 0 };
+
+    // é”
+    std::mutex g_poolMutex;
 }
 
-TLSFPool::~TLSFPool() {
-    // È·±£Shutdown±»µ÷ÓÃ
+TLSFPool::TLSFPool()
+    : m_initialized(false)
+{
+}
+
+TLSFPool::~TLSFPool()
+{
     Shutdown();
 }
 
-bool TLSFPool::Initialize(size_t initialSize) {
-    if (m_tlsfPool) {
-        LogMessage("[TLSFPool] ÒÑ³õÊ¼»¯");
+bool TLSFPool::Initialize(size_t initialSize)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_initialized) {
+        LogMessage("[TLSFPool] å·²åˆå§‹åŒ–");
         return true;
     }
 
-    // ·ÖÅäÄÚ´æ³Ø¿Õ¼ä
-    m_poolMemory = VirtualAlloc(NULL, initialSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!m_poolMemory) {
-        LogMessage("[TLSFPool] ÎŞ·¨·ÖÅäÖ÷³ØÄÚ´æ: %zu ×Ö½Ú", initialSize);
+    // ç¡®ä¿åˆå§‹å¤§å°æ˜¯æœ‰æ•ˆçš„
+    if (initialSize < 1024 * 1024) {
+        initialSize = 1024 * 1024; // æœ€å°1MB
+    }
+
+    // åˆ†é…TLSFæ§åˆ¶ç»“æ„å†…å­˜
+    void* tlsfMem = VirtualAlloc(NULL, tlsf_size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!tlsfMem) {
+        LogMessage("[TLSFPool] æ— æ³•åˆ†é…TLSFæ§åˆ¶ç»“æ„å†…å­˜");
         return false;
     }
 
-    // ´´½¨TLSF³Ø
-    m_tlsfPool = tlsf_create(m_poolMemory);
-    if (!m_tlsfPool) {
-        VirtualFree(m_poolMemory, 0, MEM_RELEASE);
-        m_poolMemory = nullptr;
-        LogMessage("[TLSFPool] ÎŞ·¨´´½¨TLSFÖ÷³Ø");
+    // åˆ›å»ºTLSFå®ä¾‹
+    g_tlsfInstance = tlsf_create(tlsfMem);
+    if (!g_tlsfInstance) {
+        LogMessage("[TLSFPool] TLSFå®ä¾‹åˆ›å»ºå¤±è´¥");
+        VirtualFree(tlsfMem, 0, MEM_RELEASE);
         return false;
     }
 
-    // Ìí¼ÓÖ÷ÄÚ´æ³Ø
-    void* pool = tlsf_add_pool(m_tlsfPool,
-        static_cast<char*>(m_poolMemory) + tlsf_size(),
-        initialSize - tlsf_size());
-    if (!pool) {
-        tlsf_destroy(m_tlsfPool);
-        VirtualFree(m_poolMemory, 0, MEM_RELEASE);
-        m_poolMemory = nullptr;
-        m_tlsfPool = nullptr;
-        LogMessage("[TLSFPool] ÎŞ·¨Ìí¼ÓÖ÷ÄÚ´æ³Ø");
+    // åˆ†é…åˆå§‹å†…å­˜æ± 
+    void* poolMem = VirtualAlloc(NULL, initialSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!poolMem) {
+        LogMessage("[TLSFPool] æ— æ³•åˆ†é…åˆå§‹å†…å­˜æ± ");
+        tlsf_destroy(g_tlsfInstance);
+        VirtualFree(tlsfMem, 0, MEM_RELEASE);
+        g_tlsfInstance = nullptr;
         return false;
     }
 
-    // ´´½¨°²È«³Ø
-    size_t safePoolSize = initialSize / 10; // 10%µÄ´óĞ¡
-    m_safePoolMemory = VirtualAlloc(NULL, safePoolSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (m_safePoolMemory) {
-        m_safeTlsfPool = tlsf_create(m_safePoolMemory);
-        if (m_safeTlsfPool) {
-            void* safePool = tlsf_add_pool(m_safeTlsfPool,
-                static_cast<char*>(m_safePoolMemory) + tlsf_size(),
-                safePoolSize - tlsf_size());
-            if (!safePool) {
-                tlsf_destroy(m_safeTlsfPool);
-                VirtualFree(m_safePoolMemory, 0, MEM_RELEASE);
-                m_safePoolMemory = nullptr;
-                m_safeTlsfPool = nullptr;
-                LogMessage("[TLSFPool] ÎŞ·¨Ìí¼Ó°²È«ÄÚ´æ³Ø£¬¼ÌĞøÊ¹ÓÃÖ÷³Ø");
-            }
-        }
-        else {
-            VirtualFree(m_safePoolMemory, 0, MEM_RELEASE);
-            m_safePoolMemory = nullptr;
-            LogMessage("[TLSFPool] ÎŞ·¨´´½¨TLSF°²È«³Ø£¬¼ÌĞøÊ¹ÓÃÖ÷³Ø");
-        }
+    // æ·»åŠ åˆå§‹æ± 
+    g_initialPool = tlsf_add_pool(g_tlsfInstance, poolMem, initialSize);
+    if (!g_initialPool) {
+        LogMessage("[TLSFPool] æ— æ³•æ·»åŠ åˆå§‹å†…å­˜æ± åˆ°TLSF");
+        VirtualFree(poolMem, 0, MEM_RELEASE);
+        tlsf_destroy(g_tlsfInstance);
+        VirtualFree(tlsfMem, 0, MEM_RELEASE);
+        g_tlsfInstance = nullptr;
+        return false;
     }
 
-    // ÉèÖÃ³Ø´óĞ¡
-    m_totalPoolSize.store(initialSize);
+    // è®°å½•åˆå§‹æ± å¤§å°
+    g_totalPoolSize.store(initialSize);
+    m_initialized = true;
 
-    LogMessage("[TLSFPool] TLSF³õÊ¼»¯Íê³É£¬Ô¤Áô´óĞ¡: %zu ×Ö½Ú", initialSize);
+    LogMessage("[TLSFPool] TLSFåˆå§‹åŒ–å®Œæˆï¼Œåˆå§‹æ± å¤§å°: %zu å­—èŠ‚", initialSize);
     return true;
 }
 
-void TLSFPool::Shutdown() {
-    if (m_disableMemoryReleasing.load()) {
-        LogMessage("[TLSFPool] ±£ÁôËùÓĞÄÚ´æ¿é£¬½öÇåÀí¹ÜÀíÊı¾İ");
-        m_tlsfPool = nullptr;
-        m_poolMemory = nullptr;
-        m_safeTlsfPool = nullptr;
-        m_safePoolMemory = nullptr;
+void TLSFPool::Shutdown()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!m_initialized) {
         return;
     }
 
-    // ÇåÀíÈ«¾Ö×·×Ù±í
-    {
-        std::lock_guard<std::mutex> lock(m_trackingMutex);
-        m_allocatedBlocks.clear();
-    }
-
-    // Ïú»ÙTLSF³Ø
-    if (m_safeTlsfPool) {
-        tlsf_destroy(m_safeTlsfPool);
-        m_safeTlsfPool = nullptr;
-    }
-
-    if (m_safePoolMemory) {
-        VirtualFree(m_safePoolMemory, 0, MEM_RELEASE);
-        m_safePoolMemory = nullptr;
-    }
-
-    if (m_tlsfPool) {
-        tlsf_destroy(m_tlsfPool);
-        m_tlsfPool = nullptr;
-    }
-
-    if (m_poolMemory) {
-        VirtualFree(m_poolMemory, 0, MEM_RELEASE);
-        m_poolMemory = nullptr;
-    }
-
-    LogMessage("[TLSFPool] TLSF¹Ø±ÕÍê³É");
-}
-
-void* TLSFPool::Allocate(size_t size) {
-    if (!m_tlsfPool) {
-        // ÀÁ³õÊ¼»¯
-        Initialize(64 * 1024 * 1024);  // Ä¬ÈÏ64MB
-        if (!m_tlsfPool) return nullptr;
-    }
-
-    size_t lockIndex = get_shard_index(nullptr, size);
-    std::lock_guard<std::mutex> lock(m_poolMutexes[lockIndex]);
-
-    void* ptr = tlsf_malloc(m_tlsfPool, size);
-    if (ptr) {
-        m_usedSize.fetch_add(size, std::memory_order_relaxed);
-
-        // ¼ÇÂ¼·ÖÅä
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        m_allocatedBlocks[ptr] = size;
-    }
-
-    return ptr;
-}
-
-void TLSFPool::Free(void* ptr) {
-    if (!m_tlsfPool || !ptr) return;
-
-    // ±ÜÃâÊÍ·ÅÓÀ¾Ã¿é
-    if (IsPermanentBlock(ptr)) {
-        LogMessage("[TLSFPool] ³¢ÊÔÊÍ·ÅÓÀ¾Ã¿é: %p£¬ÒÑºöÂÔ", ptr);
+    // å¦‚æœè®¾ç½®äº†ä¸é‡Šæ”¾å†…å­˜ï¼Œåˆ™åªæ¸…ç†ç®¡ç†ç»“æ„
+    if (g_tlsfDisableMemoryReleasing.load()) {
+        LogMessage("[TLSFPool] ä¿ç•™æ‰€æœ‰å†…å­˜å—ï¼Œä»…æ¸…ç†ç®¡ç†æ•°æ®");
+        g_tlsfInstance = nullptr;
+        g_initialPool = nullptr;
+        g_additionalPools.clear();
+        m_initialized = false;
         return;
     }
 
-    size_t lockIndex = get_shard_index(ptr);
-    std::lock_guard<std::mutex> lock(m_poolMutexes[lockIndex]);
+    // æ­£å¸¸æ¸…ç† - å…ˆæ¸…ç†é¢å¤–æ± 
+    for (const auto& pool : g_additionalPools) {
+        if (pool.first) {
+            // ä»TLSFç§»é™¤æ± 
+            tlsf_remove_pool(g_tlsfInstance, pool.first);
+            // é‡Šæ”¾ç³»ç»Ÿå†…å­˜
+            VirtualFree(pool.first, 0, MEM_RELEASE);
+        }
+    }
+    g_additionalPools.clear();
 
-    // ²éÕÒ¼ÇÂ¼µÄ¿é´óĞ¡
-    size_t size = 0;
-    {
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        auto it = m_allocatedBlocks.find(ptr);
-        if (it != m_allocatedBlocks.end()) {
-            size = it->second;
-            m_allocatedBlocks.erase(it);
+    // æ¸…ç†åˆå§‹æ± 
+    if (g_initialPool) {
+        void* poolMem = g_initialPool;
+        tlsf_remove_pool(g_tlsfInstance, g_initialPool);
+        VirtualFree(poolMem, 0, MEM_RELEASE);
+        g_initialPool = nullptr;
+    }
+
+    // æ¸…ç†TLSFå®ä¾‹
+    if (g_tlsfInstance) {
+        void* tlsfMem = g_tlsfInstance;
+        tlsf_destroy(g_tlsfInstance);
+        VirtualFree(tlsfMem, 0, MEM_RELEASE);
+        g_tlsfInstance = nullptr;
+    }
+
+    m_initialized = false;
+    LogMessage("[TLSFPool] TLSFå†…å­˜æ± å…³é—­å®Œæˆ");
+}
+
+void* TLSFPool::Allocate(size_t size)
+{
+    if (!g_tlsfInstance) {
+        // æ‡’åˆå§‹åŒ–
+        if (!Initialize(64 * 1024 * 1024)) {  // é»˜è®¤64MB
+            return nullptr;
         }
     }
 
-    if (size > 0) {
-        m_usedSize.fetch_sub(size, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inTLSFOperation.store(true);
+
+    void* ptr = tlsf_malloc(g_tlsfInstance, size);
+
+    // å¦‚æœåˆ†é…å¤±è´¥ä¸”sizeæ¯”è¾ƒå¤§ï¼Œå¯èƒ½éœ€è¦æ‰©å±•å†…å­˜æ± 
+    if (!ptr && size > 1024) {
+        if (ExpandPool(size * 2)) {
+            // å†æ¬¡å°è¯•åˆ†é…
+            ptr = tlsf_malloc(g_tlsfInstance, size);
+        }
     }
 
-    // ÊÍ·ÅÄÚ´æ
-    tlsf_free(m_tlsfPool, ptr);
+    if (ptr) {
+        g_usedSize.fetch_add(size, std::memory_order_relaxed);
+    }
+
+    g_inTLSFOperation.store(false);
+    return ptr;
 }
 
-void* TLSFPool::Realloc(void* oldPtr, size_t newSize) {
-    if (!m_tlsfPool) return nullptr;
+void* TLSFPool::AllocateSafe(size_t size)
+{
+    if (!g_tlsfInstance) {
+        // æ‡’åˆå§‹åŒ–
+        if (!Initialize(64 * 1024 * 1024)) {  // é»˜è®¤64MB
+            return nullptr;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inTLSFOperation.store(true);
+
+    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+        // åœ¨ä¸å®‰å…¨æœŸç›´æ¥ç”¨ç³»ç»Ÿåˆ†é…
+        void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        g_inTLSFOperation.store(false);
+
+        if (!sysPtr) {
+            LogMessage("[TLSFPool] ä¸å®‰å…¨æœŸé—´ç³»ç»Ÿå†…å­˜åˆ†é…å¤±è´¥: %zu", size);
+            return nullptr;
+        }
+
+        void* userPtr = static_cast<char*>(sysPtr) + sizeof(StormAllocHeader);
+        SetupCompatibleHeader(userPtr, size - sizeof(StormAllocHeader));
+        LogMessage("[TLSFPool] ä¸å®‰å…¨æœŸé—´ä½¿ç”¨ç³»ç»Ÿå†…å­˜: %p, å¤§å°: %zu", userPtr, size);
+        return sysPtr;
+    }
+
+    void* ptr = tlsf_malloc(g_tlsfInstance, size);
+
+    // å¦‚æœåˆ†é…å¤±è´¥ä¸”sizeæ¯”è¾ƒå¤§ï¼Œå¯èƒ½éœ€è¦æ‰©å±•å†…å­˜æ± 
+    if (!ptr && size > 1024) {
+        if (ExpandPool(size * 2)) {
+            // å†æ¬¡å°è¯•åˆ†é…
+            ptr = tlsf_malloc(g_tlsfInstance, size);
+        }
+    }
+
+    if (ptr) {
+        g_usedSize.fetch_add(size, std::memory_order_relaxed);
+    }
+
+    g_inTLSFOperation.store(false);
+    return ptr;
+}
+
+void TLSFPool::Free(void* ptr)
+{
+    if (!g_tlsfInstance || !ptr) return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inTLSFOperation.store(true);
+
+    // é¿å…é‡Šæ”¾æ°¸ä¹…å—
+    if (IsPermanentBlock(ptr)) {
+        LogMessage("[TLSFPool] å°è¯•é‡Šæ”¾æ°¸ä¹…å—: %pï¼Œå·²å¿½ç•¥", ptr);
+        g_inTLSFOperation.store(false);
+        return;
+    }
+
+    // è·å–å¤§å°å¹¶æ›´æ–°ç»Ÿè®¡
+    size_t size = tlsf_block_size(ptr);
+    if (size > 0) {
+        g_usedSize.fetch_sub(size, std::memory_order_relaxed);
+    }
+
+    // é‡Šæ”¾å†…å­˜
+    tlsf_free(g_tlsfInstance, ptr);
+
+    g_inTLSFOperation.store(false);
+}
+
+void TLSFPool::FreeSafe(void* ptr)
+{
+    if (!ptr) return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inTLSFOperation.store(true);
+
+    // é¿å…é‡Šæ”¾æ°¸ä¹…å—
+    if (IsPermanentBlock(ptr)) {
+        LogMessage("[TLSFPool] å°è¯•é‡Šæ”¾æ°¸ä¹…å—: %pï¼Œå·²å¿½ç•¥", ptr);
+        g_inTLSFOperation.store(false);
+        return;
+    }
+
+    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+        // ä¸å®‰å…¨æœŸå¤„ç†: å°†æŒ‡é’ˆåŠ å…¥å»¶è¿Ÿé‡Šæ”¾é˜Ÿåˆ—
+        g_MemorySafety.EnqueueDeferredFree(ptr, GetBlockSize(ptr));
+        g_inTLSFOperation.store(false);
+        return;
+    }
+
+    // è·å–å¤§å°å¹¶æ›´æ–°ç»Ÿè®¡
+    size_t size = tlsf_block_size(ptr);
+    if (size > 0) {
+        g_usedSize.fetch_sub(size, std::memory_order_relaxed);
+    }
+
+    // é‡Šæ”¾å†…å­˜
+    tlsf_free(g_tlsfInstance, ptr);
+
+    g_inTLSFOperation.store(false);
+}
+
+void* TLSFPool::Realloc(void* oldPtr, size_t newSize)
+{
+    if (!g_tlsfInstance) return nullptr;
     if (!oldPtr) return Allocate(newSize);
     if (newSize == 0) {
         Free(oldPtr);
         return nullptr;
     }
 
-    size_t oldLockIndex = get_shard_index(oldPtr);
-    size_t newLockIndex = get_shard_index(nullptr, newSize);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inTLSFOperation.store(true);
 
-    // Ëø¶¨Á½¸ö·ÖÆ¬
-    if (oldLockIndex != newLockIndex) {
-        // °´Ë³ĞòËø¶¨£¬±ÜÃâËÀËø
-        if (oldLockIndex < newLockIndex) {
-            std::lock_guard<std::mutex> lock1(m_poolMutexes[oldLockIndex]);
-            std::lock_guard<std::mutex> lock2(m_poolMutexes[newLockIndex]);
-            return ReallocInternal(oldPtr, newSize);
-        }
-        else {
-            std::lock_guard<std::mutex> lock2(m_poolMutexes[newLockIndex]);
-            std::lock_guard<std::mutex> lock1(m_poolMutexes[oldLockIndex]);
-            return ReallocInternal(oldPtr, newSize);
+    // è·å–æ—§å—å¤§å°
+    size_t oldSize = tlsf_block_size(oldPtr);
+
+    // ä½¿ç”¨TLSFçš„é‡åˆ†é…åŠŸèƒ½
+    void* newPtr = tlsf_realloc(g_tlsfInstance, oldPtr, newSize);
+
+    // å¦‚æœé‡åˆ†é…å¤±è´¥ï¼Œå°è¯•æ‰©å±•æ± å¹¶é‡æ–°åˆ†é…
+    if (!newPtr && newSize > oldSize) {
+        if (ExpandPool(newSize * 2)) {
+            newPtr = tlsf_realloc(g_tlsfInstance, oldPtr, newSize);
         }
     }
-    else {
-        std::lock_guard<std::mutex> lock(m_poolMutexes[oldLockIndex]);
-        return ReallocInternal(oldPtr, newSize);
+
+    if (newPtr) {
+        // æ›´æ–°ç»Ÿè®¡
+        if (oldSize > 0) {
+            g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
+        }
+        g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
     }
+
+    g_inTLSFOperation.store(false);
+    return newPtr;
 }
 
-void* TLSFPool::AllocateSafe(size_t size) {
-    if (!m_tlsfPool) {
-        // ÀÁ³õÊ¼»¯
-        Initialize(64 * 1024 * 1024);
-        if (!m_tlsfPool) return nullptr;
-    }
-
-    // ×¢Òâ£ºµ÷ÓÃÕßÓ¦¸ÃÒÑ¾­³ÖÓĞÁËÏàÓ¦µÄ·ÖÆ¬Ëø
-
-    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-        // ²»°²È«ÆÚÊ¹ÓÃÏµÍ³·ÖÅä
-        void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!sysPtr) {
-            LogMessage("[TLSFPool] ²»°²È«ÆÚ¼äÏµÍ³ÄÚ´æ·ÖÅäÊ§°Ü: %zu", size);
-            return nullptr;
-        }
-
-        void* userPtr = static_cast<char*>(sysPtr) + sizeof(StormAllocHeader);
-        SetupCompatibleHeader(userPtr, size - sizeof(StormAllocHeader));
-        LogMessage("[TLSFPool] ²»°²È«ÆÚ¼äÊ¹ÓÃÏµÍ³ÄÚ´æ: %p, ´óĞ¡: %zu", userPtr, size);
-        return sysPtr;
-    }
-
-    // ÓÅÏÈÊ¹ÓÃ°²È«³Ø
-    void* ptr = nullptr;
-    if (m_safeTlsfPool) {
-        ptr = tlsf_malloc(m_safeTlsfPool, size);
-    }
-
-    // °²È«³Ø·ÖÅäÊ§°Ü£¬»ØÍËµ½Ö÷³Ø
-    if (!ptr && m_tlsfPool) {
-        ptr = tlsf_malloc(m_tlsfPool, size);
-    }
-
-    if (ptr) {
-        m_usedSize.fetch_add(size, std::memory_order_relaxed);
-
-        // ¼ÇÂ¼·ÖÅä
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        m_allocatedBlocks[ptr] = size;
-    }
-
-    return ptr;
-}
-
-void TLSFPool::FreeSafe(void* ptr) {
-    if (!ptr) return;
-
-    // ×¢Òâ£ºµ÷ÓÃÕßÓ¦¸ÃÒÑ¾­³ÖÓĞÁËÏàÓ¦µÄ·ÖÆ¬Ëø
-
-    // ±ÜÃâÊÍ·ÅÓÀ¾Ã¿é
-    if (IsPermanentBlock(ptr)) {
-        LogMessage("[TLSFPool] ³¢ÊÔÊÍ·ÅÓÀ¾Ã¿é: %p£¬ÒÑºöÂÔ", ptr);
-        return;
-    }
-
-    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-        // ²»°²È«ÆÚ´¦Àí: ½«Ö¸Õë¼ÓÈëÑÓ³ÙÊÍ·Å¶ÓÁĞ
-        g_MemorySafety.EnqueueDeferredFree(ptr, GetBlockSize(ptr));
-        return;
-    }
-
-    // »ñÈ¡¿é´óĞ¡²¢¸üĞÂÍ³¼Æ
-    size_t size = 0;
-    {
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        auto it = m_allocatedBlocks.find(ptr);
-        if (it != m_allocatedBlocks.end()) {
-            size = it->second;
-            m_allocatedBlocks.erase(it);
-        }
-    }
-
-    if (size > 0) {
-        m_usedSize.fetch_sub(size, std::memory_order_relaxed);
-    }
-
-    // ÅĞ¶ÏÊÇ·ñÀ´×Ô°²È«³Ø
-    bool isSafePoolPtr = m_safeTlsfPool && tlsf_check_pool(tlsf_get_pool(m_safeTlsfPool));
-    bool isMainPoolPtr = m_tlsfPool && tlsf_check_pool(tlsf_get_pool(m_tlsfPool));
-
-    // ¸ù¾İËùÊô³ØÑ¡ÔñÊÍ·Å·½Ê½
-    if (isSafePoolPtr) {
-        tlsf_free(m_safeTlsfPool, ptr);
-    }
-    else if (isMainPoolPtr) {
-        tlsf_free(m_tlsfPool, ptr);
-    }
-    else {
-        // Î´ÖªÀ´Ô´£¬Ê¹ÓÃVirtualFree
-        VirtualFree(ptr, 0, MEM_RELEASE);
-    }
-}
-
-void* TLSFPool::ReallocSafe(void* oldPtr, size_t newSize) {
-    if (!m_tlsfPool) return nullptr;
+void* TLSFPool::ReallocSafe(void* oldPtr, size_t newSize)
+{
+    if (!g_tlsfInstance) return nullptr;
     if (!oldPtr) return AllocateSafe(newSize);
     if (newSize == 0) {
         FreeSafe(oldPtr);
         return nullptr;
     }
 
-    // ×¢Òâ£ºµ÷ÓÃÕßÓ¦¸ÃÒÑ¾­³ÖÓĞÁËÏàÓ¦µÄ·ÖÆ¬Ëø
+    std::lock_guard<std::mutex> lock(m_mutex);
+    g_inTLSFOperation.store(true);
 
     if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-        // ²»°²È«ÆÚ´¦Àí: ·ÖÅä+¸´ÖÆ+ÑÓ³ÙÊÍ·Å
+        // ä¸å®‰å…¨æœŸå¤„ç†: åˆ†é…+å¤åˆ¶+å»¶è¿Ÿé‡Šæ”¾
         void* newPtr = AllocateSafe(newSize);
+        g_inTLSFOperation.store(false);
+
         if (!newPtr) return nullptr;
 
-        // ³¢ÊÔ»ñÈ¡¾É¿é´óĞ¡
-        size_t oldSize = GetBlockSize(oldPtr);
-
-        // ³¢ÊÔ¸´ÖÆÊı¾İ
-        size_t copySize = oldSize > 0 ? min(oldSize, newSize) : min(newSize, (size_t)64);
-        try {
-            memcpy(newPtr, oldPtr, copySize);
+        // å°è¯•è·å–å¤§å°å¹¶å¤åˆ¶æ•°æ®
+        size_t oldSize = tlsf_block_size(oldPtr);
+        if (oldSize == 0) {
+            // æ— æ³•ç¡®å®šå¤§å°ï¼Œä¿å®ˆå¤åˆ¶
+            try {
+                memcpy(newPtr, oldPtr, min(newSize, (size_t)64));
+            }
+            catch (...) {
+                LogMessage("[TLSFPool] ä¸å®‰å…¨æœŸé—´å¤åˆ¶æ•°æ®å¤±è´¥");
+                FreeSafe(newPtr);
+                return nullptr;
+            }
         }
-        catch (...) {
-            LogMessage("[TLSFPool] ²»°²È«ÆÚ¼ä¸´ÖÆÊı¾İÊ§°Ü");
-            FreeSafe(newPtr);
-            return nullptr;
+        else {
+            // æ­£å¸¸å¤åˆ¶
+            try {
+                memcpy(newPtr, oldPtr, min(oldSize, newSize));
+            }
+            catch (...) {
+                LogMessage("[TLSFPool] ä¸å®‰å…¨æœŸé—´å¤åˆ¶æ•°æ®å¤±è´¥");
+                FreeSafe(newPtr);
+                return nullptr;
+            }
         }
 
-        // ²»ÊÍ·Å¾ÉÖ¸Õë£¬¶øÊÇ·ÅÈëÑÓ³Ù¶ÓÁĞ
+        // ä¸é‡Šæ”¾æ—§æŒ‡é’ˆï¼Œè€Œæ˜¯æ”¾å…¥å»¶è¿Ÿé˜Ÿåˆ—
         g_MemorySafety.EnqueueDeferredFree(oldPtr, oldSize);
         return newPtr;
     }
 
-    // ÅĞ¶ÏÊÇ·ñÀ´×Ô°²È«³Ø
-    bool isSafePoolPtr = m_safeTlsfPool && tlsf_check_pool(tlsf_get_pool(m_safeTlsfPool));
-    bool isMainPoolPtr = m_tlsfPool && tlsf_check_pool(tlsf_get_pool(m_tlsfPool));
+    // è·å–æ—§å—å¤§å°
+    size_t oldSize = tlsf_block_size(oldPtr);
 
-    // »ñÈ¡¾É¿é´óĞ¡
-    size_t oldSize = 0;
-    {
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        auto it = m_allocatedBlocks.find(oldPtr);
-        if (it != m_allocatedBlocks.end()) {
-            oldSize = it->second;
-        }
-    }
+    // ä½¿ç”¨TLSFçš„é‡åˆ†é…åŠŸèƒ½
+    void* newPtr = tlsf_realloc(g_tlsfInstance, oldPtr, newSize);
 
-    void* newPtr = nullptr;
-
-    // ¸ù¾İÀ´Ô´³ØÑ¡ÔñÖØ·ÖÅä·½Ê½
-    if (isSafePoolPtr) {
-        newPtr = tlsf_realloc(m_safeTlsfPool, oldPtr, newSize);
-    }
-    else if (isMainPoolPtr) {
-        newPtr = tlsf_realloc(m_tlsfPool, oldPtr, newSize);
-    }
-    else {
-        // Î´ÖªÀ´Ô´£¬·ÖÅäĞÂÄÚ´æ²¢¸´ÖÆ
-        newPtr = AllocateSafe(newSize);
-        if (newPtr && oldPtr) {
-            size_t copySize = oldSize > 0 ? min(oldSize, newSize) : min(newSize, (size_t)64);
-            try {
-                memcpy(newPtr, oldPtr, copySize);
-            }
-            catch (...) {
-                FreeSafe(newPtr);
-                return nullptr;
-            }
-
-            // ½«¾ÉÖ¸Õë¼ÓÈëÑÓ³ÙÊÍ·Å¶ÓÁĞ
-            g_MemorySafety.EnqueueDeferredFree(oldPtr, oldSize);
+    // å¦‚æœé‡åˆ†é…å¤±è´¥ï¼Œå°è¯•æ‰©å±•æ± å¹¶é‡æ–°åˆ†é…
+    if (!newPtr && newSize > oldSize) {
+        if (ExpandPool(newSize * 2)) {
+            newPtr = tlsf_realloc(g_tlsfInstance, oldPtr, newSize);
         }
     }
 
     if (newPtr) {
-        // ¸üĞÂÍ³¼ÆºÍ¸ú×ÙĞÅÏ¢
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-
-        // Èç¹ûÖ¸Õë±ä»¯£¬ÒÆ³ı¾É¼ÇÂ¼
-        if (newPtr != oldPtr) {
-            auto it = m_allocatedBlocks.find(oldPtr);
-            if (it != m_allocatedBlocks.end()) {
-                m_allocatedBlocks.erase(it);
-            }
-
-            if (oldSize > 0) {
-                m_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
-            }
+        // æ›´æ–°ç»Ÿè®¡
+        if (oldSize > 0) {
+            g_usedSize.fetch_sub(oldSize, std::memory_order_relaxed);
         }
-
-        // Ìí¼ÓĞÂ¼ÇÂ¼
-        m_allocatedBlocks[newPtr] = newSize;
-        m_usedSize.fetch_add(newSize, std::memory_order_relaxed);
+        g_usedSize.fetch_add(newSize, std::memory_order_relaxed);
     }
 
+    g_inTLSFOperation.store(false);
     return newPtr;
 }
 
-size_t TLSFPool::GetUsedSize() {
-    return m_usedSize.load(std::memory_order_relaxed);
+bool TLSFPool::IsFromPool(void* ptr)
+{
+    if (!ptr || !g_tlsfInstance) return false;
+
+    __try {
+        // TLSFæ²¡æœ‰ç›´æ¥çš„æ–¹æ³•æ£€æŸ¥æŒ‡é’ˆæ‰€æœ‰æƒï¼Œæ‰€ä»¥æˆ‘ä»¬å°è¯•è·å–å—å¤§å°
+        // å¦‚æœèƒ½è·å–å¤§å°ï¼Œè¯´æ˜æ˜¯æˆ‘ä»¬çš„å—
+        size_t size = tlsf_block_size(ptr);
+        return size > 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // è®¿é—®æŒ‡é’ˆå‡ºç°å¼‚å¸¸
+        return false;
+    }
 }
 
-size_t TLSFPool::GetTotalSize() {
-    // È·±£×Ü´óĞ¡Ê¼ÖÕ´óÓÚÒÑÓÃ´óĞ¡
-    size_t currentUsed = GetUsedSize();
-    size_t calculatedTotal = m_totalPoolSize.load(std::memory_order_relaxed);
+size_t TLSFPool::GetBlockSize(void* ptr)
+{
+    if (!ptr) return 0;
 
-    // Èç¹ûÊ¹ÓÃÁ¿³¬¹ıÁË¼ÇÂ¼µÄ×ÜÁ¿
+    __try {
+        if (g_tlsfInstance) {
+            return tlsf_block_size(ptr);
+        }
+
+        // å°è¯•è·å–StormHeaderä¿¡æ¯
+        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
+            static_cast<char*>(ptr) - sizeof(StormAllocHeader));
+
+        if (header->Magic == STORM_MAGIC) {
+            return header->Size;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // æŒ‡é’ˆè®¿é—®å¼‚å¸¸
+    }
+
+    return 0;
+}
+
+size_t TLSFPool::GetUsedSize()
+{
+    return g_usedSize.load(std::memory_order_relaxed);
+}
+
+size_t TLSFPool::GetTotalSize()
+{
+    // ç¡®ä¿æ€»å¤§å°å§‹ç»ˆå¤§äºå·²ç”¨å¤§å°
+    size_t currentUsed = GetUsedSize();
+    size_t calculatedTotal = g_totalPoolSize.load(std::memory_order_relaxed);
+
+    // å¦‚æœä½¿ç”¨é‡è¶…è¿‡äº†è®°å½•çš„æ€»é‡
     if (currentUsed > calculatedTotal) {
-        // ¸üĞÂ×Ü´óĞ¡Îªµ±Ç°Ê¹ÓÃÁ¿µÄ150%
+        // æ›´æ–°æ€»å¤§å°ä¸ºå½“å‰ä½¿ç”¨é‡çš„150%
         size_t newTotal = currentUsed * 3 / 2;
-        m_totalPoolSize.store(newTotal, std::memory_order_relaxed);
+        g_totalPoolSize.store(newTotal, std::memory_order_relaxed);
         return newTotal;
     }
 
     return calculatedTotal;
 }
 
-bool TLSFPool::IsFromPool(void* ptr) {
-    if (!ptr) return false;
+void TLSFPool::DisableMemoryReleasing()
+{
+    g_tlsfDisableMemoryReleasing.store(true);
+    LogMessage("[TLSFPool] å·²ç¦ç”¨å†…å­˜é‡Šæ”¾ï¼Œæ‰€æœ‰å†…å­˜å°†ä¿ç•™åˆ°è¿›ç¨‹ç»“æŸ");
+}
 
-    __try {
-        // ¼ì²éÊÇ·ñÎªTLSF¹ÜÀíµÄÄÚ´æ
-        if (m_tlsfPool && tlsf_check_pool(tlsf_get_pool(m_tlsfPool))) {
-            return true;
-        }
+void TLSFPool::CheckAndFreeUnusedPools()
+{
+    // TLSFæœ¬èº«ä¸æ”¯æŒæ”¶ç¼©å†…å­˜æ± ï¼Œè¿™é‡Œåªåšæ—¥å¿—
+    LogMessage("[TLSFPool] TLSFä¸æ”¯æŒåŠ¨æ€æ”¶ç¼©å†…å­˜æ± ");
+}
 
-        if (m_safeTlsfPool && tlsf_check_pool(tlsf_get_pool(m_safeTlsfPool))) {
-            return true;
-        }
+void TLSFPool::HeapCollect()
+{
+    // TLSFæœ¬èº«ä¸æ”¯æŒåƒåœ¾æ”¶é›†ï¼Œè¿™é‡Œåªåšæ—¥å¿—
+    LogMessage("[TLSFPool] TLSFä¸æ”¯æŒåƒåœ¾æ”¶é›†");
+}
 
-        // ¼ì²éÈ«¾Ö¸ú×Ù±í
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        return m_allocatedBlocks.find(ptr) != m_allocatedBlocks.end();
+bool TLSFPool::ExpandPool(size_t additionalSize)
+{
+    // ç¡®ä¿å¤§å°æœ‰æ•ˆ
+    if (additionalSize < 1024 * 1024) {
+        additionalSize = 1024 * 1024;  // æœ€å°1MB
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // ·ÃÎÊÖ¸Õë³öÏÖÒì³£
+
+    // åˆ†é…æ–°æ± å†…å­˜
+    void* poolMem = VirtualAlloc(NULL, additionalSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!poolMem) {
+        LogMessage("[TLSFPool] æ— æ³•åˆ†é…é¢å¤–å†…å­˜æ± : %zu å­—èŠ‚", additionalSize);
         return false;
     }
-}
 
-size_t TLSFPool::GetBlockSize(void* ptr) {
-    if (!ptr) return 0;
-
-    // ³¢ÊÔ´Ó¸ú×Ù±í»ñÈ¡´óĞ¡
-    std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-    auto it = m_allocatedBlocks.find(ptr);
-    if (it != m_allocatedBlocks.end()) {
-        return it->second;
+    // æ·»åŠ åˆ°TLSF
+    pool_t newPool = tlsf_add_pool(g_tlsfInstance, poolMem, additionalSize);
+    if (!newPool) {
+        LogMessage("[TLSFPool] æ— æ³•æ·»åŠ é¢å¤–å†…å­˜æ± åˆ°TLSF");
+        VirtualFree(poolMem, 0, MEM_RELEASE);
+        return false;
     }
 
-    // ³¢ÊÔ´ÓTLSF»ñÈ¡´óĞ¡
-    return tlsf_block_size(ptr);
+    // è®°å½•æ–°æ± 
+    g_additionalPools.push_back(std::make_pair(newPool, additionalSize));
+
+    // æ›´æ–°æ€»æ± å¤§å°
+    g_totalPoolSize.fetch_add(additionalSize, std::memory_order_relaxed);
+
+    LogMessage("[TLSFPool] æˆåŠŸæ‰©å±•å†…å­˜æ± : %zu å­—èŠ‚", additionalSize);
+    return true;
 }
 
-void TLSFPool::PrintStats() {
-    if (!m_tlsfPool) {
-        LogMessage("[TLSFPool] TLSFÎ´³õÊ¼»¯");
+void TLSFPool::PrintStats()
+{
+    if (!g_tlsfInstance) {
+        LogMessage("[TLSFPool] TLSFæœªåˆå§‹åŒ–");
         return;
     }
 
-    LogMessage("[TLSFPool] === TLSFÄÚ´æ³ØÍ³¼Æ ===");
-    LogMessage("[TLSFPool] ÒÑÓÃÄÚ´æ: %zu KB", m_usedSize.load() / 1024);
-    LogMessage("[TLSFPool] ×ÜÄÚ´æ: %zu KB", m_totalPoolSize.load() / 1024);
+    std::lock_guard<std::mutex> lock(m_mutex);
 
-    // ¿é´óĞ¡Í³¼Æ
-    {
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        LogMessage("[TLSFPool] ¸ú×Ù¿éÊıÁ¿: %zu", m_allocatedBlocks.size());
-    }
+    LogMessage("[TLSFPool] === TLSFå†…å­˜æ± ç»Ÿè®¡ ===");
+    LogMessage("[TLSFPool] å·²ç”¨å†…å­˜: %zu KB", g_usedSize.load() / 1024);
+    LogMessage("[TLSFPool] æ€»å†…å­˜æ± : %zu KB", g_totalPoolSize.load() / 1024);
+    LogMessage("[TLSFPool] é¢å¤–å†…å­˜æ± æ•°é‡: %zu", g_additionalPools.size());
 
-    LogMessage("[TLSFPool] TLSFÍ³¼ÆÍê³É");
-}
+    // æ£€æŸ¥TLSFå†…éƒ¨ä¸€è‡´æ€§
+    int check_result = tlsf_check(g_tlsfInstance);
+    LogMessage("[TLSFPool] TLSFå¥åº·æ£€æŸ¥: %s", check_result == 0 ? "é€šè¿‡" : "å¤±è´¥");
 
-void TLSFPool::CheckAndFreeUnusedPools() {
-    // TLSFÃ»ÓĞ×Ô¶¯³Ø»ØÊÕ»úÖÆ£¬ÕâÀïÖ»×öÈÕÖ¾¼ÇÂ¼
-    LogMessage("[TLSFPool] CheckAndFreeUnusedPools - TLSFÃ»ÓĞ×Ô¶¯³Ø»ØÊÕ»úÖÆ");
-}
+    LogMessage("[TLSFPool] TLSFå†…éƒ¨ä¿¡æ¯:");
+    LogMessage("[TLSFPool] - æœ€å°å—å¤§å°: %zu", tlsf_block_size_min());
+    LogMessage("[TLSFPool] - æœ€å¤§å—å¤§å°: %zu", tlsf_block_size_max());
+    LogMessage("[TLSFPool] - å¯¹é½å¤§å°: %zu", tlsf_align_size());
+    LogMessage("[TLSFPool] - åˆ†é…å¼€é”€: %zu", tlsf_alloc_overhead());
 
-void TLSFPool::DisableMemoryReleasing() {
-    m_disableMemoryReleasing.store(true);
-    LogMessage("[TLSFPool] ÒÑ½ûÓÃÄÚ´æÊÍ·Å£¬ËùÓĞÄÚ´æ½«±£Áôµ½½ø³Ì½áÊø");
-}
-
-void TLSFPool::HeapCollect() {
-    // TLSFÃ»ÓĞÀ¬»ø»ØÊÕ»úÖÆ£¬ÕâÀï¿ÉÒÔÊÖ¶¯ÕûÀíËéÆ¬
-    LogMessage("[TLSFPool] HeapCollect - TLSFÃ»ÓĞ×Ô¶¯À¬»ø»ØÊÕ»úÖÆ");
-}
-
-void* TLSFPool::CreateStabilizingBlock(size_t size, const char* purpose) {
-    // Ê¹ÓÃÏµÍ³·ÖÅäÈ·±£ÎÈ¶¨ĞÔ
-    void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!rawPtr) {
-        LogMessage("[TLSFPool] ÎŞ·¨·ÖÅäÎÈ¶¨»¯¿é: %zu", size);
-        return nullptr;
-    }
-
-    void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
-
-    // È·±£ÕıÈ·ÉèÖÃÍ·²¿
-    try {
-        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(rawPtr);
-        header->HeapPtr = SPECIAL_MARKER;  // ÌØÊâ±ê¼Ç£¬±íÊ¾ÎÒÃÇ¹ÜÀíµÄ¿é
-        header->Size = static_cast<DWORD>(size);
-        header->AlignPadding = 0;
-        header->Flags = 0x4;  // ±ê¼ÇÎª´ó¿éVirtualAlloc
-        header->Magic = STORM_MAGIC;
-    }
-    catch (...) {
-        LogMessage("[TLSFPool] ÉèÖÃÎÈ¶¨»¯¿éÍ·²¿Ê§°Ü: %p", rawPtr);
-        VirtualFree(rawPtr, 0, MEM_RELEASE);
-        return nullptr;
-    }
-
-    LogMessage("[TLSFPool] ´´½¨ÎÈ¶¨»¯¿é: %p (´óĞ¡: %zu, ÓÃÍ¾: %s)",
-        userPtr, size, purpose ? purpose : "Î´Öª");
-
-    return userPtr;
-}
-
-bool TLSFPool::ValidatePointer(void* ptr) {
-    if (!ptr) return false;
-
-    __try {
-        // ³¢ÊÔ¶ÁÈ¡Ö¸ÕëµÄµÚÒ»¸ö×Ö½Ú£¬ÑéÖ¤¿É¶Á
-        volatile char test = *static_cast<char*>(ptr);
-
-        // ¼ì²éÈ«¾Ö¸ú×Ù±í
-        std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-        return m_allocatedBlocks.find(ptr) != m_allocatedBlocks.end();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-void TLSFPool::Preheat() {
-    if (!m_tlsfPool) {
-        Initialize(64 * 1024 * 1024);  // Ä¬ÈÏ64MB
-        if (!m_tlsfPool) return;
-    }
-
-    LogMessage("[TLSFPool] ¿ªÊ¼Ô¤ÈÈÄÚ´æ³Ø...");
-
-    // ¸ù¾İ³£¼û·ÖÅä´óĞ¡½øĞĞÔ¤ÈÈ
-    const std::pair<size_t, int> commonSizes[] = {
-        {4, 50},      // 4×Ö½Ú£¬Ô¤ÈÈ50¸ö
-        {16, 30},     // 16×Ö½Ú£¬Ô¤ÈÈ30¸ö
-        {32, 20},     // 32×Ö½Ú£¬Ô¤ÈÈ20¸ö
-        {72, 15},     // 72×Ö½Ú£¬Ô¤ÈÈ15¸ö
-        {108, 15},    // 108×Ö½Ú£¬Ô¤ÈÈ15¸ö
-        {128, 10},    // 128×Ö½Ú£¬Ô¤ÈÈ10¸ö
-        {192, 10},    // 192×Ö½Ú£¬Ô¤ÈÈ10¸ö
-        {256, 10},    // 256×Ö½Ú£¬Ô¤ÈÈ10¸ö
-        {512, 5},     // 512×Ö½Ú£¬Ô¤ÈÈ5¸ö
-        {1024, 5},    // 1KB£¬Ô¤ÈÈ5¸ö
-        {4096, 3},    // 4KB£¬Ô¤ÈÈ3¸ö
-        {16384, 2},   // 16KB£¬Ô¤ÈÈ2¸ö
-        {65536, 1},   // 64KB£¬Ô¤ÈÈ1¸ö
-        {262144, 1},  // 256KB£¬Ô¤ÈÈ1¸ö
-    };
-
-    std::vector<void*> preheatedBlocks;
-
-    for (const auto& [size, count] : commonSizes) {
-        for (int i = 0; i < count; i++) {
-            void* ptr = tlsf_malloc(m_tlsfPool, size);
-            if (ptr) {
-                preheatedBlocks.push_back(ptr);
-
-                // ¼ÇÂ¼·ÖÅä
-                std::lock_guard<std::mutex> trackLock(m_trackingMutex);
-                m_allocatedBlocks[ptr] = size;
-                m_usedSize.fetch_add(size, std::memory_order_relaxed);
-            }
-        }
-    }
-
-    LogMessage("[TLSFPool] Ô¤ÈÈ·ÖÅäÁË %zu ¸öÄÚ´æ¿é", preheatedBlocks.size());
-
-    // ÊÍ·ÅÒ»°ëÔ¤ÈÈµÄ¿é£¬±£ÁôÒ»°ëÔÚ»º´æÖĞ
-    for (size_t i = 0; i < preheatedBlocks.size() / 2; i++) {
-        Free(preheatedBlocks[i]);
-    }
-
-    LogMessage("[TLSFPool] ÄÚ´æ³ØÔ¤ÈÈÍê³É£¬ÊÍ·ÅÁË %zu ¸öÄÚ´æ¿é", preheatedBlocks.size() / 2);
-}
-
-void TLSFPool::DisableActualFree() {
-    DisableMemoryReleasing();  // µ÷ÓÃÒÑÊµÏÖµÄº¯Êı
-}
-
-size_t TLSFPool::get_shard_index(void* ptr, size_t size) {
-    size_t hash;
-    if (ptr) {
-        // FNV-1a¹şÏ£µÄ¼ò»¯°æ
-        hash = (reinterpret_cast<uintptr_t>(ptr) * 2654435761) >> 16;
-    }
-    else {
-        // ¶ÔÓÚ²»Í¬´óĞ¡µÄ·ÖÅäÊ¹ÓÃ¸ü¿ÆÑ§µÄ·Ö²¼
-        if (size <= 128) {
-            hash = size / 16;
-        }
-        else if (size <= 4096) {
-            hash = 8 + (size - 128) / 64;
-        }
-        else if (size <= 65536) {
-            hash = 70 + (size / 1024);
-        }
-        else {
-            hash = 134 + (size / 16384);
-        }
-    }
-    return hash % LOCK_SHARDS;
+    LogMessage("[TLSFPool] =====================");
 }
