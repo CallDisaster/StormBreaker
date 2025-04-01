@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 #include "StormHook.h"
 #include "Base/MemorySafety.h"
+#include <mimalloc.h>
 
 
 #pragma comment(lib, "dbghelp.lib")

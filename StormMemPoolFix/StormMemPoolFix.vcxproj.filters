@@ -31,6 +31,15 @@
     <Filter Include="头文件\Graphic">
       <UniqueIdentifier>{99d03913-b949-47b9-84fa-4d6e89968c8a}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\MemPool">
+      <UniqueIdentifier>{d568b581-d304-4205-be72-395cfbce4cf3}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\Base\MemPool">
+      <UniqueIdentifier>{a5c2eaa1-e6bd-4aa9-aa85-d349b36a3a8d}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Base\MemPool">
+      <UniqueIdentifier>{cb7f8f27-c44e-49b3-8338-7eb4bbdff522}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framework.h">
@@ -69,8 +78,17 @@
     <ClInclude Include="Graphic\GameOffsets.h">
       <Filter>头文件\Graphic</Filter>
     </ClInclude>
-    <ClInclude Include="Storm\tlsf.h">
-      <Filter>头文件\Storm</Filter>
+    <ClInclude Include="Base\MemPool\MemoryPoolInterface.h">
+      <Filter>头文件\Base\MemPool</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\MemPool\MiMallocPool.h">
+      <Filter>头文件\Base\MemPool</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\MemPool\TLSFPool.h">
+      <Filter>头文件\Base\MemPool</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\MemPool\MemoryPoolManager.h">
+      <Filter>头文件\Base\MemPool</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -104,8 +122,14 @@
     <ClCompile Include="Graphic\GameOffsets.cpp">
       <Filter>源文件\Graphic</Filter>
     </ClCompile>
-    <ClCompile Include="Storm\tlsf.c">
-      <Filter>源文件\Storm</Filter>
+    <ClCompile Include="Base\MemPool\MemoryPoolManager.cpp">
+      <Filter>源文件\Base\MemPool</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\MemPool\TLSFPool.cpp">
+      <Filter>源文件\Base\MemPool</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\MemPool\MiMallocPool.cpp">
+      <Filter>源文件\Base\MemPool</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

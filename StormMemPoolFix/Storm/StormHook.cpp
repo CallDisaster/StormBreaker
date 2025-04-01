@@ -16,35 +16,31 @@
 #include <Base/MemorySafety.h>
 #include "../Base/Logger.h"
 #include "MemoryPool.h"
+#include "Base/MemPool/MemoryPoolManager.h" // 添加新的内存池管理器头文件
 
 MemorySafety& g_MemSafety = MemorySafety::GetInstance();
 
 static std::vector<SpecialBlockFilter> g_specialFilters = {
     // JassVM 相关分配，使用独立的低地址内存
     { 0x28A8, "Instance.cpp", 0, true, true },  // JassVM 实例
-    //{ 0x64, "jass.cpp", 0, true, true },       // JassVM 栈帧
-    //{ 0, "jass", 0, true, true },              // 捕获所有包含 "jass" 的分配
-    //{ 0, "Instance", 0, true, true },          // 捕获所有包含 "Instance" 的分配
 
     // 地形和模型可以使用 TLSF
     { 0, "terrain", 0, true, false },
     { 0, "model", 0, true, false },
 };
 
-// 额外状态变量
+// 保持现有的全局变量和状态
 std::atomic<bool> g_afterCleanAll{ false };
 std::atomic<DWORD> g_lastCleanAllTime{ 0 };
 thread_local bool tls_inCleanAll = false;
-std::atomic<bool> g_insideUnsafePeriod{ false }; // 新增：标记不安全时期
+std::atomic<bool> g_insideUnsafePeriod{ false };
 std::atomic<bool> g_shouldExit{ false };
 std::atomic<bool> g_disableActualFree{ false };
 std::atomic<bool> g_disableMemoryReleasing{ false };
 HANDLE g_statsThreadHandle = NULL;
 
-// 全局变量定义
-std::atomic<size_t> g_bigThreshold{ 128 * 1024 };      // 默认512KB为大块阈值
-// 主内存池大小: 32MB
-constexpr size_t TLSF_MAIN_POOL_SIZE = 128 * 1024 * 1024;
+// 维持其他全局变量
+std::atomic<size_t> g_bigThreshold{ 128 * 1024 };
 std::mutex g_bigBlocksMutex;
 std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
 MemoryStats g_memStats;
@@ -935,11 +931,10 @@ void ManageTempStabilizers(int currentCleanCount) {
 }
 // Hook: SMemAlloc - 处理大块分配
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag) {
-    // 记录分配类型和大小（锁外完成）
+    // 现有逻辑保持不变
     ResourceType type = GetResourceType(name, size);
     g_detailedProfiler.RecordAllocation(size, name, type);
 
-    // 检查是否在 CleanAll 后的第一次分配（锁外完成）
     bool isAfterCleanAll = g_afterCleanAll.exchange(false);
     if (isAfterCleanAll) {
         static int cleanAllCounter = 0;
@@ -947,7 +942,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         CreateStabilizingBlocks(cleanAllCounter);
     }
 
-    // 检查是否为 JassVM 相关分配（锁外完成）
+    // 检查是否为JassVM相关分配
     bool isJassVM = false;
     if (name) {
         if (size == 10408 && strstr(name, "Instance.cpp")) {
@@ -956,22 +951,21 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
                 g_memStats.OnAlloc(size);
                 return reinterpret_cast<size_t>(jassPtr);
             }
-            // 分配失败回退到 Storm
             LogMessage("[JassVM] 分配失败，回退到 Storm: %zu 字节", size);
         }
     }
 
-    // 分配策略判断（锁外完成）
-    bool useMiMalloc = (size >= g_bigThreshold.load());
+    // 分配策略判断
+    bool useManagedPool = (size >= g_bigThreshold.load());
 
-    if (useMiMalloc) {
-        // 先尝试从缓存获取大块（只需要缓存的锁，不需要全局锁）
+    if (useManagedPool) {
+        // 先尝试从缓存获取大块
         void* cachedPtr = g_largeBlockCache.GetBlock(size + sizeof(StormAllocHeader));
         if (cachedPtr) {
             void* userPtr = static_cast<char*>(cachedPtr) + sizeof(StormAllocHeader);
             SetupCompatibleHeader(userPtr, size);
 
-            // 记录此块信息（需要锁保护）
+            // 记录此块信息
             BigBlockInfo info;
             info.rawPtr = cachedPtr;
             info.size = size;
@@ -989,7 +983,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             return reinterpret_cast<size_t>(userPtr);
         }
 
-        // 缓存未命中，使用 mimalloc 分配（使用分片锁）
+        // 使用内存池管理器分配 - 修改这部分使用MemPool命名空间
         size_t totalSize = size + sizeof(StormAllocHeader);
         void* rawPtr = nullptr;
 
@@ -1012,25 +1006,25 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         }
 
         if (!rawPtr) {
-            LogMessage("[Alloc] mimalloc 分配失败: %zu 字节, 回退到 Storm", size);
+            LogMessage("[Alloc] 内存池分配失败: %zu 字节, 回退到 Storm", size);
             return s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         }
 
-        // 设置用户指针和兼容头（锁外完成）
+        // 设置用户指针和兼容头
         void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
         SetupCompatibleHeader(userPtr, size);
 
-        // 注册到内存安全系统（锁外完成）
+        // 注册到内存安全系统
         g_MemSafety.RegisterMemoryBlock(rawPtr, userPtr, size, name, src_line);
 
-        // 记录此块信息（需要锁保护）
+        // 记录此块信息
         BigBlockInfo info;
         info.rawPtr = rawPtr;
         info.size = size;
         info.timestamp = GetTickCount();
         info.source = name ? _strdup(name) : nullptr;
         info.srcLine = src_line;
-        info.type = GetResourceType(name,size);
+        info.type = GetResourceType(name, size);
 
         {
             std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
@@ -1041,7 +1035,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         return reinterpret_cast<size_t>(userPtr);
     }
     else {
-        // 小块使用 Storm 原始分配
+        // 小块使用Storm原始分配
         size_t ret = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         if (ret) {
             g_memStats.OnAlloc(size);
@@ -1049,16 +1043,14 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         return ret;
     }
 }
-
 // Hook: SMemFree - 处理释放
 int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     if (!a1) return 1;  // 空指针认为成功
 
     void* ptr = reinterpret_cast<void*>(a1);
 
-    // 先检查是否为 JVM_MemPool 指针（锁外完成）
+    // 先检查是否为JVM_MemPool指针
     if (JVM_MemPool::IsFromPool(ptr)) {
-        // 使用 JVM_MemPool 专用释放
         JVM_MemPool::Free(ptr);
         return 1;
     }
@@ -1066,20 +1058,17 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     bool ourBlock = false;
     bool permanentBlock = false;
 
-    // 使用C++异常处理检查指针（锁外完成）
     try {
-        // 先执行最轻量级的检查
         permanentBlock = IsPermanentBlock(ptr);
         if (permanentBlock) {
             LogMessage("[Free] 忽略永久块释放: %p", ptr);
-            return 1; // 假装成功
+            return 1;
         }
 
         // 检查是否为我们管理的块
         ourBlock = IsOurBlock(ptr);
     }
     catch (...) {
-        // 如果检查过程中出现异常，认为不是我们的块
         LogMessage("[Free] 检查指针时出现异常: %p", ptr);
         return s_origStormFree(a1, name, argList, a4);
     }
@@ -1091,7 +1080,7 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
         BigBlockInfo blockInfo = {};
 
         try {
-            // 获取块信息（需要锁保护）
+            // 获取块信息
             {
                 std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
                 auto it = g_bigBlocks.find(ptr);
@@ -1104,14 +1093,12 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
 
             if (blockFound) {
                 g_memStats.OnFree(blockInfo.size);
-
-                // 在找到块信息后添加记录
                 g_detailedProfiler.RecordFree(blockInfo.size, blockInfo.type);
 
-                // 安全取消注册（锁外完成）
+                // 安全取消注册
                 g_MemSafety.TryUnregisterBlock(ptr);
 
-                // 释放名称字符串（锁外完成）
+                // 释放名称字符串
                 if (blockInfo.source) {
                     free((void*)blockInfo.source);
                 }
@@ -1181,7 +1168,7 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
         return 1;
     }
     else {
-        // 不是我们的块，使用 Storm 释放
+        // 不是我们的块，使用Storm释放
         return s_origStormFree(a1, name, argList, a4);
     }
 }
@@ -1190,8 +1177,7 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
     const char* name, DWORD src_line, DWORD flag)
 {
-
-    // 基本边界情况处理（锁外完成）
+    // 基本边界情况处理
     if (!oldPtr) {
         return reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
     }
@@ -1201,26 +1187,26 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         return nullptr;
     }
 
-    // 检查是否是 JVM_MemPool 内存（锁外完成）
+    // 检查是否是JVM_MemPool内存
     if (JVM_MemPool::IsFromPool(oldPtr)) {
-        // 使用 JVM_MemPool 专用重分配
+        // 使用JVM_MemPool专用重分配
         return JVM_MemPool::Realloc(oldPtr, newSize);
     }
 
-    // 永久块特殊处理（锁外完成）
+    // 永久块特殊处理
     if (IsPermanentBlock(oldPtr)) {
         LogMessage("[Realloc] 检测到永久块重分配: %p, 新大小=%zu", oldPtr, newSize);
         void* newPtr = reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
 
         if (newPtr) {
-            // 只复制最少必要数据（锁外完成）
+            // 只复制最少必要数据
             SafeMemCopy(newPtr, oldPtr, min(64, newSize));
         }
 
         return newPtr;
     }
 
-    // 不安全期特殊处理（锁外完成）
+    // 不安全期特殊处理
     bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load();
     if (inUnsafePeriod) {
         if (IsOurBlock(oldPtr)) {
@@ -1234,7 +1220,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
                 return nullptr;
             }
 
-            // 尝试安全复制（锁外完成）
+            // 尝试安全复制
             size_t oldSize = MemPool::GetBlockSize(oldPtr);
             if (oldSize > 0) {
                 SafeMemCopy(newPtr, oldPtr, min(oldSize, newSize));
@@ -1244,7 +1230,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
                 SafeMemCopy(newPtr, oldPtr, min(64, newSize));
             }
 
-            // 将oldPtr放入延迟释放队列（不释放，只记录）
+            // 将oldPtr放入延迟释放队列
             g_MemSafety.EnqueueDeferredFree(oldPtr, oldSize);
 
             return newPtr;
@@ -1254,17 +1240,17 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
     }
 
-    // 确定重分配策略（锁外完成）
+    // 确定重分配策略
     bool isOurOldBlock = IsOurBlock(oldPtr);
-    bool shouldUseMimalloc = (newSize >= g_bigThreshold.load()) ||
+    bool shouldUseManagedPool = (newSize >= g_bigThreshold.load()) ||
         IsSpecialBlockAllocation(newSize, name, src_line);
 
     // 情况1: 我们的块重分配为我们的块
-    if (isOurOldBlock && shouldUseMimalloc) {
+    if (isOurOldBlock && shouldUseManagedPool) {
         BigBlockInfo oldInfo = {};
         bool blockFound = false;
 
-        // 获取旧块信息（需要锁保护）
+        // 获取旧块信息
         {
             std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
             auto it = g_bigBlocks.find(oldPtr);
@@ -1303,7 +1289,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
             }
 
             if (!newRawPtr) {
-                LogMessage("[Realloc] mimalloc重分配失败, 大小=%zu", newSize);
+                LogMessage("[Realloc] 内存池重分配失败, 大小=%zu", newSize);
                 return nullptr;
             }
 
@@ -1311,11 +1297,11 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
             SetupCompatibleHeader(newPtr, newSize);
         }
         catch (...) {
-            LogMessage("[Realloc] mimalloc重分配异常: %p", oldPtr);
+            LogMessage("[Realloc] 内存池重分配异常: %p", oldPtr);
             return nullptr;
         }
 
-        // 更新安全系统（锁外完成）
+        // 更新安全系统
         g_MemSafety.UnregisterMemoryBlock(oldPtr);
         g_MemSafety.RegisterMemoryBlock(newRawPtr, newPtr, newSize, name, src_line);
 
@@ -1346,7 +1332,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
             }
         }
 
-        // 更新统计（锁外完成）
+        // 更新统计
         g_memStats.OnFree(oldInfo.size);
         g_memStats.OnAlloc(newSize);
 
@@ -1536,6 +1522,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 // 钩子安装和初始化
 ///////////////////////////////////////////////////////////////////////////////
 
+// 修改InitializeStormMemoryHooks函数
 bool InitializeStormMemoryHooks() {
     // 初始化日志系统
     if (!LogSystem::GetInstance().Initialize()) {
@@ -1576,11 +1563,12 @@ bool InitializeStormMemoryHooks() {
         return false;
     }
 
-    // 初始化 JassVM 内存管理
+    // 初始化JassVM内存管理
     JVM_MemPool::Initialize();
 
-    // 初始化TLSF内存池
-    MemPool::Initialize(TLSF_MAIN_POOL_SIZE);
+    // 初始化内存池 - 改为使用MemPool命名空间
+    // 默认使用mimalloc内存池
+    MemPool::Initialize(128 * 1024 * 1024);
 
     // 创建永久稳定块，使用更广泛的大小分布
     CreatePermanentStabilizers(25, "全周期保护");
@@ -1620,6 +1608,17 @@ bool InitializeStormMemoryHooks() {
 
     LogMessage("[Init] Storm内存钩子安装成功！");
     return true;
+}
+
+
+// 添加切换内存池类型的函数
+bool SwitchMemoryPoolType(PoolType newType) {
+    return MemPool::SwitchPoolType(newType);
+}
+
+// 添加获取当前内存池类型的函数
+PoolType GetCurrentMemoryPoolType() {
+    return MemPool::GetCurrentPoolType();
 }
 
 void TransferMemoryOwnership() {
@@ -1731,7 +1730,7 @@ void SafelyDetachHooks() {
 void ShutdownStormMemoryHooks() {
     LogMessage("[关闭] 退出程序...");
 
-    // 1. 标记不安全期开始——必须最先执行
+    // 1. 标记不安全期开始
     g_insideUnsafePeriod.store(true);
 
     // 2. 最后的内存报告
@@ -1758,12 +1757,12 @@ void ShutdownStormMemoryHooks() {
     LogMessage("[关闭] 释放永久块引用...");
     g_permanentBlocks.clear();
 
-    // 9. 清理JassVM内存池 - 同样禁用实际释放
+    // 9. 清理JassVM内存池
     LogMessage("[关闭] 关闭JassVM内存管理...");
     JVM_MemPool::Cleanup();
 
-    // 10. 清理mimalloc内存池
-    LogMessage("[关闭] 关闭mimalloc内存池...");
+    // 10. 使用内存池管理器关闭内存池
+    LogMessage("[关闭] 关闭内存池...");
     MemPool::Shutdown();
 
     // 11. 关闭日志系统

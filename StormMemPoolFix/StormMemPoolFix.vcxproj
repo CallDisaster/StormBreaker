@@ -154,6 +154,10 @@
     <ClInclude Include="Base\fp_call.h" />
     <ClInclude Include="Base\MemorySafety.h" />
     <ClInclude Include="Base\Logger.h" />
+    <ClInclude Include="Base\MemPool\MemoryPoolInterface.h" />
+    <ClInclude Include="Base\MemPool\MemoryPoolManager.h" />
+    <ClInclude Include="Base\MemPool\MiMallocPool.h" />
+    <ClInclude Include="Base\MemPool\TLSFPool.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="Graphic\Core.h" />
     <ClInclude Include="Graphic\GameOffsets.h" />
@@ -163,9 +167,11 @@
     <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
-    <ClInclude Include="Storm\tlsf.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Base\MemPool\MemoryPoolManager.cpp" />
+    <ClCompile Include="Base\MemPool\MiMallocPool.cpp" />
+    <ClCompile Include="Base\MemPool\TLSFPool.cpp" />
     <ClCompile Include="Base\MemroySafety.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="Graphic\Core.cpp" />
@@ -181,7 +187,6 @@
     <ClCompile Include="Storm\StormHeapHook.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />
-    <ClCompile Include="Storm\tlsf.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

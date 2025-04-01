@@ -137,6 +137,9 @@ void CreateStabilizingBlocks(int cleanAllCount);
 bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);
 bool IsPermanentBlock(void* ptr);
 ResourceType GetResourceType(const char* name, size_t size);
+bool InitializeStormMemoryHooks(PoolType poolType = PoolType::MiMalloc); // 默认使用mimalloc
+bool SwitchMemoryPoolType(PoolType newType);
+PoolType GetCurrentMemoryPoolType();
 
 // Hook函数声明
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);
