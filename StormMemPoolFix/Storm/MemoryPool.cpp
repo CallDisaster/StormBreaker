@@ -274,11 +274,19 @@ namespace MemPool {
             return true;
         }
 
-        // 设置mimalloc选项 - 这些选项可以逐个测试效果
-        mi_option_enable(mi_option_eager_commit);          // 快速提交内存
-        mi_option_set(mi_option_purge_delay, 1000);        // 减少内存归还延迟
-        //mi_option_set(mi_option_segment_cache, 100);       // 增加段缓存
-        mi_option_set(mi_option_arena_reserve, initialSize / 1024); // 预留足够空间
+        // 1. 禁用急于提交内存 - 这有助于减少虚拟内存占用
+        mi_option_set(mi_option_arena_eager_commit, 0);
+
+        // 2. 减少内存归还延迟 - 让未使用内存更快归还系统
+        mi_option_set(mi_option_purge_delay, 10);
+
+        // 3. 设置较小的预留空间 - 如果总虚拟内存过高，这很关键
+        mi_option_set(mi_option_arena_reserve, 16 * 1024);
+
+        // 延迟提交 - 这可能会改善内存分配模式
+        mi_option_set(mi_option_eager_commit_delay, 8);
+
+        mi_option_set(mi_option_reset_decommits, 1);
 
         // 创建主要mimalloc堆
         g_mainHeap = mi_heap_new();
@@ -924,5 +932,11 @@ namespace MemPool {
         mi_stats_print(NULL);
 
         LogMessage("[MemPool] mimalloc统计完成");
+    }
+
+    void HeapCollect() {
+        if (g_mainHeap) {
+            mi_heap_collect(g_mainHeap, true);
+        }
     }
 }

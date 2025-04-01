@@ -51,6 +51,7 @@ namespace MemPool {
     bool ValidatePointer(void* ptr);
     void DisableActualFree();
     void Preheat();
+    void HeapCollect();
     // 分片索引计算函数
     inline size_t get_shard_index(void* ptr = nullptr, size_t size = 0) {
         size_t hash;

@@ -73,9 +73,9 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <OutDir>E:\Work\War3\StormBreaker</OutDir>
-    <ExternalIncludePath>$(ProjectDir)Dependencies\Detours\include;$(ProjectDir)Dependencies\mimalloc-dev\include;$(ProjectDir)Dependencies\spdlog\include;$(ProjectDir)Dependencies\tlsf;$(ExternalIncludePath)</ExternalIncludePath>
+    <ExternalIncludePath>$(ProjectDir)Dependencies\Detours\include;$(ProjectDir)Dependencies\mimalloc-dev\include;$(ProjectDir)Dependencies\spdlog\include;$(ProjectDir)Dependencies\DXSDK\include;$(ProjectDir)Dependencies\tlsf;$(ExternalIncludePath)</ExternalIncludePath>
     <IncludePath>$(ProjectDir);$(IncludePath)</IncludePath>
-    <LibraryPath>$(ProjectDir)\Dependencies\;$(ProjectDir)\Dependencies\Detours\lib.X86;$(LibraryPath)</LibraryPath>
+    <LibraryPath>$(ProjectDir)\Dependencies\;$(ProjectDir)\Dependencies\DXSDK\lib;$(ProjectDir)\Dependencies\Detours\lib.X86;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -112,7 +112,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>detours.lib;mimalloc.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>detours.lib;d3d9.lib;d3dx9.lib;mimalloc.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)$(TargetName).asi</OutputFile>
     </Link>
   </ItemDefinitionGroup>
@@ -155,15 +155,22 @@
     <ClInclude Include="Base\MemorySafety.h" />
     <ClInclude Include="Base\Logger.h" />
     <ClInclude Include="framework.h" />
+    <ClInclude Include="Graphic\Core.h" />
+    <ClInclude Include="Graphic\GameOffsets.h" />
+    <ClInclude Include="Graphic\Hooks.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
     <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
+    <ClInclude Include="Storm\tlsf.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Base\MemroySafety.cpp" />
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="Graphic\Core.cpp" />
+    <ClCompile Include="Graphic\GameOffsets.cpp" />
+    <ClCompile Include="Graphic\Hooks.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -174,6 +181,7 @@
     <ClCompile Include="Storm\StormHeapHook.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />
+    <ClCompile Include="Storm\tlsf.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

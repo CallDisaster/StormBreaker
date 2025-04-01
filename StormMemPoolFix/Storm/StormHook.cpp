@@ -44,7 +44,7 @@ HANDLE g_statsThreadHandle = NULL;
 // 全局变量定义
 std::atomic<size_t> g_bigThreshold{ 128 * 1024 };      // 默认512KB为大块阈值
 // 主内存池大小: 32MB
-constexpr size_t TLSF_MAIN_POOL_SIZE = 64 * 1024 * 1024;
+constexpr size_t TLSF_MAIN_POOL_SIZE = 128 * 1024 * 1024;
 std::mutex g_bigBlocksMutex;
 std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
 MemoryStats g_memStats;
@@ -77,6 +77,96 @@ static FILE* g_logFile = nullptr;
 ///////////////////////////////////////////////////////////////////////////////
 // 辅助函数
 ///////////////////////////////////////////////////////////////////////////////
+
+// 在 StormHook.cpp 中添加
+// 工作集内存监控相关
+std::atomic<size_t> g_workingSetThreshold{ 1000 * 1024 * 1024 };  // 默认1.2GB
+std::atomic<DWORD> g_lastWorkingSetCleanTime{ 0 };
+std::atomic<size_t> g_peakWorkingSetSize{ 0 };
+
+// 获取进程工作集内存大小
+size_t GetProcessWorkingSetSize() {
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        // 更新峰值记录
+        size_t current = pmc.WorkingSetSize;
+        size_t peak = g_peakWorkingSetSize.load();
+        if (current > peak) {
+            g_peakWorkingSetSize.store(current);
+        }
+        return current;
+    }
+    return 0;
+}
+
+// 主动清理工作集内存
+bool TrimWorkingSet(bool aggressive) {
+    // 记录清理前的内存状态
+    size_t beforeSize = GetProcessWorkingSetSize();
+
+    // 1. 尝试使用 EmptyWorkingSet API
+    bool success = false;
+    HANDLE hProcess = GetCurrentProcess();
+    if (EmptyWorkingSet(hProcess)) {
+        success = true;
+    }
+
+    // 2. 如果需要更激进的清理或上一步失败，使用 SetProcessWorkingSetSize
+    if (aggressive || !success) {
+        // 参数 -1, -1 会最大程度地移除不必要的页面
+        if (SetProcessWorkingSetSize(hProcess, (SIZE_T)-1, (SIZE_T)-1)) {
+            success = true;
+        }
+    }
+
+    //强制清理mimalloc
+	MemPool::HeapCollect();
+
+    // 记录当前时间作为最后清理时间
+    g_lastWorkingSetCleanTime.store(GetTickCount());
+
+    // 记录清理后的内存状态
+    size_t afterSize = GetProcessWorkingSetSize();
+    size_t freedSize = (beforeSize > afterSize) ? (beforeSize - afterSize) : 0;
+
+    // 记录日志
+    LogMessage("[内存] 工作集内存清理: 清理前=%zu MB, 清理后=%zu MB, 释放=%zu MB, %s",
+        beforeSize / (1024 * 1024),
+        afterSize / (1024 * 1024),
+        freedSize / (1024 * 1024),
+        success ? "成功" : "部分失败");
+
+    return success;
+}
+
+// 检查并清理工作集内存(如果超过阈值)
+bool CheckAndTrimWorkingSet() {
+    // 获取当前工作集大小
+    size_t currentSize = GetProcessWorkingSetSize();
+
+    // 获取阈值
+    size_t threshold = g_workingSetThreshold.load();
+
+    // 如果当前工作集大小超过阈值
+    if (currentSize > threshold) {
+        // 检查上次清理时间，避免频繁清理
+        DWORD currentTime = GetTickCount();
+        DWORD lastTime = g_lastWorkingSetCleanTime.load();
+
+        // 如果距离上次清理超过30秒，执行清理
+        if (currentTime - lastTime > 30000) {
+            LogMessage("[内存] 工作集内存超过阈值: 当前=%zu MB, 阈值=%zu MB, 开始清理...",
+                currentSize / (1024 * 1024), threshold / (1024 * 1024));
+
+            // 执行清理
+            bool success = TrimWorkingSet(currentSize > threshold * 1.5); // 如果超过阈值50%，使用激进模式
+
+            return success;
+        }
+    }
+
+    return false;
+}
 
 // 锁等待时间统计报告函数
 void PrintLockStats() {
@@ -129,6 +219,7 @@ size_t GetTLSFPoolTotal() {
     // 获取mimalloc内存池总大小
     return MemPool::GetTotalSize();
 }
+
 
 // 生成完整的内存报告，兼容现有函数逻辑但引用mimalloc
 void GenerateMemoryReport(bool forceWrite) {
@@ -528,11 +619,18 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
     DWORD lastStatsTime = GetTickCount();
     DWORD lastReportTime = GetTickCount();
     DWORD lastLockStatsTime = GetTickCount(); // 锁统计时间戳
+    DWORD lastWorkingSetCheckTime = GetTickCount();
 
     while (!g_shouldExit.load()) {
         Sleep(5000);  // 每5秒检查一次
 
         DWORD currentTime = GetTickCount();
+
+        // 每15秒检查一次工作集内存
+        if (currentTime - lastWorkingSetCheckTime > 15000) {
+            CheckAndTrimWorkingSet();
+            lastWorkingSetCheckTime = currentTime;
+        }
 
         // 每30秒生成内存报告
         if (currentTime - lastReportTime > 30000) {
@@ -547,6 +645,8 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
             }
             lastCleanupTime = currentTime;
         }
+
+
 
         // 每分钟打印一次内存统计
         if (currentTime - lastStatsTime > 60000) {

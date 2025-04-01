@@ -113,6 +113,18 @@ extern std::mutex g_poolMutexes[LOCK_SHARDS];
 extern std::atomic<size_t> g_totalLockWaitTime;
 extern std::atomic<size_t> g_lockWaitCount;
 
+// 工作集内存监控相关
+extern std::atomic<size_t> g_workingSetThreshold;  // 工作集清理阈值
+extern std::atomic<DWORD> g_lastWorkingSetCleanTime;  // 上次清理时间
+extern std::atomic<size_t> g_peakWorkingSetSize;  // 峰值工作集大小
+
+// 获取进程工作集内存大小
+size_t GetProcessWorkingSetSize();
+// 主动清理工作集内存
+bool TrimWorkingSet(bool aggressive = false);
+// 检查并清理工作集内存(如果超过阈值)
+bool CheckAndTrimWorkingSet();
+
 // 函数声明
 bool InitializeStormMemoryHooks();
 bool HookAllStormHeapFunctions();
