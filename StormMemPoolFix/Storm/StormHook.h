@@ -52,11 +52,11 @@ struct BigBlockInfo {
 
 // 缓存特殊大块的过滤条件（优化频繁分配的特定模式）
 struct SpecialBlockFilter {
-    size_t size;
-    const char* name;
-    int sourceLine;
-    bool useCustomPool;
-    bool forceSystemAlloc;  // 新增：强制使用系统分配
+    size_t size;           // 块大小，0表示匹配任意大小
+    const char* name;      // 源名称子串匹配
+    int sourceLine;        // 源代码行，0表示匹配任意行
+    bool useCustomPool;    // 是否使用自定义内存池
+    bool forceSystemAlloc; // 强制使用系统分配VirtualAlloc
 
     // 显式构造函数
     SpecialBlockFilter(size_t s, const char* n, int sl, bool ucp, bool fsa)
@@ -97,8 +97,8 @@ extern Storm_MemAlloc_t s_origStormAlloc;
 extern Storm_MemFree_t s_origStormFree;
 extern Storm_MemReAlloc_t s_origStormReAlloc;
 extern StormHeap_CleanupAll_t s_origCleanupAll;
-extern std::atomic<bool> g_cleanAllInProgress;
-extern std::atomic<bool> g_afterCleanAll;
+extern std::atomic<bool> g_cleanAllInProgress;  // 是否正在进行CleanAll
+extern std::atomic<bool> g_afterCleanAll;   // 是否正在进行CleanAll
 extern std::atomic<DWORD> g_lastCleanAllTime;
 extern thread_local bool tls_inCleanAll;
 extern std::atomic<bool> g_insideUnsafePeriod; // 新增：标记不安全时期
@@ -135,12 +135,12 @@ void SetupCompatibleHeader(void* userPtr, size_t size);
 bool IsOurBlock(void* ptr);
 void PrintAllPoolsUsage();
 void CreateStabilizingBlocks(int cleanAllCount);
-bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);
+bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);   // 检查是否为特殊块分配，size为0表示匹配任意大小
 bool IsPermanentBlock(void* ptr);
-ResourceType GetResourceType(const char* name, size_t size);
+ResourceType GetResourceType(const char* name, size_t size);    // 从资源名称和大小检测资源类型
 bool InitializeStormMemoryHooks(PoolType poolType = PoolType::MiMalloc); // 默认使用mimalloc
-bool SwitchMemoryPoolType(PoolType newType);
-PoolType GetCurrentMemoryPoolType();
+bool SwitchMemoryPoolType(PoolType newType); // 切换内存池类型
+PoolType GetCurrentMemoryPoolType();    // 获取当前内存池类型
 
 // Hook函数声明
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);

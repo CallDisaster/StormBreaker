@@ -565,7 +565,7 @@ ResourceType GetResourceType(const char* name, size_t size) {
 // 检查是否为特殊块分配
 bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line) {
     for (const auto& filter : g_specialFilters) {
-        if (filter.size == size &&
+        if ((filter.size == 0 || filter.size == size) && // 0表示任意大小
             (filter.name == nullptr || (name && strstr(name, filter.name))) &&
             (filter.sourceLine == 0 || filter.sourceLine == src_line)) {
             return true;
@@ -944,19 +944,30 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
 
     // 检查是否为JassVM相关分配
     bool isJassVM = false;
-    if (name) {
-        if (size == 10408 && strstr(name, "Instance.cpp")) {
-            void* jassPtr = JVM_MemPool::Allocate(size);
-            if (jassPtr) {
-                g_memStats.OnAlloc(size);
-                return reinterpret_cast<size_t>(jassPtr);
-            }
-            LogMessage("[JassVM] 分配失败，回退到 Storm: %zu 字节", size);
+    if (name && size == 10408 && strstr(name, "Instance.cpp")) {
+        void* jassPtr = JVM_MemPool::Allocate(size);
+        if (jassPtr) {
+            g_memStats.OnAlloc(size);
+            return reinterpret_cast<size_t>(jassPtr);
         }
+        LogMessage("[JassVM] 分配失败，回退到 Storm: %zu 字节", size);
     }
 
     // 分配策略判断
     bool useManagedPool = (size >= g_bigThreshold.load());
+
+    // 特殊处理：地形和模型资源
+    if (name && (
+        strstr(name, "terrain") || strstr(name, "Terrain") ||
+        strstr(name, "model") || strstr(name, "Model"))) {
+        useManagedPool = true;
+        // 对于地形和模型资源，切换到TLSF池
+        MemPool::SwitchPoolType(PoolType::TLSF);
+    }
+    else {
+        // 其他资源使用默认池(mimalloc)
+        MemPool::SwitchPoolType(PoolType::MiMalloc);
+    }
 
     if (useManagedPool) {
         // 先尝试从缓存获取大块
@@ -983,7 +994,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             return reinterpret_cast<size_t>(userPtr);
         }
 
-        // 使用内存池管理器分配 - 修改这部分使用MemPool命名空间
+        // 使用内存池管理器分配
         size_t totalSize = size + sizeof(StormAllocHeader);
         void* rawPtr = nullptr;
 
@@ -1007,6 +1018,10 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
 
         if (!rawPtr) {
             LogMessage("[Alloc] 内存池分配失败: %zu 字节, 回退到 Storm", size);
+
+            // 重置回默认池
+            MemPool::SwitchPoolType(PoolType::Default);
+
             return s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         }
 
@@ -1043,6 +1058,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         return ret;
     }
 }
+
 // Hook: SMemFree - 处理释放
 int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     if (!a1) return 1;  // 空指针认为成功
@@ -1096,11 +1112,20 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
                 g_detailedProfiler.RecordFree(blockInfo.size, blockInfo.type);
 
                 // 安全取消注册
-                g_MemSafety.TryUnregisterBlock(ptr);
+                g_MemorySafety.TryUnregisterBlock(ptr);
 
                 // 释放名称字符串
                 if (blockInfo.source) {
                     free((void*)blockInfo.source);
+                }
+
+                // 如果这是地形或模型块，确保使用TLSF释放
+                if (blockInfo.type == ResourceType::Terrain ||
+                    blockInfo.type == ResourceType::Model) {
+                    MemPool::SwitchPoolType(PoolType::TLSF);
+                }
+                else {
+                    MemPool::SwitchPoolType(PoolType::MiMalloc);
                 }
 
                 // 获取分片索引
@@ -1125,7 +1150,7 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
                         g_totalLockWaitTime.fetch_add(lockWaitTime);
                         g_lockWaitCount.fetch_add(1);
 
-                        MemPool::FreeSafe(ptr);
+                        MemPool::FreeSafe(blockInfo.rawPtr);
                     }
                 }
                 // 小块直接释放
@@ -1138,7 +1163,7 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
                     g_totalLockWaitTime.fetch_add(lockWaitTime);
                     g_lockWaitCount.fetch_add(1);
 
-                    MemPool::FreeSafe(ptr);
+                    MemPool::FreeSafe(blockInfo.rawPtr);
                 }
 
                 g_freedByFreeHook++;
@@ -1154,8 +1179,16 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
 
                 // 使用分片锁保护释放操作
                 std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
-                MemPool::FreeSafe(rawPtr);
-                g_freedByFreeHook++;
+
+                // 尝试两种池释放
+                if (MemPool::IsFromPool(rawPtr)) {
+                    MemPool::FreeSafe(rawPtr);
+                    g_freedByFreeHook++;
+                }
+                else {
+                    // 可能不是我们的块，尝试Storm释放
+                    return s_origStormFree(a1, name, argList, a4);
+                }
             }
         }
         catch (const std::exception& e) {
@@ -1212,6 +1245,16 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         if (IsOurBlock(oldPtr)) {
             LogMessage("[Realloc] 不安全期间处理: %p, 新大小=%zu", oldPtr, newSize);
 
+            // 特殊处理：地形和模型资源
+            if (name && (
+                strstr(name, "terrain") || strstr(name, "Terrain") ||
+                strstr(name, "model") || strstr(name, "Model"))) {
+                MemPool::SwitchPoolType(PoolType::TLSF);
+            }
+            else {
+                MemPool::SwitchPoolType(PoolType::MiMalloc);
+            }
+
             // 只分配，不释放
             void* newPtr = reinterpret_cast<void*>(
                 Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
@@ -1244,6 +1287,17 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
     bool isOurOldBlock = IsOurBlock(oldPtr);
     bool shouldUseManagedPool = (newSize >= g_bigThreshold.load()) ||
         IsSpecialBlockAllocation(newSize, name, src_line);
+
+    // 特殊处理：地形和模型资源
+    if (name && (
+        strstr(name, "terrain") || strstr(name, "Terrain") ||
+        strstr(name, "model") || strstr(name, "Model"))) {
+        shouldUseManagedPool = true;
+        MemPool::SwitchPoolType(PoolType::TLSF);
+    }
+    else if (shouldUseManagedPool) {
+        MemPool::SwitchPoolType(PoolType::MiMalloc);
+    }
 
     // 情况1: 我们的块重分配为我们的块
     if (isOurOldBlock && shouldUseManagedPool) {
@@ -1388,7 +1442,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         // 取消注册（锁外完成）
         g_MemSafety.UnregisterMemoryBlock(oldPtr);
 
-        // 释放mimalloc旧块
+        // 释放我们的旧块
         {
             // 从大块映射中移除
             std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
@@ -1428,7 +1482,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         void* newUserPtr = nullptr;
 
         try {
-            // 分配新的mimalloc块
+            // 分配新的内存池块
             size_t totalSize = newSize + sizeof(StormAllocHeader);
 
             // 获取分片索引
@@ -1450,7 +1504,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
             }
 
             if (!newRawPtr) {
-                LogMessage("[Realloc] mimalloc分配失败，回退到Storm");
+                LogMessage("[Realloc] 内存池分配失败，回退到Storm");
                 return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
             }
 
@@ -1473,7 +1527,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
             s_origStormFree(reinterpret_cast<int>(oldPtr), const_cast<char*>(name), src_line, flag);
         }
         catch (...) {
-            LogMessage("[Realloc] Storm到mimalloc转换异常");
+            LogMessage("[Realloc] Storm到内存池转换异常");
             if (newRawPtr) {
                 // 获取分片索引
                 size_t lockIndex = MemPool::get_shard_index(newRawPtr);

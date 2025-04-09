@@ -128,7 +128,7 @@ namespace MemPool {
         return hash % LOCK_SHARDS;
     }
 
-    // 切换内存池类型
+    // 切换内存池类型 - 返回bool表示是否成功
     inline bool SwitchPoolType(PoolType newType) {
         return MemoryPoolManager::SwitchPoolType(newType);
     }
