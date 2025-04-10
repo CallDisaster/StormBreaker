@@ -137,21 +137,11 @@ void* MiMallocPool::Allocate(size_t size)
 
 void* MiMallocPool::AllocateSafe(size_t size)
 {
-    if (!g_mainHeap) {
-        // 懒初始化
-        if (!Initialize(64 * 1024 * 1024)) {  // 默认64MB
-            return nullptr;
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_mutex);
-    g_inMiMallocOperation.store(true);
-
+    // 最早检查不安全期间，避免任何堆操作
     if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
         // 在不安全期直接用系统分配
         void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        g_inMiMallocOperation.store(false);
 
         if (!sysPtr) {
             LogMessage("[MiMallocPool] 不安全期间系统内存分配失败: %zu", size);
@@ -164,22 +154,54 @@ void* MiMallocPool::AllocateSafe(size_t size)
         return sysPtr;
     }
 
-    if (!g_safeHeap) {
-        if (!g_mainHeap) {
-            Initialize(64 * 1024 * 1024);
+    // 检查堆有效性，但不使用锁和g_inMiMallocOperation标志
+    if (!g_mainHeap) {
+        try {
+            // 使用较小作用域的锁进行初始化
+            std::lock_guard<std::mutex> init_lock(m_mutex);
+            if (!Initialize(64 * 1024 * 1024)) { // 默认64MB
+                return nullptr;
+            }
         }
-        if (!g_safeHeap) {
-            g_inMiMallocOperation.store(false);
+        catch (...) {
+            LogMessage("[MiMallocPool] 初始化异常");
             return nullptr;
         }
     }
 
-    void* ptr = mi_heap_malloc(g_safeHeap, size);
-    if (ptr) {
-        g_usedSize.fetch_add(size, std::memory_order_relaxed);
+    // 确保安全堆有效
+    if (!g_safeHeap) {
+        try {
+            std::lock_guard<std::mutex> init_lock(m_mutex);
+            if (!g_mainHeap) {
+                return nullptr;
+            }
+            g_safeHeap = mi_heap_new();
+            if (!g_safeHeap) {
+                LogMessage("[MiMallocPool] 无法创建安全堆");
+                return nullptr;
+            }
+        }
+        catch (...) {
+            LogMessage("[MiMallocPool] 创建安全堆异常");
+            return nullptr;
+        }
     }
 
-    g_inMiMallocOperation.store(false);
+    // 使用try-catch保护mimalloc操作
+    void* ptr = nullptr;
+    try {
+        // 不使用锁直接分配 - 这更接近原始版本
+        ptr = mi_heap_malloc(g_safeHeap, size);
+        if (ptr) {
+            g_usedSize.fetch_add(size, std::memory_order_relaxed);
+        }
+    }
+    catch (...) {
+        LogMessage("[MiMallocPool] 安全堆分配异常");
+        return nullptr;
+    }
+
     return ptr;
 }
 

@@ -44,27 +44,6 @@ public:
 #pragma warning(pop)
 };
 
-// 内存块跟踪信息
-struct MemoryTraceInfo {
-    void* rawPointer;      // 原始分配地址
-    void* userPointer;     // 用户获得的地址
-    size_t size;           // 分配大小
-    DWORD timestamp;       // 分配时间
-    DWORD threadId;        // 分配线程ID
-    char sourceFile[64];   // 分配源文件
-    int sourceLine;        // 分配行号
-    bool isValid;          // 内存块是否有效
-    uint32_t checksum;     // 内存块校验和
-};
-
-// 延迟释放队列项目
-struct DeferredFreeItem {
-    void* pointer;         // 要释放的指针
-    DWORD queueTime;       // 入队时间
-    size_t size;           // 内存块大小
-    bool processed;        // 是否已处理
-};
-
 class MemorySafety {
 public:
     static MemorySafety& GetInstance() noexcept;
@@ -88,6 +67,7 @@ public:
     void EnterUnsafePeriod() noexcept;
     void ExitUnsafePeriod() noexcept;
     bool IsInUnsafePeriod() const noexcept;
+
     // 统计和验证方法
     void PrintStats() noexcept;
     void ValidateAllBlocks() noexcept;
@@ -97,27 +77,49 @@ public:
         const char* sourceFile, int sourceLine) noexcept;
     void UnregisterMemoryBlock(void* userPtr) noexcept;
 
-private:
-    MemorySafety() noexcept;
-    ~MemorySafety();
+public:
+    // 内存条目哈希表和延迟释放队列项结构（公开用于全局兼容）
+    struct MemoryTraceInfo {
+        void* rawPointer;      // 原始分配地址
+        void* userPointer;     // 用户获得的地址
+        size_t size;           // 分配大小
+        DWORD timestamp;       // 分配时间
+        DWORD threadId;        // 分配线程ID
+        char sourceFile[64];   // 分配源文件
+        int sourceLine;        // 分配行号
+        bool isValid;          // 内存块是否有效
+        uint32_t checksum;     // 内存块校验和
+    };
 
-    // 内存条目哈希表
     struct MemoryEntry {
         void* userPtr;
         MemoryTraceInfo info;
         MemoryEntry* next;
     };
 
+    struct DeferredFreeItem {
+        void* ptr;         // 要释放的指针
+        size_t size;       // 内存块大小
+        DeferredFreeItem* next;  // 下一个项目
+    };
+
+private:
+    MemorySafety() noexcept;
+    ~MemorySafety();
+
+    // SEH安全辅助方法
+    MemoryEntry* AllocateMemoryEntrySEH() noexcept;
+    DeferredFreeItem* AllocateDeferredFreeItemSEH() noexcept;
+    bool SafeMemcpyWithSEH(void* dest, const void* src, size_t size) noexcept;
+    bool DoValidatePointerRangeSEH(void* ptr, size_t size, MEMORY_BASIC_INFORMATION* mbi) noexcept;
+    bool IsSystemBlockSEH(void* ptr) noexcept;
+    bool ValidateBlockPointerSEH(void* ptr) noexcept;
+
     enum { HASH_TABLE_SIZE = 4096 };
     MemoryEntry* m_memoryTable[HASH_TABLE_SIZE];
     CRITICAL_SECTION m_tableLock;
 
     // 延迟释放队列
-    struct DeferredFreeItem {
-        void* ptr;
-        size_t size;
-        DeferredFreeItem* next;
-    };
     DeferredFreeItem* m_deferredFreeList;
     CRITICAL_SECTION m_queueLock;
 
@@ -153,6 +155,6 @@ private:
 // 安全内存操作宏
 #define SAFE_MEMCPY(dest, src, size) g_MemorySafety.SafeMemoryCopy(dest, src, size)
 
-// 辅助函数声明
-bool IsValidPointer(const void* ptr);  // 改为接受 const void*
+// 辅助函数声明 - 修改为接受const void*
+bool IsValidPointer(const void* ptr);
 uint32_t QuickChecksum(const void* data, size_t len);

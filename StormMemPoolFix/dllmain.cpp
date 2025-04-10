@@ -98,6 +98,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             std::cout << "使用mimalloc内存池" << std::endl;
         }
 
+        poolType = PoolType::TLSF; // 强制使用TLSF
+
         // 初始化内存钩子
         if (InitializeStormMemoryHooks(poolType)) {
             std::cout << "StormMemPoolHook 初始化成功！" << std::endl;

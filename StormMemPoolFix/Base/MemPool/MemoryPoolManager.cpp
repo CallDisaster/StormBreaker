@@ -2,20 +2,21 @@
 
 #include "pch.h"
 #include "MemoryPoolManager.h"
-#include "MiMallocPool.h"
-#include "TLSFPool.h"
+#include "TLSFPool.h" // 移除 MiMallocPool.h
 #include <mutex>
 #include <memory>
+#include <atomic> // 添加 atomic 头文件
 #include "Storm/StormHook.h"
 #include "Base/MemorySafety.h"
 
 // 私有命名空间，不导出符号
 namespace {
     // 当前活跃的内存池类型
-    std::atomic<PoolType> g_activePoolType{ PoolType::Default };
+    // 不再需要 g_activePoolType，因为我们强制使用 TLSF
+    // std::atomic<PoolType> g_activePoolType{ PoolType::TLSF }; // 强制 TLSF
 
-    // 内存池实例
-    std::unique_ptr<MiMallocPool> g_miMallocPool;
+    // 内存池实例 - 只保留 TLSF
+    // std::unique_ptr<MiMallocPool> g_miMallocPool; // 移除 MiMallocPool
     std::unique_ptr<TLSFPool> g_tlsfPool;
 
     // 访问锁
@@ -23,28 +24,30 @@ namespace {
 
     // 状态标志
     std::atomic<bool> g_initialized{ false };
-    std::atomic<bool> g_disableActualFree{ false };
+    std::atomic<bool> g_disableActualFree{ false }; // 这个标志可能仍需保留
 
-    // 池指针归属跟踪 - 用于避免交叉释放
+    // 池指针归属跟踪 - 简化，因为只有一个主池 (TLSF)
+    // 可以考虑移除，或者保留用于区分 TLSF 和 JVM 或 Storm 原生
+    // 暂时保留，但 PoolType 只需区分 TLSF 和 Default/Unknown
     std::unordered_map<void*, PoolType> g_pointerOrigin;
     std::mutex g_pointerOriginMutex;
 
-    // 记录指针归属
-    void TrackPointer(void* ptr, PoolType pool) {
+    // 记录指针归属 (只记录 TLSF)
+    void TrackPointer(void* ptr) {
         if (!ptr) return;
         std::lock_guard<std::mutex> lock(g_pointerOriginMutex);
-        g_pointerOrigin[ptr] = pool;
+        g_pointerOrigin[ptr] = PoolType::TLSF;
     }
 
-    // 获取指针归属的池
+    // 获取指针归属的池 (只检查是否为 TLSF)
     PoolType GetPointerPool(void* ptr) {
         if (!ptr) return PoolType::Default;
         std::lock_guard<std::mutex> lock(g_pointerOriginMutex);
         auto it = g_pointerOrigin.find(ptr);
         if (it != g_pointerOrigin.end()) {
-            return it->second;
+            return it->second; // 应该是 TLSF
         }
-        return PoolType::Default; // 默认
+        return PoolType::Default; // 默认/未知
     }
 
     // 清除指针跟踪
@@ -54,22 +57,26 @@ namespace {
         g_pointerOrigin.erase(ptr);
     }
 
-    // 工具函数 - 获取块大小，内部使用
+    // 工具函数 - 获取块大小，内部使用 (只查 TLSF)
     size_t GetBlockSizeInternal(void* ptr)
     {
         if (!ptr) return 0;
 
-        // 先尝试mimalloc获取
-        if (g_miMallocPool) {
-            size_t size = g_miMallocPool->GetBlockSize(ptr);
-            if (size > 0) return size;
-        }
-
-        // 再尝试TLSF获取
+        // 只尝试TLSF获取
         if (g_tlsfPool) {
             size_t size = g_tlsfPool->GetBlockSize(ptr);
             if (size > 0) return size;
         }
+
+        // 尝试从 Storm 头获取 (如果 IsOurBlock 失败)
+        try {
+             StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
+                 static_cast<char*>(ptr) - sizeof(StormAllocHeader));
+             if (header->Magic == STORM_MAGIC) { // 假设 STORM_MAGIC 已定义
+                 return header->Size;
+             }
+        } catch(...) {}
+
 
         return 0;
     }
@@ -91,59 +98,21 @@ bool MemoryPoolManager::Initialize(size_t initialSize, PoolType poolType)
         return true;
     }
 
-    // 设置当前活跃的池类型
-    g_activePoolType.store(poolType);
+    // 强制使用 TLSF
+    // g_activePoolType.store(PoolType::TLSF); // 不再需要 activePoolType
 
-    bool mimalloc_ok = false;
-    bool tlsf_ok = false;
-
-    // 创建主要池 (mimalloc)
-    g_miMallocPool = std::make_unique<MiMallocPool>();
-    if (g_miMallocPool->Initialize(initialSize)) {
-        mimalloc_ok = true;
-        LogMessage("[MemoryPoolManager] mimalloc池初始化成功");
-    }
-    else {
-        LogMessage("[MemoryPoolManager] mimalloc池初始化失败");
-        g_miMallocPool.reset();
-    }
-
-    // 创建备用池 (TLSF) - 延迟初始化，需要用时才初始化
+    // 只创建 TLSF 池
     g_tlsfPool = std::make_unique<TLSFPool>();
     if (g_tlsfPool->Initialize(initialSize)) {
-        tlsf_ok = true;
         LogMessage("[MemoryPoolManager] TLSF池初始化成功");
-    }
-    else {
+    } else {
         LogMessage("[MemoryPoolManager] TLSF池初始化失败");
         g_tlsfPool.reset();
-    }
-
-    // 根据初始化结果设置默认池
-    if (poolType == PoolType::TLSF && !tlsf_ok) {
-        if (mimalloc_ok) {
-            LogMessage("[MemoryPoolManager] TLSF初始化失败，回退到mimalloc");
-            g_activePoolType.store(PoolType::MiMalloc);
-        }
-        else {
-            LogMessage("[MemoryPoolManager] 所有内存池初始化失败");
-            return false;
-        }
-    }
-    else if (poolType == PoolType::MiMalloc && !mimalloc_ok) {
-        if (tlsf_ok) {
-            LogMessage("[MemoryPoolManager] mimalloc初始化失败，回退到TLSF");
-            g_activePoolType.store(PoolType::TLSF);
-        }
-        else {
-            LogMessage("[MemoryPoolManager] 所有内存池初始化失败");
-            return false;
-        }
+        return false; // TLSF 初始化失败则管理器初始化失败
     }
 
     g_initialized = true;
-    LogMessage("[MemoryPoolManager] 内存池管理器初始化完成，当前使用: %s",
-        g_activePoolType.load() == PoolType::MiMalloc ? "mimalloc" : "TLSF");
+    LogMessage("[MemoryPoolManager] 内存池管理器初始化完成 (使用 TLSF)");
     return true;
 }
 
@@ -155,12 +124,7 @@ void MemoryPoolManager::Shutdown()
         return;
     }
 
-    // 关闭所有已创建的内存池
-    if (g_miMallocPool) {
-        g_miMallocPool->Shutdown();
-        g_miMallocPool.reset();
-    }
-
+    // 只关闭 TLSF 池
     if (g_tlsfPool) {
         g_tlsfPool->Shutdown();
         g_tlsfPool.reset();
@@ -176,48 +140,9 @@ void MemoryPoolManager::Shutdown()
     LogMessage("[MemoryPoolManager] 所有内存池已关闭");
 }
 
-bool MemoryPoolManager::SwitchPoolType(PoolType newType)
-{
-    if (!g_initialized) {
-        // 尝试初始化
-        if (!Initialize(64 * 1024 * 1024, newType)) {
-            return false;
-        }
-    }
-
-    if (newType == g_activePoolType) {
-        // 已经是当前类型
-        return true;
-    }
-
-    std::lock_guard<std::mutex> lock(g_managerMutex);
-
-    // 检查目标池是否可用
-    if (newType == PoolType::MiMalloc && !g_miMallocPool) {
-        LogMessage("[MemoryPoolManager] 无法切换到mimalloc: 池不可用");
-        return false;
-    }
-
-    if (newType == PoolType::TLSF && !g_tlsfPool) {
-        LogMessage("[MemoryPoolManager] 无法切换到TLSF: 池不可用");
-        return false;
-    }
-
-    // 更新当前池类型
-    PoolType oldType = g_activePoolType.load();
-    g_activePoolType.store(newType);
-
-    LogMessage("[MemoryPoolManager] 内存池已从%s切换到%s",
-        oldType == PoolType::MiMalloc ? "mimalloc" : "TLSF",
-        newType == PoolType::MiMalloc ? "mimalloc" : "TLSF");
-
-    return true;
-}
-
-PoolType MemoryPoolManager::GetActivePoolType()
-{
-    return g_activePoolType.load();
-}
+// 移除 SwitchPoolType 和 GetActivePoolType，因为不再需要切换
+// bool MemoryPoolManager::SwitchPoolType(PoolType newType) { ... }
+// PoolType MemoryPoolManager::GetActivePoolType() { ... }
 
 void* MemoryPoolManager::Allocate(size_t size)
 {
@@ -229,36 +154,13 @@ void* MemoryPoolManager::Allocate(size_t size)
         }
     }
 
-    // 根据当前活跃池类型分配内存
+    // 直接使用 TLSF 池分配
     void* ptr = nullptr;
-    switch (g_activePoolType.load()) {
-    case PoolType::MiMalloc:
-        if (g_miMallocPool) {
-            ptr = g_miMallocPool->Allocate(size);
-            if (ptr) {
-                TrackPointer(ptr, PoolType::MiMalloc);
-            }
+    if (g_tlsfPool) {
+        ptr = g_tlsfPool->Allocate(size);
+        if (ptr) {
+            TrackPointer(ptr); // 只需记录指针，无需指定类型
         }
-        break;
-
-    case PoolType::TLSF:
-        if (g_tlsfPool) {
-            ptr = g_tlsfPool->Allocate(size);
-            if (ptr) {
-                TrackPointer(ptr, PoolType::TLSF);
-            }
-        }
-        break;
-
-    default:
-        // 默认使用mimalloc
-        if (g_miMallocPool) {
-            ptr = g_miMallocPool->Allocate(size);
-            if (ptr) {
-                TrackPointer(ptr, PoolType::MiMalloc);
-            }
-        }
-        break;
     }
 
     return ptr;
@@ -278,36 +180,21 @@ void MemoryPoolManager::Free(void* ptr)
         return;
     }
 
-    // 检查指针归属并使用对应池释放
+    // 检查指针是否由 TLSF 管理
     PoolType origin = GetPointerPool(ptr);
 
-    if (origin == PoolType::MiMalloc) {
-        if (g_miMallocPool) {
-            g_miMallocPool->Free(ptr);
-            UntrackPointer(ptr);
-        }
-    }
-    else if (origin == PoolType::TLSF) {
+    if (origin == PoolType::TLSF) {
         if (g_tlsfPool) {
             g_tlsfPool->Free(ptr);
             UntrackPointer(ptr);
         }
-    }
-    else {
-        // 未知来源，尝试两种池都释放
-        bool freed = false;
-        if (g_miMallocPool && g_miMallocPool->IsFromPool(ptr)) {
-            g_miMallocPool->Free(ptr);
-            freed = true;
+    } else {
+        // 未知来源，尝试 TLSF 释放 (IsFromPool 会检查)
+        if (g_tlsfPool && g_tlsfPool->IsFromPool(ptr)) {
+             g_tlsfPool->Free(ptr);
+             UntrackPointer(ptr); // 如果成功释放，则清除跟踪
         }
-        else if (g_tlsfPool && g_tlsfPool->IsFromPool(ptr)) {
-            g_tlsfPool->Free(ptr);
-            freed = true;
-        }
-
-        if (freed) {
-            UntrackPointer(ptr);
-        }
+        // 如果 TLSF 无法释放，则可能是 Storm 原生或其他来源，Hooked_Storm_MemFree 会处理
     }
 }
 
@@ -350,56 +237,40 @@ void* MemoryPoolManager::Realloc(void* oldPtr, size_t newSize)
         return newPtr;
     }
 
-    // 根据指针归属选择池重分配
+    // 检查旧指针是否由 TLSF 管理
     PoolType origin = GetPointerPool(oldPtr);
     void* newPtr = nullptr;
 
-    if (origin == PoolType::MiMalloc) {
-        if (g_miMallocPool) {
-            newPtr = g_miMallocPool->Realloc(oldPtr, newSize);
-            // 如果重分配地址改变，更新跟踪
-            if (newPtr && newPtr != oldPtr) {
-                UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::MiMalloc);
-            }
-        }
-    }
-    else if (origin == PoolType::TLSF) {
+    if (origin == PoolType::TLSF) {
         if (g_tlsfPool) {
             newPtr = g_tlsfPool->Realloc(oldPtr, newSize);
             // 如果重分配地址改变，更新跟踪
             if (newPtr && newPtr != oldPtr) {
                 UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::TLSF);
+                TrackPointer(newPtr);
             }
         }
-    }
-    else {
-        // 未知来源，尝试直接检测
-        if (g_miMallocPool && g_miMallocPool->IsFromPool(oldPtr)) {
-            newPtr = g_miMallocPool->Realloc(oldPtr, newSize);
-            if (newPtr && newPtr != oldPtr) {
-                UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::MiMalloc);
-            }
-        }
-        else if (g_tlsfPool && g_tlsfPool->IsFromPool(oldPtr)) {
+    } else {
+        // 未知来源，尝试 TLSF 检测和重分配
+        if (g_tlsfPool && g_tlsfPool->IsFromPool(oldPtr)) {
             newPtr = g_tlsfPool->Realloc(oldPtr, newSize);
             if (newPtr && newPtr != oldPtr) {
                 UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::TLSF);
+                TrackPointer(newPtr);
             }
-        }
-        else {
-            // 不是我们的池管理的内存，重新分配新块并复制
-            newPtr = Allocate(newSize);
+        } else {
+            // 不是 TLSF 管理的内存，分配新 TLSF 块并复制
+            newPtr = Allocate(newSize); // Allocate 内部会 TrackPointer
             if (newPtr) {
                 // 保守复制
                 try {
-                    memcpy(newPtr, oldPtr, min(newSize, (size_t)64));
+                    size_t oldSize = GetBlockSizeInternal(oldPtr); // 尝试获取大小
+                    if (oldSize == 0) oldSize = 64; // 获取失败则保守估计
+                    memcpy(newPtr, oldPtr, min(newSize, oldSize));
+                    // 这里需要调用 Storm 的 Free 来释放 oldPtr，但这应该在 Hooked_Storm_MemRealloc 中处理
                 }
                 catch (...) {
-                    Free(newPtr);
+                    Free(newPtr); // 释放新分配的块
                     return nullptr;
                 }
             }
@@ -436,36 +307,13 @@ void* MemoryPoolManager::AllocateSafe(size_t size)
         return sysPtr;
     }
 
-    // 根据当前活跃池类型分配内存
+    // 直接使用 TLSF 池安全分配
     void* ptr = nullptr;
-    switch (g_activePoolType.load()) {
-    case PoolType::MiMalloc:
-        if (g_miMallocPool) {
-            ptr = g_miMallocPool->AllocateSafe(size);
-            if (ptr) {
-                TrackPointer(ptr, PoolType::MiMalloc);
-            }
+    if (g_tlsfPool) {
+        ptr = g_tlsfPool->AllocateSafe(size);
+        if (ptr) {
+            TrackPointer(ptr);
         }
-        break;
-
-    case PoolType::TLSF:
-        if (g_tlsfPool) {
-            ptr = g_tlsfPool->AllocateSafe(size);
-            if (ptr) {
-                TrackPointer(ptr, PoolType::TLSF);
-            }
-        }
-        break;
-
-    default:
-        // 默认使用mimalloc
-        if (g_miMallocPool) {
-            ptr = g_miMallocPool->AllocateSafe(size);
-            if (ptr) {
-                TrackPointer(ptr, PoolType::MiMalloc);
-            }
-        }
-        break;
     }
 
     return ptr;
@@ -491,37 +339,20 @@ void MemoryPoolManager::FreeSafe(void* ptr)
         return;
     }
 
-    // 检查指针归属并使用对应池释放
+    // 检查指针是否由 TLSF 管理
     PoolType origin = GetPointerPool(ptr);
 
-    if (origin == PoolType::MiMalloc) {
-        if (g_miMallocPool) {
-            g_miMallocPool->FreeSafe(ptr);
-            UntrackPointer(ptr);
-        }
-    }
-    else if (origin == PoolType::TLSF) {
+    if (origin == PoolType::TLSF) {
         if (g_tlsfPool) {
             g_tlsfPool->FreeSafe(ptr);
             UntrackPointer(ptr);
         }
-    }
-    else {
-        // 未知来源，尝试两种池都释放
-        bool freed = false;
-        if (g_miMallocPool && g_miMallocPool->IsFromPool(ptr)) {
-            g_miMallocPool->FreeSafe(ptr);
-            freed = true;
-        }
-        else if (g_tlsfPool && g_tlsfPool->IsFromPool(ptr)) {
+    } else {
+        // 未知来源，尝试 TLSF 释放
+        if (g_tlsfPool && g_tlsfPool->IsFromPool(ptr)) {
             g_tlsfPool->FreeSafe(ptr);
-            freed = true;
-        }
-
-        if (freed) {
             UntrackPointer(ptr);
-        }
-        else {
+        } else {
             // 无法确定来源，加入延迟释放队列
             g_MemorySafety.EnqueueDeferredFree(ptr, GetBlockSizeInternal(ptr));
         }
@@ -594,57 +425,42 @@ void* MemoryPoolManager::ReallocSafe(void* oldPtr, size_t newSize)
         return newPtr;
     }
 
-    // 根据指针归属选择池重分配
+    // 检查旧指针是否由 TLSF 管理
     PoolType origin = GetPointerPool(oldPtr);
     void* newPtr = nullptr;
 
-    if (origin == PoolType::MiMalloc) {
-        if (g_miMallocPool) {
-            newPtr = g_miMallocPool->ReallocSafe(oldPtr, newSize);
-            // 如果重分配地址改变，更新跟踪
-            if (newPtr && newPtr != oldPtr) {
-                UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::MiMalloc);
-            }
-        }
-    }
-    else if (origin == PoolType::TLSF) {
+    if (origin == PoolType::TLSF) {
         if (g_tlsfPool) {
             newPtr = g_tlsfPool->ReallocSafe(oldPtr, newSize);
             // 如果重分配地址改变，更新跟踪
             if (newPtr && newPtr != oldPtr) {
                 UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::TLSF);
+                TrackPointer(newPtr);
             }
         }
-    }
-    else {
-        // 未知来源，尝试直接检测
-        if (g_miMallocPool && g_miMallocPool->IsFromPool(oldPtr)) {
-            newPtr = g_miMallocPool->ReallocSafe(oldPtr, newSize);
-            if (newPtr && newPtr != oldPtr) {
-                UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::MiMalloc);
-            }
-        }
-        else if (g_tlsfPool && g_tlsfPool->IsFromPool(oldPtr)) {
+    } else {
+        // 未知来源，尝试 TLSF 检测和重分配
+        if (g_tlsfPool && g_tlsfPool->IsFromPool(oldPtr)) {
             newPtr = g_tlsfPool->ReallocSafe(oldPtr, newSize);
             if (newPtr && newPtr != oldPtr) {
                 UntrackPointer(oldPtr);
-                TrackPointer(newPtr, PoolType::TLSF);
+                TrackPointer(newPtr);
             }
-        }
-        else {
-            // 不是我们的池管理的内存，分配新块并复制
-            newPtr = AllocateSafe(newSize);
+        } else {
+            // 不是 TLSF 管理的内存，分配新 TLSF 块并复制
+            newPtr = AllocateSafe(newSize); // AllocateSafe 内部会 TrackPointer
             if (newPtr) {
                 // 尝试复制数据
                 try {
-                    // 保守复制
-                    memcpy(newPtr, oldPtr, min(64, newSize));
+                    size_t oldSize = GetBlockSizeInternal(oldPtr); // 尝试获取大小
+                    if (oldSize == 0) oldSize = 64; // 获取失败则保守估计
+                    memcpy(newPtr, oldPtr, min(newSize, oldSize));
+                    // 这里需要调用 Storm 的 Free 来释放 oldPtr，这应该在 Hooked_Storm_MemRealloc 中处理
+                    // 或者，如果 oldPtr 是系统分配的，则需要 VirtualFree
+                    // 暂时不处理 oldPtr 的释放，依赖 Hooked_Storm_MemRealloc
                 }
                 catch (...) {
-                    FreeSafe(newPtr);
+                    FreeSafe(newPtr); // 释放新分配的块
                     return nullptr;
                 }
             }
@@ -664,11 +480,7 @@ bool MemoryPoolManager::IsFromPool(void* ptr)
         return true;
     }
 
-    // 然后直接询问各池
-    if (g_miMallocPool && g_miMallocPool->IsFromPool(ptr)) {
-        return true;
-    }
-
+    // 只询问 TLSF 池
     if (g_tlsfPool && g_tlsfPool->IsFromPool(ptr)) {
         return true;
     }
@@ -683,11 +495,7 @@ size_t MemoryPoolManager::GetBlockSize(void* ptr)
 
 void MemoryPoolManager::DisableMemoryReleasing()
 {
-    // 对两个内存池都禁用内存释放
-    if (g_miMallocPool) {
-        g_miMallocPool->DisableMemoryReleasing();
-    }
-
+    // 只对 TLSF 池禁用内存释放
     if (g_tlsfPool) {
         g_tlsfPool->DisableMemoryReleasing();
     }
@@ -697,19 +505,9 @@ void MemoryPoolManager::DisableMemoryReleasing()
 
 void MemoryPoolManager::CheckAndFreeUnusedPools()
 {
-    // 只对当前活跃池执行
-    switch (g_activePoolType.load()) {
-    case PoolType::MiMalloc:
-        if (g_miMallocPool) {
-            g_miMallocPool->CheckAndFreeUnusedPools();
-        }
-        break;
-
-    case PoolType::TLSF:
-        if (g_tlsfPool) {
-            g_tlsfPool->CheckAndFreeUnusedPools();
-        }
-        break;
+    // 只对 TLSF 池执行
+    if (g_tlsfPool) {
+        g_tlsfPool->CheckAndFreeUnusedPools();
     }
 }
 
@@ -756,21 +554,10 @@ void MemoryPoolManager::Preheat()
 {
     LogMessage("[MemoryPoolManager] 开始预热当前内存池...");
 
-    // 只对当前活跃池预热
-    switch (g_activePoolType.load()) {
-    case PoolType::MiMalloc:
-        if (g_miMallocPool) {
-            // 预热操作
-            // ...
-        }
-        break;
-
-    case PoolType::TLSF:
-        if (g_tlsfPool) {
-            // 针对TLSF的预热操作
-            // ...
-        }
-        break;
+    // 只对 TLSF 池预热
+    if (g_tlsfPool) {
+        // 针对TLSF的预热操作
+        // g_tlsfPool->Preheat(); // 假设 TLSFPool 有 Preheat 方法
     }
 
     LogMessage("[MemoryPoolManager] 内存池预热完成");
@@ -778,42 +565,26 @@ void MemoryPoolManager::Preheat()
 
 void MemoryPoolManager::HeapCollect()
 {
-    // 对当前活跃池执行垃圾收集
-    switch (g_activePoolType.load()) {
-    case PoolType::MiMalloc:
-        if (g_miMallocPool) {
-            g_miMallocPool->HeapCollect();
-        }
-        break;
-
-    case PoolType::TLSF:
-        if (g_tlsfPool) {
-            g_tlsfPool->HeapCollect();
-        }
-        break;
+    // 只对 TLSF 池执行垃圾收集
+    if (g_tlsfPool) {
+        g_tlsfPool->HeapCollect();
     }
 }
 
 void MemoryPoolManager::PrintStats()
 {
-    LogMessage("[MemoryPoolManager] === 内存池管理器统计 ===");
-    LogMessage("[MemoryPoolManager] 当前活跃内存池: %s",
-        g_activePoolType.load() == PoolType::MiMalloc ? "mimalloc" : "TLSF");
+    LogMessage("[MemoryPoolManager] === TLSF 内存池统计 ===");
 
-    // 显示mimalloc统计
-    if (g_miMallocPool) {
-        LogMessage("[MemoryPoolManager] --- mimalloc统计 ---");
-        g_miMallocPool->PrintStats();
-    }
-
-    // 显示TLSF统计
+    // 只显示TLSF统计
     if (g_tlsfPool) {
-        LogMessage("[MemoryPoolManager] --- TLSF统计 ---");
         g_tlsfPool->PrintStats();
+    } else {
+        LogMessage("[MemoryPoolManager] TLSF 池未初始化");
     }
 
-    LogMessage("[MemoryPoolManager] 总内存使用: %zu KB", GetUsedSize() / 1024);
-    LogMessage("[MemoryPoolManager] 总内存池大小: %zu KB", GetTotalSize() / 1024);
+    // 总使用和总大小现在直接来自 TLSF 池
+    LogMessage("[MemoryPoolManager] 总内存使用: %zu KB", GetUsedSize() / 1024); // GetUsedSize 已简化
+    LogMessage("[MemoryPoolManager] 总内存池大小: %zu KB", GetTotalSize() / 1024); // GetTotalSize 已简化
     LogMessage("[MemoryPoolManager] =====================");
 }
 
@@ -821,11 +592,7 @@ size_t MemoryPoolManager::GetUsedSize()
 {
     size_t total = 0;
 
-    // 累加两个内存池的使用量
-    if (g_miMallocPool) {
-        total += g_miMallocPool->GetUsedSize();
-    }
-
+    // 只获取 TLSF 池的使用量
     if (g_tlsfPool) {
         total += g_tlsfPool->GetUsedSize();
     }
@@ -837,11 +604,7 @@ size_t MemoryPoolManager::GetTotalSize()
 {
     size_t total = 0;
 
-    // 累加两个内存池的总量
-    if (g_miMallocPool) {
-        total += g_miMallocPool->GetTotalSize();
-    }
-
+    // 只获取 TLSF 池的总量
     if (g_tlsfPool) {
         total += g_tlsfPool->GetTotalSize();
     }

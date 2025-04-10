@@ -376,20 +376,6 @@ bool SafeMemCopy(void* dest, const void* src, size_t size) noexcept {
     }
 }
 
-// 辅助函数 - 检查指针有效性
-bool IsValidPointer(const void* ptr) {
-    if (!ptr) return false;
-
-    __try {
-        // 尝试读取第一个字节验证可读
-        volatile char test = *static_cast<const char*>(ptr);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 bool IsValidMemoryBlock(void* ptr, size_t expectedSize = 0) {
     if (!ptr) return false;
 
@@ -471,11 +457,14 @@ void SetupCompatibleHeader(void* userPtr, size_t size) {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
 
-        header->HeapPtr = SPECIAL_MARKER;  // 特殊标记
-        header->Size = static_cast<DWORD>(size);
-        header->AlignPadding = 0;
-        header->Flags = 0x4;  // 标记为大块VirtualAlloc
-        header->Magic = STORM_MAGIC;
+        // 检查是否已经有Storm魔数，避免覆盖
+        if (header->Magic != STORM_MAGIC) {
+            header->HeapPtr = SPECIAL_MARKER;  // 我们的特殊标记
+            header->Size = static_cast<DWORD>(size);
+            header->AlignPadding = 0;
+            header->Flags = 0x4;  // 标记为大块
+            header->Magic = STORM_MAGIC;
+        }
     }
     catch (...) {
         LogMessage("[ERROR] 设置兼容头失败: %p", userPtr);
@@ -486,10 +475,16 @@ void SetupCompatibleHeader(void* userPtr, size_t size) {
 bool IsOurBlock(void* ptr) {
     if (!ptr) return false;
 
+    // 在不安全期间总是返回false
+    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
+        return false;
+    }
+
     __try {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(StormAllocHeader));
 
+        // 必须同时满足魔数和特殊标记条件
         return (header->Magic == STORM_MAGIC &&
             header->HeapPtr == SPECIAL_MARKER);
     }
@@ -931,10 +926,11 @@ void ManageTempStabilizers(int currentCleanCount) {
 }
 // Hook: SMemAlloc - 处理大块分配
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag) {
-    // 现有逻辑保持不变
+    // 记录分配类型和大小
     ResourceType type = GetResourceType(name, size);
     g_detailedProfiler.RecordAllocation(size, name, type);
 
+    // 检查是否在 CleanAll 后的第一次分配
     bool isAfterCleanAll = g_afterCleanAll.exchange(false);
     if (isAfterCleanAll) {
         static int cleanAllCounter = 0;
@@ -942,8 +938,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         CreateStabilizingBlocks(cleanAllCounter);
     }
 
-    // 检查是否为JassVM相关分配
-    bool isJassVM = false;
+    // 检查是否为 JassVM 相关分配
     if (name && size == 10408 && strstr(name, "Instance.cpp")) {
         void* jassPtr = JVM_MemPool::Allocate(size);
         if (jassPtr) {
@@ -953,23 +948,23 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         LogMessage("[JassVM] 分配失败，回退到 Storm: %zu 字节", size);
     }
 
-    // 分配策略判断
-    bool useManagedPool = (size >= g_bigThreshold.load());
+    // 分配策略：大块使用内存池，小块使用 Storm
+    bool useMemPool = (size >= g_bigThreshold.load());
 
-    // 特殊处理：地形和模型资源
+    // 移除所有内存池切换逻辑
+    /*
     if (name && (
         strstr(name, "terrain") || strstr(name, "Terrain") ||
         strstr(name, "model") || strstr(name, "Model"))) {
         useManagedPool = true;
-        // 对于地形和模型资源，切换到TLSF池
         MemPool::SwitchPoolType(PoolType::TLSF);
     }
     else {
-        // 其他资源使用默认池(mimalloc)
         MemPool::SwitchPoolType(PoolType::MiMalloc);
     }
+    */
 
-    if (useManagedPool) {
+    if (useMemPool) {
         // 先尝试从缓存获取大块
         void* cachedPtr = g_largeBlockCache.GetBlock(size + sizeof(StormAllocHeader));
         if (cachedPtr) {
@@ -994,34 +989,12 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             return reinterpret_cast<size_t>(userPtr);
         }
 
-        // 使用内存池管理器分配
+        // 使用当前内存池分配
         size_t totalSize = size + sizeof(StormAllocHeader);
-        void* rawPtr = nullptr;
-
-        // 获取分片索引
-        size_t lockIndex = MemPool::get_shard_index(nullptr, size);
-
-        // 开始计时
-        DWORD lockStartTime = GetTickCount();
-
-        {
-            // 使用分片锁保护分配操作
-            std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
-
-            // 记录锁等待时间
-            DWORD lockWaitTime = GetTickCount() - lockStartTime;
-            g_totalLockWaitTime.fetch_add(lockWaitTime);
-            g_lockWaitCount.fetch_add(1);
-
-            rawPtr = MemPool::AllocateSafe(totalSize);
-        }
+        void* rawPtr = MemPool::AllocateSafe(totalSize);
 
         if (!rawPtr) {
             LogMessage("[Alloc] 内存池分配失败: %zu 字节, 回退到 Storm", size);
-
-            // 重置回默认池
-            MemPool::SwitchPoolType(PoolType::Default);
-
             return s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         }
 
@@ -1050,7 +1023,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         return reinterpret_cast<size_t>(userPtr);
     }
     else {
-        // 小块使用Storm原始分配
+        // 小块使用 Storm 原始分配
         size_t ret = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         if (ret) {
             g_memStats.OnAlloc(size);
@@ -1059,152 +1032,153 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
     }
 }
 
-// Hook: SMemFree - 处理释放
-int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
+// 将所有释放逻辑放入一个辅助函数中
+int DoHooked_Storm_MemFree(int a1, char* name, int argList, int a4)
+{
     if (!a1) return 1;  // 空指针认为成功
 
     void* ptr = reinterpret_cast<void*>(a1);
 
-    // 先检查是否为JVM_MemPool指针
+    // 检查 JVM_MemPool
     if (JVM_MemPool::IsFromPool(ptr)) {
         JVM_MemPool::Free(ptr);
         return 1;
     }
 
-    bool ourBlock = false;
-    bool permanentBlock = false;
-
-    try {
-        permanentBlock = IsPermanentBlock(ptr);
-        if (permanentBlock) {
-            LogMessage("[Free] 忽略永久块释放: %p", ptr);
-            return 1;
-        }
-
-        // 检查是否为我们管理的块
-        ourBlock = IsOurBlock(ptr);
-    }
-    catch (...) {
-        LogMessage("[Free] 检查指针时出现异常: %p", ptr);
+    // 在不安全期间直接交给 Storm
+    if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
         return s_origStormFree(a1, name, argList, a4);
     }
 
-    // 常规释放流程
-    if (ourBlock) {
-        // 获取块信息
-        bool blockFound = false;
-        BigBlockInfo blockInfo = {};
+    // 检查永久块
+    if (IsPermanentBlock(ptr)) {
+        LogMessage("[Free] 忽略永久块释放: %p", ptr);
+        return 1;
+    }
 
-        try {
-            // 获取块信息
-            {
-                std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
-                auto it = g_bigBlocks.find(ptr);
-                if (it != g_bigBlocks.end()) {
-                    blockInfo = it->second;
-                    g_bigBlocks.erase(it);
-                    blockFound = true;
-                }
+    // 检查是否为我们管理的块
+    if (!IsOurBlock(ptr)) {
+        // 不是我们的块，交给 Storm 处理
+        return s_origStormFree(a1, name, argList, a4);
+    }
+
+    // 至此，确认是我们的块
+    // 获取块信息
+    BigBlockInfo blockInfo = {};
+    bool blockFound = false;
+
+    // 从大块映射中查找（使用 lock_guard 管理锁）
+    {
+        std::lock_guard<std::mutex> lock(g_bigBlocksMutex);
+        auto it = g_bigBlocks.find(ptr);
+        if (it != g_bigBlocks.end()) {
+            blockInfo = it->second;
+            g_bigBlocks.erase(it);
+            blockFound = true;
+        }
+    }
+
+    if (blockFound) {
+        g_memStats.OnFree(blockInfo.size);
+        g_detailedProfiler.RecordFree(blockInfo.size, blockInfo.type);
+
+        // 安全取消注册
+        g_MemorySafety.TryUnregisterBlock(ptr);
+
+        // 释放名称字符串
+        if (blockInfo.source) {
+            free((void*)blockInfo.source);
+        }
+
+        // 获取分片索引
+        size_t lockIndex = MemPool::get_shard_index(ptr);
+
+        // 开始计时
+        DWORD lockStartTime = GetTickCount();
+
+        // 根据大小决定是否放入缓存
+        if (blockInfo.size >= g_bigThreshold.load()) {
+            // 尝试放入缓存
+            if (g_largeBlockCache.GetCacheSize() < 10) {
+                g_largeBlockCache.ReleaseBlock(blockInfo.rawPtr, blockInfo.size);
             }
-
-            if (blockFound) {
-                g_memStats.OnFree(blockInfo.size);
-                g_detailedProfiler.RecordFree(blockInfo.size, blockInfo.type);
-
-                // 安全取消注册
-                g_MemorySafety.TryUnregisterBlock(ptr);
-
-                // 释放名称字符串
-                if (blockInfo.source) {
-                    free((void*)blockInfo.source);
-                }
-
-                // 如果这是地形或模型块，确保使用TLSF释放
-                if (blockInfo.type == ResourceType::Terrain ||
-                    blockInfo.type == ResourceType::Model) {
-                    MemPool::SwitchPoolType(PoolType::TLSF);
-                }
-                else {
-                    MemPool::SwitchPoolType(PoolType::MiMalloc);
-                }
-
-                // 获取分片索引
-                size_t lockIndex = MemPool::get_shard_index(ptr);
-
-                // 开始计时
-                DWORD lockStartTime = GetTickCount();
-
-                // 根据大小决定是否放入缓存
-                if (blockInfo.size >= g_bigThreshold.load()) {
-                    // 尝试放入缓存
-                    if (g_largeBlockCache.GetCacheSize() < 10) {
-                        g_largeBlockCache.ReleaseBlock(blockInfo.rawPtr, blockInfo.size);
-                    }
-                    // 缓存已满，直接释放
-                    else {
-                        // 使用分片锁保护释放操作
-                        std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
-
-                        // 记录锁等待时间
-                        DWORD lockWaitTime = GetTickCount() - lockStartTime;
-                        g_totalLockWaitTime.fetch_add(lockWaitTime);
-                        g_lockWaitCount.fetch_add(1);
-
-                        MemPool::FreeSafe(blockInfo.rawPtr);
-                    }
-                }
-                // 小块直接释放
-                else {
-                    // 使用分片锁保护释放操作
+            // 缓存已满，直接释放
+            else {
+                // 使用分片锁保护释放操作
+                {
                     std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
-
                     // 记录锁等待时间
                     DWORD lockWaitTime = GetTickCount() - lockStartTime;
                     g_totalLockWaitTime.fetch_add(lockWaitTime);
                     g_lockWaitCount.fetch_add(1);
-
                     MemPool::FreeSafe(blockInfo.rawPtr);
                 }
+            }
+        }
+        // 小块直接释放
+        else {
+            // 使用分片锁保护释放操作
+            {
+                std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
+                // 记录锁等待时间
+                DWORD lockWaitTime = GetTickCount() - lockStartTime;
+                g_totalLockWaitTime.fetch_add(lockWaitTime);
+                g_lockWaitCount.fetch_add(1);
+                MemPool::FreeSafe(blockInfo.rawPtr);
+            }
+        }
 
+        g_freedByFreeHook++;
+    }
+    else {
+        LogMessage("[Free] 未找到注册的块: %p", ptr);
+
+        // 尝试释放原始内存
+        void* rawPtr = static_cast<char*>(ptr) - sizeof(StormAllocHeader);
+
+        // 获取分片索引
+        size_t lockIndex = MemPool::get_shard_index(ptr);
+
+        // 使用分片锁保护释放操作
+        {
+            std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
+            // 检查是否为我们池中的内存
+            if (MemPool::IsFromPool(rawPtr)) {
+                MemPool::FreeSafe(rawPtr);
                 g_freedByFreeHook++;
             }
             else {
-                LogMessage("[Free] 未找到注册的块: %p", ptr);
-
-                // 尝试释放原始内存
-                void* rawPtr = static_cast<char*>(ptr) - sizeof(StormAllocHeader);
-
-                // 获取分片索引
-                size_t lockIndex = MemPool::get_shard_index(ptr);
-
-                // 使用分片锁保护释放操作
-                std::lock_guard<std::mutex> lock(g_poolMutexes[lockIndex]);
-
-                // 尝试两种池释放
-                if (MemPool::IsFromPool(rawPtr)) {
-                    MemPool::FreeSafe(rawPtr);
-                    g_freedByFreeHook++;
-                }
-                else {
-                    // 可能不是我们的块，尝试Storm释放
-                    return s_origStormFree(a1, name, argList, a4);
-                }
+                // 不是我们的内存，交给 Storm
+                return s_origStormFree(a1, name, argList, a4);
             }
         }
-        catch (const std::exception& e) {
-            LogMessage("[Free] 释放过程异常: %p, 错误=%s", ptr, e.what());
-        }
-        catch (...) {
-            LogMessage("[Free] 释放过程未知异常: %p", ptr);
-        }
-
-        return 1;
     }
-    else {
-        // 不是我们的块，使用Storm释放
-        return s_origStormFree(a1, name, argList, a4);
-    }
+    return 1;
 }
+
+// 主函数仅作 SEH 捕获的包装，不含需要析构的 C++ 对象
+int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4)
+{
+    if (!a1)
+        return 1;
+
+    void* ptr = reinterpret_cast<void*>(a1);
+    int result = 0;
+
+    __try {
+        // 仅调用不含非平凡局部对象的辅助函数
+        result = DoHooked_Storm_MemFree(a1, name, argList, a4);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // 捕获异常后记录信息，并交由原始函数处理
+        LogMessage("[Free] 异常处理块: %p，交给Storm处理，异常代码: 0x%x",
+            ptr, GetExceptionCode());
+        result = s_origStormFree(a1, name, argList, a4);
+    }
+
+    return result;
+}
+
 
 // Hook: SMemReAlloc - 处理重分配
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
@@ -1287,17 +1261,6 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
     bool isOurOldBlock = IsOurBlock(oldPtr);
     bool shouldUseManagedPool = (newSize >= g_bigThreshold.load()) ||
         IsSpecialBlockAllocation(newSize, name, src_line);
-
-    // 特殊处理：地形和模型资源
-    if (name && (
-        strstr(name, "terrain") || strstr(name, "Terrain") ||
-        strstr(name, "model") || strstr(name, "Model"))) {
-        shouldUseManagedPool = true;
-        MemPool::SwitchPoolType(PoolType::TLSF);
-    }
-    else if (shouldUseManagedPool) {
-        MemPool::SwitchPoolType(PoolType::MiMalloc);
-    }
 
     // 情况1: 我们的块重分配为我们的块
     if (isOurOldBlock && shouldUseManagedPool) {
@@ -1578,6 +1541,9 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 
 // 修改InitializeStormMemoryHooks函数
 bool InitializeStormMemoryHooks(PoolType poolType) {
+    // 强制使用TLSF，忽略传入的参数
+    poolType = PoolType::TLSF;
+
     // 初始化日志系统
     if (!LogSystem::GetInstance().Initialize()) {
         printf("[错误] 无法初始化日志系统\n");
@@ -1617,22 +1583,16 @@ bool InitializeStormMemoryHooks(PoolType poolType) {
         return false;
     }
 
-    // 初始化内存池 - 使用提供的池类型
-    if (!MemPool::Initialize(128 * 1024 * 1024)) {
+    // 初始化内存池管理器，并固定使用TLSF
+    if (!MemoryPoolManager::Initialize(64 * 1024 * 1024, PoolType::TLSF)) {
         LogMessage("[Init] 内存池初始化失败");
         return false;
     }
 
-    // 如果需要切换内存池类型
-    if (poolType != PoolType::Default) {
-        if (!MemPool::SwitchPoolType(poolType)) {
-            LogMessage("[Init] 内存池类型切换失败");
-            // 不退出，使用默认
-        }
-    }
+    LogMessage("[Init] 已固定使用TLSF内存池 - 已禁用内存池切换");
 
-    // 创建永久稳定块，使用更广泛的大小分布
-    //CreatePermanentStabilizers(25, "全周期保护");
+    // 创建更少的永久稳定块
+    CreatePermanentStabilizers(8, "全周期保护"); // 减少稳定块数量，原来是25个
 
     // 安装钩子
     DetourTransactionBegin();
@@ -1653,9 +1613,9 @@ bool InitializeStormMemoryHooks(PoolType poolType) {
     Storm_g_DebugHeapPtr = 0;
 
     // 输出初始内存报告
-    //GenerateMemoryReport(true);
+    GenerateMemoryReport(true);
 
-    LogMessage("[Init] Storm内存钩子安装成功！");
+    LogMessage("[Init] Storm内存钩子安装成功！使用固定TLSF内存池");
     return true;
 }
 
