@@ -611,3 +611,17 @@ size_t MemoryPoolManager::GetTotalSize()
 
     return total;
 }
+
+bool MemoryPoolManager::SwitchPoolType(PoolType newType) {
+    // 由于我们只使用TLSF，所以这个函数始终返回true
+    // 如果尝试切换到其他池类型，记录日志但仍继续使用TLSF
+    if (newType != PoolType::TLSF) {
+        LogMessage("[MemoryPoolManager] 当前只支持TLSF内存池，已忽略切换请求");
+    }
+    return true;
+}
+
+PoolType MemoryPoolManager::GetActivePoolType() {
+    // 始终返回TLSF
+    return PoolType::TLSF;
+}

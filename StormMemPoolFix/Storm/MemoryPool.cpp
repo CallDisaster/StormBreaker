@@ -164,5 +164,9 @@ namespace JVM_MemPool {
     }
 } // <-- 添加缺失的右花括号来结束 JVM_MemPool 命名空间
 
+// 在 Storm/MemoryPool.cpp 文件中添加定义
+namespace MemPool {
+    std::atomic<bool> g_inOperation{ false };  // 初始化为false
+}
 // Removed obsolete SmallBlockPool namespace
 // Removed obsolete MemPool namespace and its commented-out code
