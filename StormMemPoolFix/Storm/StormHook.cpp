@@ -2425,99 +2425,87 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
     }
 
     bool shouldTryColdStore = (resourceType == ResourceType::Model || resourceType == ResourceType::Sound)
-                              && (processVirtualMemBytes > COLD_STORAGE_TRIGGER_THRESHOLD) // 使用进程整体虚拟内存判断
-                              && ColdStorage::ColdStorageManager::GetInstance().IsStorageProcessReady(); // 检查存储进程是否就绪
+        && (processVirtualMemBytes > COLD_STORAGE_TRIGGER_THRESHOLD) // 使用进程整体虚拟内存判断
+        && ColdStorage::ColdStorageManager::GetInstance().IsStorageProcessReady(); // 检查存储进程是否就绪
 
     if (shouldTryColdStore) {
-        LogMessage("[ColdStorage] 尝试冷存储: 类型=%d, 大小=%zu, 名称=%s (进程虚拟内存: %zu MB)", (int)resourceType, size, name ? name : "N/A", processVirtualMemBytes / (1024*1024) );
+        LogMessage("[ColdStorage] 尝试冷存储: 类型=%d, 大小=%zu, 名称=%s (进程虚拟内存: %zu MB)",
+            (int)resourceType, size, name ? name : "N/A", processVirtualMemBytes / (1024 * 1024));
 
         // 1. 先按原方式分配内存 (TLSF或Storm)，获取真实指针和内容
-        //    注意：这里我们先分配，再决定是否冷存。也可以反过来，先判断再分配。
-        //    先分配的好处是能拿到实际内容去存储。
         size_t actualAllocatedPtr = 0;
         bool allocatedByTLSF = (size >= g_bigThreshold.load(std::memory_order_relaxed));
         void* realPtr = nullptr; // 指向用户区的真实指针
         void* rawPtr = nullptr;  // 指向分配的原始内存（含头部）
 
         if (allocatedByTLSF) {
-             size_t totalSize = size + sizeof(StormAllocHeader);
-             rawPtr = MemPool::AllocateSafe(totalSize);
-             if (rawPtr) {
-                 realPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
-                 SetupCompatibleHeader(realPtr, size);
-                 actualAllocatedPtr = reinterpret_cast<size_t>(realPtr);
-                 // 记录到 g_bigBlocks 等... (这部分逻辑后面会复用)
-             }
-        } else {
-            actualAllocatedPtr = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
-            if (actualAllocatedPtr) {
-                 realPtr = reinterpret_cast<void*>(actualAllocatedPtr);
-                 // 对于Storm分配的块，我们无法直接获取rawPtr，但可以传递userPtr
-                 rawPtr = realPtr; // 假设rawPtr就是userPtr，因为我们无法访问Storm头部
+            size_t totalSize = size + sizeof(StormAllocHeader);
+            rawPtr = MemPool::AllocateSafe(totalSize);
+            if (rawPtr) {
+                realPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
+                SetupCompatibleHeader(realPtr, size);
+                actualAllocatedPtr = reinterpret_cast<size_t>(realPtr);
             }
         }
-
+        else {
+            actualAllocatedPtr = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
+            if (actualAllocatedPtr) {
+                realPtr = reinterpret_cast<void*>(actualAllocatedPtr);
+                // 对于Storm分配的块，我们无法直接获取rawPtr
+                rawPtr = realPtr;  // 假设rawPtr就是userPtr
+            }
+        }
 
         if (actualAllocatedPtr != 0 && realPtr != nullptr) {
             // 2. 尝试将分配到的内存块发送到存储进程
             ColdStorage::BlockID blockId = ColdStorage::ColdStorageManager::GetInstance().StoreBlock(realPtr, size);
 
             if (blockId != ColdStorage::INVALID_BLOCK_ID) {
-                // 3. 冷存储成功！
-                LogMessage("[ColdStorage] 冷存储成功: ID=%llu, 原始指针=%p", blockId, realPtr);
-
-                // 生成唯一的标记指针
-                size_t markerOffset = g_nextColdStorageMarkerOffset.fetch_add(1);
-                size_t markerPtrValue = COLD_STORAGE_MARKER_BASE + markerOffset;
-                void* markerPtr = reinterpret_cast<void*>(markerPtrValue);
-
-                // 记录映射关系
-                {
-                    std::lock_guard<std::mutex> lock(g_coldStorageMapMutex);
-                    g_coldStorageMap[markerPtrValue] = blockId;
-                }
+                // 3. 冷存储成功！获取代理指针
 
                 // 4. 释放刚刚在主进程分配的物理内存 (非常重要!)
                 if (allocatedByTLSF && rawPtr) {
-                     // 对于TLSF块，我们有rawPtr，可以安全释放
-                     MemPool::FreeSafe(rawPtr); // 释放原始块
-                     // 从 g_bigBlocks 中移除刚才添加的记录 (如果添加了的话)
-                     g_bigBlocks.erase(realPtr);
-                } else if (!allocatedByTLSF) {
-                    // 对于Storm分配的块，我们没有rawPtr，不能直接调用MemPool::FreeSafe
-                    // 需要调用原始Storm Free
-                    s_origStormFree(static_cast<int>(actualAllocatedPtr), const_cast<char*>(name), src_line, flag); // <--- Cast name to char*
+                    // 对于TLSF块，我们有rawPtr，可以安全释放
+                    MemPool::FreeSafe(rawPtr); // 释放原始块
+                    // 从 g_bigBlocks 中移除刚才添加的记录 (如果添加了的话)
+                    g_bigBlocks.erase(realPtr);
                 }
-                 g_memStats.OnFree(size); // 修正统计，因为我们释放了刚分配的
+                else if (!allocatedByTLSF) {
+                    // 对于Storm分配的块，调用原始Storm Free
+                    s_origStormFree(static_cast<int>(actualAllocatedPtr), const_cast<char*>(name), src_line, flag);
+                }
+                g_memStats.OnFree(size); // 修正统计，因为我们释放了刚分配的
 
-                LogMessage("[ColdStorage] 返回标记指针: %p (对应BlockID: %llu)", markerPtr, blockId);
-                return markerPtrValue; // 返回标记指针
-
-            } else {
+                // 返回刚才创建的代理指针，相当于：
+                // void* proxyPtr = ... 从StoreBlock返回的值 ...
+                // return reinterpret_cast<size_t>(proxyPtr);
+                return static_cast<size_t>(blockId);
+            }
+            else {
                 // 冷存储失败，按原逻辑处理 (继续使用刚才分配的 realPtr)
                 LogMessage("[ColdStorage] 冷存储失败，使用本地内存: %p", realPtr);
-                 if (allocatedByTLSF && rawPtr) {
-                     // 如果是TLSF分配失败，需要记录到 g_bigBlocks
-                     BigBlockInfo info;
-                     info.rawPtr = rawPtr;
-                     info.size = size;
-                     info.timestamp = GetTickCount();
-                     info.source = name ? _strdup(name) : nullptr;
-                     info.srcLine = src_line;
-                     info.type = resourceType;
-                     g_bigBlocks.insert(realPtr, info);
-                     g_memStats.OnAlloc(size); // 统计分配
-                 } else if (!allocatedByTLSF) {
-                     // Storm分配已在上面完成，统计也应已完成（如果原始分配成功）
-                     if(actualAllocatedPtr) g_memStats.OnAlloc(size);
-                 }
+                if (allocatedByTLSF && rawPtr) {
+                    // 如果是TLSF分配失败，需要记录到 g_bigBlocks
+                    BigBlockInfo info;
+                    info.rawPtr = rawPtr;
+                    info.size = size;
+                    info.timestamp = GetTickCount();
+                    info.source = name ? _strdup(name) : nullptr;
+                    info.srcLine = src_line;
+                    info.type = resourceType;
+                    g_bigBlocks.insert(realPtr, info);
+                    g_memStats.OnAlloc(size); // 统计分配
+                }
+                else if (!allocatedByTLSF) {
+                    // Storm分配已在上面完成，统计也应已完成
+                    if (actualAllocatedPtr) g_memStats.OnAlloc(size);
+                }
                 return actualAllocatedPtr; // 返回真实的指针
             }
         }
         // 如果第一步分配就失败了，直接走后续的原始分配逻辑
     }
     // --- 冷存储逻辑结束 ---
-
 
     // 分配策略：大块使用 TLSF，小块使用 Storm (如果未进行冷存储)
     bool useTLSF = (size >= g_bigThreshold.load(std::memory_order_relaxed));
@@ -2596,33 +2584,18 @@ int __stdcall Hooked_Storm_MemFree(int a1, const char* name, int argList, int a4
     size_t ptrValue = reinterpret_cast<size_t>(ptr);
 
     // --- 冷存储检查 ---
-    if (ptrValue >= COLD_STORAGE_MARKER_BASE && ptrValue < COLD_STORAGE_MARKER_BASE + g_nextColdStorageMarkerOffset.load()) {
-        ColdStorage::BlockID blockId = ColdStorage::INVALID_BLOCK_ID;
-        bool foundInMap = false;
-        {
-            std::lock_guard<std::mutex> lock(g_coldStorageMapMutex);
-            auto it = g_coldStorageMap.find(ptrValue);
-            if (it != g_coldStorageMap.end()) {
-                blockId = it->second;
-                g_coldStorageMap.erase(it);
-                foundInMap = true;
-            }
-        }
+    if (ColdStorage::ColdStorageManager::IsProxyPointer(ptr)) {
+        ColdStorage::BlockID blockId = ColdStorage::ColdStorageManager::GetBlockIdFromProxy(ptr);
+        if (blockId != ColdStorage::INVALID_BLOCK_ID) {
+            LogMessage("[ColdStorage] 释放冷存储代理 %p -> BlockID: %llu", ptr, blockId);
 
-        if (foundInMap && blockId != ColdStorage::INVALID_BLOCK_ID) {
-            LogMessage("[ColdStorage] 检测到冷存储标记指针 %p，请求释放 BlockID: %llu", ptr, blockId);
-            if (ColdStorage::ColdStorageManager::GetInstance().FreeBlock(blockId)) {
-                LogMessage("[ColdStorage] 释放 BlockID: %llu 成功", blockId);
-                return 1;
-            }
-            else {
-                LogMessage("[ColdStorage] 释放 BlockID: %llu 失败", blockId);
-                return 1;
-            }
-        }
-        else {
-            LogMessage("[ColdStorage] 警告：发现疑似冷存储标记指针 %p，但在映射表中未找到记录", ptr);
-            // 继续执行后续的释放逻辑
+            // 释放远程块
+            bool success = ColdStorage::ColdStorageManager::GetInstance().FreeBlock(blockId);
+
+            // 释放本地代理
+            ColdStorage::ColdStorageManager::FreeProxyMemory(ptr);
+
+            return 1; // 返回成功码
         }
     }
     // --- 冷存储检查结束 ---
@@ -2701,108 +2674,113 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
     bool shouldNewPtrBeCold = (newResourceType == ResourceType::Model || newResourceType == ResourceType::Sound)
         && (GetStormVirtualMemoryUsage() > COLD_STORAGE_TRIGGER_THRESHOLD)
         && ColdStorage::ColdStorageManager::GetInstance().IsStorageProcessReady();
-    // ---- 冷存储realloc ----
-    if (isOldPtrCold || shouldNewPtrBeCold) {
-        LogMessage("[ColdStorage] Realloc 涉及冷存储: oldPtr=%p (isCold=%d), newSize=%zu, shouldBeCold=%d",
-            oldPtr, isOldPtrCold, newSize, shouldNewPtrBeCold);
-        ColdStorage::BlockID oldBlockId = ColdStorage::INVALID_BLOCK_ID;
-        if (isOldPtrCold) {
-            std::lock_guard<std::mutex> lock(g_coldStorageMapMutex);
-            auto it = g_coldStorageMap.find(oldPtrValue);
-            if (it != g_coldStorageMap.end()) {
-                oldBlockId = it->second;
+    // --- 冷存储处理 ---
+    if (oldPtr && ColdStorage::ColdStorageManager::IsProxyPointer(oldPtr)) {
+        ColdStorage::BlockID oldBlockId = ColdStorage::ColdStorageManager::GetBlockIdFromProxy(oldPtr);
+        if (oldBlockId != ColdStorage::INVALID_BLOCK_ID) {
+            LogMessage("[ColdStorage] 重分配冷存储代理: %p (BlockID=%llu) -> 新大小=%zu",
+                oldPtr, oldBlockId, newSize);
+
+            if (newSize == 0) {
+                // Free情况 - 同时释放远程块和本地代理
+                ColdStorage::ColdStorageManager::GetInstance().FreeBlock(oldBlockId);
+                ColdStorage::ColdStorageManager::FreeProxyMemory(oldPtr);
+                return nullptr;
             }
-            else {
-                LogMessage("[ColdStorage] Realloc 错误：旧指针 %p 是标记指针但在映射表中未找到！", oldPtr);
+
+            // 从冷存储获取原始数据
+            ColdStorage::ColdStorageProxy* proxy = static_cast<ColdStorage::ColdStorageProxy*>(oldPtr);
+            size_t oldSize = proxy->originalSize;
+
+            // 分配临时缓冲区
+            void* tempBuffer = nullptr;
+            __try {
+                tempBuffer = malloc(oldSize);
+                if (!tempBuffer) {
+                    LogMessage("[ColdStorage] 重分配临时缓冲区分配失败");
+                    return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+                }
+
+                // 取回原始数据
+                auto result = ColdStorage::ColdStorageManager::GetInstance().RetrieveBlock(
+                    oldBlockId, tempBuffer, oldSize);
+
+                if (!result) {
+                    LogMessage("[ColdStorage] 无法取回BlockID=%llu的数据，使用普通重分配", oldBlockId);
+                    free(tempBuffer);
+                    return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+                }
+
+                size_t retrievedSize = result.value();
+
+                // 使用冷存储分配新块
+                ResourceType resourceType = GetResourceType(name);
+                bool shouldUseColdStorage = (resourceType == ResourceType::Model ||
+                    resourceType == ResourceType::Sound);
+
+                if (shouldUseColdStorage) {
+                    // 分配新内存
+                    void* newTempBuffer = malloc(newSize);
+                    if (!newTempBuffer) {
+                        free(tempBuffer);
+                        return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+                    }
+
+                    // 复制数据
+                    memcpy(newTempBuffer, tempBuffer, min(retrievedSize, newSize));
+
+                    // 释放旧块
+                    ColdStorage::ColdStorageManager::GetInstance().FreeBlock(oldBlockId);
+
+                    // 存储新块
+                    ColdStorage::BlockID newBlockId =
+                        ColdStorage::ColdStorageManager::GetInstance().StoreBlock(newTempBuffer, newSize);
+
+                    // 释放临时缓冲区
+                    free(tempBuffer);
+                    free(newTempBuffer);
+
+                    if (newBlockId != ColdStorage::INVALID_BLOCK_ID) {
+                        // 更新代理
+                        proxy->blockId = newBlockId;
+                        proxy->originalSize = newSize;
+
+                        // 更新映射
+                        {
+                            std::lock_guard<std::mutex> mapLock(g_proxyMapMutex);
+                            g_proxyToBlockMap[oldPtr] = newBlockId;
+                        }
+
+                        LogMessage("[ColdStorage] 重分配完成: %p (旧ID=%llu -> 新ID=%llu)",
+                            oldPtr, oldBlockId, newBlockId);
+                        return oldPtr; // 返回相同的代理指针
+                    }
+                }
+
+                // 冷存储失败，回退到常规分配
+                void* newPtr = reinterpret_cast<void*>(
+                    Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
+
+                if (newPtr) {
+                    // 复制数据到新内存
+                    memcpy(newPtr, tempBuffer, min(retrievedSize, newSize));
+
+                    // 释放旧块和代理
+                    ColdStorage::ColdStorageManager::GetInstance().FreeBlock(oldBlockId);
+                    ColdStorage::ColdStorageManager::FreeProxyMemory(oldPtr);
+                }
+
+                free(tempBuffer);
+                return newPtr;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                if (tempBuffer) free(tempBuffer);
+                LogMessage("[ColdStorage] 重分配过程中发生异常，回退到普通重分配");
                 return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
             }
         }
-        // ---- 冷->冷 ----
-        if (isOldPtrCold && shouldNewPtrBeCold) {
-            std::vector<unsigned char> tempBuffer;
-            std::optional<size_t> retrievedSizeOpt = ColdStorage::ColdStorageManager::GetInstance().RetrieveBlock(oldBlockId, nullptr, 0);
-            if (!retrievedSizeOpt)
-                return nullptr;
-            size_t oldSize = retrievedSizeOpt.value();
-            tempBuffer.resize(oldSize);
-            retrievedSizeOpt = ColdStorage::ColdStorageManager::GetInstance().RetrieveBlock(oldBlockId, tempBuffer.data(), oldSize);
-            if (!retrievedSizeOpt || retrievedSizeOpt.value() != oldSize)
-                return nullptr;
-            ColdStorage::ColdStorageManager::GetInstance().FreeBlock(oldBlockId);
-            {
-                std::lock_guard<std::mutex> lock(g_coldStorageMapMutex);
-                g_coldStorageMap.erase(oldPtrValue);
-            }
-            void* dataToStore = nullptr;
-            std::vector<unsigned char> newDataBuffer;
-            if (newSize <= oldSize) {
-                dataToStore = tempBuffer.data();
-            }
-            else {
-                newDataBuffer.resize(newSize);
-                memcpy(newDataBuffer.data(), tempBuffer.data(), oldSize);
-                dataToStore = newDataBuffer.data();
-            }
-            ColdStorage::BlockID newBlockId = ColdStorage::ColdStorageManager::GetInstance().StoreBlock(dataToStore, newSize);
-            if (newBlockId != ColdStorage::INVALID_BLOCK_ID) {
-                size_t markerOffset = g_nextColdStorageMarkerOffset.fetch_add(1);
-                size_t newMarkerPtrValue = COLD_STORAGE_MARKER_BASE + markerOffset;
-                {
-                    std::lock_guard<std::mutex> lock(g_coldStorageMapMutex);
-                    g_coldStorageMap[newMarkerPtrValue] = newBlockId;
-                }
-                return reinterpret_cast<void*>(newMarkerPtrValue);
-            }
-            else {
-                return nullptr;
-            }
-        }
-        // ---- 冷->普通 ----
-        else if (isOldPtrCold && !shouldNewPtrBeCold) {
-            void* newRealPtr = reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
-            if (!newRealPtr)
-                return nullptr;
-            std::optional<size_t> retrievedSizeOpt = ColdStorage::ColdStorageManager::GetInstance().RetrieveBlock(oldBlockId, newRealPtr, newSize);
-            if (!retrievedSizeOpt) {
-                Hooked_Storm_MemFree(reinterpret_cast<int>(newRealPtr), const_cast<char*>(name), src_line, flag);
-                return nullptr;
-            }
-            ColdStorage::ColdStorageManager::GetInstance().FreeBlock(oldBlockId);
-            {
-                std::lock_guard<std::mutex> lock(g_coldStorageMapMutex);
-                g_coldStorageMap.erase(oldPtrValue);
-            }
-            return newRealPtr;
-        }
-        // ---- 普通->冷 ----
-        else if (!isOldPtrCold && shouldNewPtrBeCold) {
-            void* tempNewPtr = nullptr;
-            if (!SafeOrigAlloc(ecx, edx, newSize, name, src_line, flag, &tempNewPtr) || !tempNewPtr)
-                return nullptr;
-            g_memStats.OnAlloc(newSize);
-            size_t oldSize = GetBlockSize(oldPtr);
-            if (oldSize == 0)
-                oldSize = newSize;
-            SafeMemCopy(tempNewPtr, oldPtr, min(oldSize, newSize));
-            ColdStorage::BlockID newBlockId = ColdStorage::ColdStorageManager::GetInstance().StoreBlock(tempNewPtr, newSize);
-            s_origStormFree(reinterpret_cast<int>(tempNewPtr), name, src_line, flag);
-            g_memStats.OnFree(newSize);
-            if (newBlockId != ColdStorage::INVALID_BLOCK_ID) {
-                Hooked_Storm_MemFree(reinterpret_cast<int>(oldPtr), name, src_line, flag);
-                size_t markerOffset = g_nextColdStorageMarkerOffset.fetch_add(1);
-                size_t newMarkerPtrValue = COLD_STORAGE_MARKER_BASE + markerOffset;
-                {
-                    std::lock_guard<std::mutex> lock(g_coldStorageMapMutex);
-                    g_coldStorageMap[newMarkerPtrValue] = newBlockId;
-                }
-                return reinterpret_cast<void*>(newMarkerPtrValue);
-            }
-            else {
-                return nullptr;
-            }
-        }
     }
-    // --- 冷存储逻辑结束 ---
+    // --- 冷存储处理结束 ---
     bool isOurOldBlock = false;
     bool shouldUseTLSF = false;
     bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire);

@@ -7,16 +7,18 @@ namespace ColdStorage {
 
 // --- 常量定义 ---
 
-// 共享内存名称 (确保唯一性) - 移除 Global\\ 前缀
-constexpr const wchar_t* SHARED_MEM_NAME = L"StormColdStorageSharedMem_v1";
-// 命令队列信号量名称 - 移除 Global\\ 前缀
-constexpr const wchar_t* CMD_QUEUE_SEM_NAME = L"StormColdStorageCmdSem_v1";
-// 响应信号量名称 - 移除 Global\\ 前缀
-constexpr const wchar_t* RESP_SEM_NAME = L"StormColdStorageRespSem_v1";
-// 共享内存互斥体名称 - 移除 Global\\ 前缀
-constexpr const wchar_t* SHARED_MEM_MUTEX_NAME = L"StormColdStorageMutex_v1";
-// 存储进程启动事件名称 - 移除 Global\\ 前缀
-constexpr const wchar_t* STORAGE_PROCESS_READY_EVENT_NAME = L"StormColdStorageReadyEvent_v1";
+// Common.h 中的命名空间对象调整
+
+// 共享内存名称 (确保唯一性)
+    constexpr const wchar_t* SHARED_MEM_NAME = L"Global\\StormColdStorageSharedMem_v1";
+    // 命令队列信号量名称
+    constexpr const wchar_t* CMD_QUEUE_SEM_NAME = L"Global\\StormColdStorageCmdSem_v1";
+    // 响应信号量名称
+    constexpr const wchar_t* RESP_SEM_NAME = L"Global\\StormColdStorageRespSem_v1";
+    // 共享内存互斥体名称
+    constexpr const wchar_t* SHARED_MEM_MUTEX_NAME = L"Global\\StormColdStorageMutex_v1";
+    // 存储进程启动事件名称
+    constexpr const wchar_t* STORAGE_PROCESS_READY_EVENT_NAME = L"Global\\StormColdStorageReadyEvent_v1";
 
 
 // 共享内存大小 (例如 64MB，可调整)
