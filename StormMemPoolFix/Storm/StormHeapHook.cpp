@@ -1,4 +1,5 @@
 ﻿#include "pch.h"
+// #include "StormHook.h" // Moved lower
 #include <Windows.h>
 #include <cstdio>
 #include <map>
@@ -9,8 +10,8 @@
 #include <intrin.h>
 #include <unordered_set>
 #include <unordered_map>
-#include "StormOffsets.h"  
-#include "StormHook.h"
+#include "StormOffsets.h"
+#include "StormHook.h" // Include after StormOffsets.h
 #include "MemoryPool.h"
 
 // 当块被 free 后, Storm 通常把头4字节改成 size(WORD) + AlignPadding(BYTE) + Flags(BYTE=2) + pNext
@@ -28,8 +29,9 @@ struct StormFreeBlock
 static std::unordered_map<void*, size_t> g_DecommittedBlocks;
 static std::mutex g_DecommitLock;
 
-//size_t g_freedByAllocHook = 0;
-//size_t g_freedByFreeHook = 0;
+// Define static variables for hook statistics, limiting scope to this file
+std::atomic<size_t> g_freedByAllocHook{ 0 };
+std::atomic<size_t> g_freedByFreeHook{ 0 };
 static size_t g_peakMemoryUsed = 0;
 
 // StormOffsets 里定义的全局:

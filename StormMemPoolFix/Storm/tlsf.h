@@ -39,8 +39,9 @@
 */
 
 #include <stddef.h>
+#include <stdbool.h> // 添加此行以定义 bool 类型
 
-// 小块缓存结构定义
+// 小块缓存结构定义 (注意：这个是旧的全局缓存，保留但可能不再使用)
 #define SMALL_CACHE_SIZE_COUNT 8   // 支持的小块大小类别数量
 #define SMALL_CACHE_COUNT_PER_SIZE 16  // 每个大小缓存的块数量
 
@@ -51,7 +52,7 @@ typedef struct {
     int initialized;
 } small_block_cache_t;
 
-// 全局小块缓存
+// 全局小块缓存 (注意：这个是旧的全局缓存)
 static small_block_cache_t g_small_block_cache;
 
 #if defined(__cplusplus)
@@ -97,7 +98,12 @@ void tlsf_walk_pool(pool_t pool, tlsf_walker walker, void* user);
 int tlsf_check(tlsf_t tlsf);
 int tlsf_check_pool(pool_t pool);
 
-
+/* Thread Cache Functions */
+void InitThreadCache();
+void* AllocateFromCache(size_t size);
+bool TryReturnToCache(void* ptr, size_t size); // bool 类型现在已定义
+void CleanupThreadCache();
+void CleanupAllThreadCaches(); // 新增：清理所有线程缓存
 
 #if defined(__cplusplus)
 };
