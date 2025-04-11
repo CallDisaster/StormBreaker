@@ -47,10 +47,8 @@ namespace ColdStorage {
         }
     }
 
-    // --- 工具方法 - 从代理获取BlockID ---
-    BlockID ColdStorageManager::GetBlockIdFromProxy(void* proxyPtr) {
-        if (!proxyPtr) return INVALID_BLOCK_ID;
-
+    // 辅助函数 - 不含对象展开，可以使用SEH
+    BlockID GetBlockIdFromProxyImpl(void* proxyPtr) {
         __try {
             ColdStorageProxy* proxy = static_cast<ColdStorageProxy*>(proxyPtr);
             if (proxy->magic == COLD_PROXY_MAGIC) {
@@ -59,6 +57,18 @@ namespace ColdStorage {
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             // 异常处理
+        }
+        return INVALID_BLOCK_ID;
+    }
+
+    // 主函数 - 使用辅助函数处理SEH部分
+    BlockID ColdStorageManager::GetBlockIdFromProxy(void* proxyPtr) {
+        if (!proxyPtr) return INVALID_BLOCK_ID;
+
+        // 调用辅助函数进行SEH保护的操作
+        BlockID id = GetBlockIdFromProxyImpl(proxyPtr);
+        if (id != INVALID_BLOCK_ID) {
+            return id;
         }
 
         // 尝试从映射获取
@@ -225,6 +235,17 @@ namespace ColdStorage {
         return success;
     }
 
+
+// 辅助函数处理SEH部分
+    void ReleaseProxyMemorySafe(void* proxyPtr) {
+        __try {
+            VirtualFree(proxyPtr, 0, MEM_RELEASE);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // 忽略异常
+        }
+    }
+
     // --- 关闭 ---
     void ColdStorageManager::Shutdown() {
         if (!m_initialized.exchange(false)) {
@@ -265,37 +286,20 @@ namespace ColdStorage {
             m_pSharedMemHeader = nullptr;
             m_pDataBuffer = nullptr;
         }
-        if (m_hSharedMemFile) {
-            CloseHandle(m_hSharedMemFile);
-            m_hSharedMemFile = NULL;
-        }
-        if (m_hCmdQueueSem) {
-            CloseHandle(m_hCmdQueueSem);
-            m_hCmdQueueSem = NULL;
-        }
-        if (m_hRespSem) {
-            CloseHandle(m_hRespSem);
-            m_hRespSem = NULL;
-        }
-        if (m_hMutex) {
-            CloseHandle(m_hMutex);
-            m_hMutex = NULL;
-        }
-        if (m_hReadyEvent) {
-            CloseHandle(m_hReadyEvent);
-            m_hReadyEvent = NULL;
-        }
+
+        // 清理其他句柄
+        if (m_hSharedMemFile) { CloseHandle(m_hSharedMemFile); m_hSharedMemFile = NULL; }
+        if (m_hCmdQueueSem) { CloseHandle(m_hCmdQueueSem); m_hCmdQueueSem = NULL; }
+        if (m_hRespSem) { CloseHandle(m_hRespSem); m_hRespSem = NULL; }
+        if (m_hMutex) { CloseHandle(m_hMutex); m_hMutex = NULL; }
+        if (m_hReadyEvent) { CloseHandle(m_hReadyEvent); m_hReadyEvent = NULL; }
 
         // 4. 清理代理映射和内存
         {
             std::lock_guard<std::mutex> mapLock(g_proxyMapMutex);
             for (auto const& [proxyPtr, blockId] : g_proxyToBlockMap) {
-                __try {
-                    VirtualFree(proxyPtr, 0, MEM_RELEASE);
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    // 忽略异常
-                }
+                // 使用辅助函数安全释放内存
+                ReleaseProxyMemorySafe(proxyPtr);
             }
             g_proxyToBlockMap.clear();
         }

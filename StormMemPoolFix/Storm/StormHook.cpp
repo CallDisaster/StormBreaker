@@ -33,11 +33,11 @@ MemorySafety& g_MemSafety = MemorySafety::GetInstance();
 
 // --- 冷存储相关全局变量 ---
 namespace { // 使用匿名命名空间限制作用域
-    std::unordered_map<size_t, ColdStorage::BlockID> g_coldStorageMap; // 标记指针 -> BlockID 映射
-    std::mutex g_coldStorageMapMutex;                                 // 保护映射表访问
-    constexpr size_t COLD_STORAGE_MARKER_BASE = 0xDEADB000;           // 冷存储标记指针基址 (选择一个不太可能被使用的地址范围)
-    std::atomic<size_t> g_nextColdStorageMarkerOffset{0};             // 用于生成唯一标记指针的偏移
-    const std::wstring STORAGE_PROCESS_EXECUTABLE_PATH = L"StorageProcess.exe"; // <--- 指向同级目录
+    std::unordered_map<void*, ColdStorage::BlockID> g_proxyToBlockMap; // 标记指针 -> BlockID 映射
+    std::mutex g_proxyMapMutex;                                 // 保护映射表访问
+    constexpr size_t COLD_STORAGE_MARKER_BASE = 0xDEADB000;           // 冷存储标记指针基址
+    std::atomic<size_t> g_nextColdStorageMarkerOffset{ 0 };             // 用于生成唯一标记指针的偏移
+    const std::wstring STORAGE_PROCESS_EXECUTABLE_PATH = L"StorageProcess.exe"; // 指向同级目录
     constexpr size_t COLD_STORAGE_TRIGGER_THRESHOLD = 1024 * 1024 * 500; // 示例：Storm内存占用超过500MB时触发冷存储
 }
 // --------------------------
@@ -1053,6 +1053,43 @@ static bool SafeOrigAlloc(
     }
     *pPtr = ret;
     return success && ret;
+}
+
+// 辅助函数 - 安全检查是否是冷存储代理
+bool IsColdStorageProxyImpl(void* ptr, ColdStorage::BlockID* outBlockId) {
+    __try {
+        ColdStorage::ColdStorageProxy* proxy = static_cast<ColdStorage::ColdStorageProxy*>(ptr);
+        if (proxy->magic == ColdStorage::COLD_PROXY_MAGIC) {
+            if (outBlockId) *outBlockId = proxy->blockId;
+            return true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // 异常处理
+    }
+    return false;
+}
+
+// 辅助函数 - 安全更新代理
+bool UpdateProxySafe(ColdStorage::ColdStorageProxy* proxy, ColdStorage::BlockID newBlockId, size_t newSize) {
+    __try {
+        proxy->blockId = newBlockId;
+        proxy->originalSize = newSize;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 辅助函数 - 安全获取原始大小
+size_t GetOriginalSizeSafe(ColdStorage::ColdStorageProxy* proxy) {
+    __try {
+        return proxy->originalSize;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
 }
 
 
@@ -2668,15 +2705,17 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         Hooked_Storm_MemFree(reinterpret_cast<int>(oldPtr), const_cast<char*>(name), src_line, flag);
         return nullptr;
     }
+
     size_t oldPtrValue = reinterpret_cast<size_t>(oldPtr);
     bool isOldPtrCold = (oldPtrValue >= COLD_STORAGE_MARKER_BASE && oldPtrValue < COLD_STORAGE_MARKER_BASE + g_nextColdStorageMarkerOffset.load());
     ResourceType newResourceType = GetResourceType(name);
     bool shouldNewPtrBeCold = (newResourceType == ResourceType::Model || newResourceType == ResourceType::Sound)
         && (GetStormVirtualMemoryUsage() > COLD_STORAGE_TRIGGER_THRESHOLD)
         && ColdStorage::ColdStorageManager::GetInstance().IsStorageProcessReady();
+
     // --- 冷存储处理 ---
-    if (oldPtr && ColdStorage::ColdStorageManager::IsProxyPointer(oldPtr)) {
-        ColdStorage::BlockID oldBlockId = ColdStorage::ColdStorageManager::GetBlockIdFromProxy(oldPtr);
+    ColdStorage::BlockID oldBlockId = ColdStorage::INVALID_BLOCK_ID;
+    if (oldPtr && IsColdStorageProxyImpl(oldPtr, &oldBlockId)) {
         if (oldBlockId != ColdStorage::INVALID_BLOCK_ID) {
             LogMessage("[ColdStorage] 重分配冷存储代理: %p (BlockID=%llu) -> 新大小=%zu",
                 oldPtr, oldBlockId, newSize);
@@ -2690,11 +2729,11 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 
             // 从冷存储获取原始数据
             ColdStorage::ColdStorageProxy* proxy = static_cast<ColdStorage::ColdStorageProxy*>(oldPtr);
-            size_t oldSize = proxy->originalSize;
+            size_t oldSize = GetOriginalSizeSafe(proxy);
 
             // 分配临时缓冲区
             void* tempBuffer = nullptr;
-            __try {
+            try {
                 tempBuffer = malloc(oldSize);
                 if (!tempBuffer) {
                     LogMessage("[ColdStorage] 重分配临时缓冲区分配失败");
@@ -2742,18 +2781,17 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 
                     if (newBlockId != ColdStorage::INVALID_BLOCK_ID) {
                         // 更新代理
-                        proxy->blockId = newBlockId;
-                        proxy->originalSize = newSize;
+                        if (UpdateProxySafe(proxy, newBlockId, newSize)) {
+                            // 更新映射
+                            {
+                                std::lock_guard<std::mutex> mapLock(g_proxyMapMutex);
+                                g_proxyToBlockMap[oldPtr] = newBlockId;
+                            }
 
-                        // 更新映射
-                        {
-                            std::lock_guard<std::mutex> mapLock(g_proxyMapMutex);
-                            g_proxyToBlockMap[oldPtr] = newBlockId;
+                            LogMessage("[ColdStorage] 重分配完成: %p (旧ID=%llu -> 新ID=%llu)",
+                                oldPtr, oldBlockId, newBlockId);
+                            return oldPtr; // 返回相同的代理指针
                         }
-
-                        LogMessage("[ColdStorage] 重分配完成: %p (旧ID=%llu -> 新ID=%llu)",
-                            oldPtr, oldBlockId, newBlockId);
-                        return oldPtr; // 返回相同的代理指针
                     }
                 }
 
@@ -2773,7 +2811,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
                 free(tempBuffer);
                 return newPtr;
             }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
+            catch (...) {
                 if (tempBuffer) free(tempBuffer);
                 LogMessage("[ColdStorage] 重分配过程中发生异常，回退到普通重分配");
                 return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
