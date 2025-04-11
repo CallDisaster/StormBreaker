@@ -1,11 +1,9 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.12.35527.113
+VisualStudioVersion = 17.13.35919.96 d17.13
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "StormBreaker", "StormMemPoolFix\StormMemPoolFix.vcxproj", "{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}"
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "StorageProcess", "StormMemPoolFix\StorageProcess\StorageProcess.vcxproj", "{7EC9DC8B-EE8A-4548-8002-9ED4AEB6FC5B}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "StorageProcess", "StorageProcess.vcxproj", "{7EC9DC8B-EE8A-4548-8002-9ED4AEB6FC5B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,14 +13,6 @@ Global
 		Release|x86 = Release|x86
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Debug|x64.ActiveCfg = Debug|x64
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Debug|x64.Build.0 = Debug|x64
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Debug|x86.ActiveCfg = Debug|Win32
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Debug|x86.Build.0 = Debug|Win32
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Release|x64.ActiveCfg = Release|x64
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Release|x64.Build.0 = Release|x64
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Release|x86.ActiveCfg = Release|Win32
-		{F1E2F542-0258-4F16-AAF0-B0E75F4E1956}.Release|x86.Build.0 = Release|Win32
 		{7EC9DC8B-EE8A-4548-8002-9ED4AEB6FC5B}.Debug|x64.ActiveCfg = Debug|x64
 		{7EC9DC8B-EE8A-4548-8002-9ED4AEB6FC5B}.Debug|x64.Build.0 = Debug|x64
 		{7EC9DC8B-EE8A-4548-8002-9ED4AEB6FC5B}.Debug|x86.ActiveCfg = Debug|Win32
@@ -34,5 +24,8 @@ Global
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {1F4880A2-4FD4-445F-8256-984070B34F55}
 	EndGlobalSection
 EndGlobal

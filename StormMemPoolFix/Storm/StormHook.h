@@ -83,7 +83,7 @@ struct MemoryStats {
 
 // Storm函数类型定义
 typedef size_t(__fastcall* Storm_MemAlloc_t)(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);
-typedef int(__stdcall* Storm_MemFree_t)(int a1, char* name, int argList, int a4);
+typedef int(__stdcall* Storm_MemFree_t)(int a1,const char* name, int argList, int a4);
 typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, size_t newSize, const char* name, DWORD src_line, DWORD flag);
 typedef void(*StormHeap_CleanupAll_t)();
 
@@ -126,7 +126,7 @@ void SafelyDetachHooks();
 
 // Hook函数声明
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);
-int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4);
+int __stdcall Hooked_Storm_MemFree(int a1,const char* name, int argList, int a4);
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize, const char* name, DWORD src_line, DWORD flag);
 void Hooked_StormHeap_CleanupAll();
 
