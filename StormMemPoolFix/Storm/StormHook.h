@@ -1,4 +1,4 @@
-﻿#pragma once
+﻿#pragma
 #include "pch.h"
 #include "StormOffsets.h"
 #include <Windows.h>
@@ -93,8 +93,8 @@ constexpr DWORD SPECIAL_MARKER = 0xC0DEFEED; // 特殊标记，表明是我们�
 
 // 全局变量声明
 extern std::atomic<size_t> g_bigThreshold;      // 大块阈值
-extern std::mutex g_bigBlocksMutex;
-extern std::unordered_map<void*, BigBlockInfo> g_bigBlocks;
+// extern std::mutex g_bigBlocksMutex; // This seems unused, g_bigBlocks uses its own sharded mutex now.
+// extern std::unordered_map<void*, BigBlockInfo> g_bigBlocks; // This is replaced by BlockInfoShardedMap
 extern MemoryStats g_memStats;
 extern Storm_MemAlloc_t s_origStormAlloc;
 extern Storm_MemFree_t s_origStormFree;
@@ -121,12 +121,15 @@ bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);
 bool IsPermanentBlock(void* ptr);
 ResourceType GetResourceType(const char* name);
 bool AddExtraPool(size_t size, bool callerHasLock = false);
+void SafeExecuteCleanupAll();
+void SafelyDetachHooks();
 
 // Hook函数声明
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);
 int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4);
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize, const char* name, DWORD src_line, DWORD flag);
 void Hooked_StormHeap_CleanupAll();
+
 
 // TLSF内存池封装
 namespace MemPool {
@@ -152,77 +155,21 @@ struct TempStabilizerBlock {
     int ttl;  // 生存周期，按 CleanAll 计数
 };
 
-class LargeBlockCache {
-private:
-    struct CachedBlock {
-        void* ptr;
-        size_t size;
-        DWORD timestamp;
-    };
+// Forward declare classes defined in StormHook.cpp
+class LargeBlockCache;
+class AsyncMemoryReleaser;
+class AllocationProfiler;
+struct BlockInfoShardedMap; // Forward declare the map struct
 
-    std::vector<CachedBlock> m_blocks;
-    mutable std::mutex m_mutex;
-    const size_t MAX_CACHE_SIZE = 10;
-
-public:
-    void* GetBlock(size_t size);
-    void ReleaseBlock(void* ptr, size_t size);
-    size_t GetCacheSize() const;
-};
-
+// Declare global variables as extern
 extern LargeBlockCache g_largeBlockCache;
-
-class AsyncMemoryReleaser {
-private:
-    struct DeferredFree {
-        void* ptr;
-        size_t size;
-        DWORD queueTime;
-    };
-
-    std::queue<DeferredFree> m_queue;
-    mutable std::mutex m_mutex;  // 使用mutable关键字
-    std::thread m_thread;
-    std::atomic<bool> m_shouldExit{ false };
-
-    void WorkerThread();
-
-public:
-    AsyncMemoryReleaser();
-    ~AsyncMemoryReleaser();
-
-    void QueueFree(void* ptr, size_t size);
-    size_t GetQueueSize() const;
-};
-
 extern AsyncMemoryReleaser g_asyncReleaser;
-
-class AllocationProfiler {
-private:
-    struct SizeStats {
-        size_t allocCount;
-        size_t totalSize;
-        DWORD lastAllocTime;
-    };
-
-    std::mutex m_mutex;
-    std::unordered_map<size_t, SizeStats> m_stats;
-    std::vector<size_t> m_hotSizes;
-    DWORD m_lastUpdate;
-
-public:
-    AllocationProfiler();
-
-    void RecordAllocation(size_t size);
-    void UpdateHotSizes();
-    const std::vector<size_t>& GetHotSizes();
-    void PrintStats();
-};
-
 extern AllocationProfiler g_allocProfiler;
+extern BlockInfoShardedMap g_bigBlocks; // Use the sharded map type
+// g_freedByAllocHook and g_freedByFreeHook are now static within StormHeapHook.cpp
+extern std::atomic<size_t> g_freedByFreeHook;
 
 void GenerateMemoryReport(bool forceWrite = false);
 size_t GetStormVirtualMemoryUsage();
 size_t GetTLSFPoolUsage();
 void PrintMemoryStatus();
-

@@ -7,9 +7,6 @@
 #pragma once
 #include "pch.h"
 #include <cstddef>
-// 全局变量
-extern size_t g_freedByAllocHook;
-extern size_t g_freedByFreeHook;
 
 // Storm.dll基址
 extern uintptr_t gStormDllBase;
