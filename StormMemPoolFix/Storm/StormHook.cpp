@@ -14,10 +14,15 @@
 #include "tlsf.h" // 确保包含 tlsf.h
 #include <algorithm>
 #include <Base/MemorySafety.h>
-#include "../Base/Logger.h"
 #include "MemoryPool.h"
 #include <concurrent_queue.h>    // 新增并发队列支持
 #include <condition_variable>    // 新增条件变量支持
+
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <chrono>
+#include <iostream>
 
 // 全局常量定义 - 便于调整性能参数
 constexpr size_t LOCK_SHARD_COUNT = 64;       // 哈希表分片锁数量(增加到64)
@@ -26,7 +31,13 @@ constexpr size_t MAX_CACHE_BLOCKS = 16;       // 增大缓存块上限
 constexpr size_t BATCH_PROCESS_SIZE = 128;    // 批处理大小
 constexpr size_t ASYNC_QUEUE_CAPACITY = 4096; // 异步队列容量
 
+// 当前内存跟踪级别
+static std::atomic<MemoryTrackingLevel> g_trackingLevel{ MemoryTrackingLevel::Basic };
+
 MemorySafety& g_MemSafety = MemorySafety::GetInstance();
+
+// 全局内存跟踪器实例化
+MemoryTracker g_memoryTracker;
 
 // 特殊块过滤器列表 - 无需修改
 static std::vector<SpecialBlockFilter> g_specialFilters = {
@@ -488,147 +499,70 @@ AsyncMemoryReleaser g_asyncReleaser;
 // 将线程本地缓冲区的定义移到 AsyncMemoryReleaser 构造函数之后，确保 DeferredFree 已定义
 thread_local std::vector<AsyncMemoryReleaser::DeferredFree> AsyncMemoryReleaser::t_localBuffer;
 
-// 优化分配分析器 - 减少锁争用
-class AllocationProfiler {
-private:
-    struct SizeStats {
-        std::atomic<size_t> allocCount{ 0 };
-        std::atomic<size_t> totalSize{ 0 };
-        std::atomic<DWORD> lastAllocTime{ 0 };
-    };
-
-    // 使用哈希表数组分片
-    struct StatsShard {
-        std::mutex mutex;
-        std::unordered_map<size_t, SizeStats> stats;
-    };
-
-    StatsShard m_shards[16]; // 16个分片
-    std::atomic<DWORD> m_lastUpdate{ 0 };
-    std::mutex m_hotSizesMutex;
-    std::vector<size_t> m_hotSizes;
-
-    // 根据大小选择分片
-    size_t getShardIndex(size_t size) const {
-        return (size / 64) % 16;
-    }
-
-public:
-    AllocationProfiler() : m_lastUpdate(0) {}
-
-    void RecordAllocation(size_t size) {
-        // 对于非常频繁的小块分配，使用采样机制减少开销
-        if (size < 64 && (GetTickCount() % 10 != 0)) {
-            return; // 90%的小块分配跳过记录
-        }
-
-        size_t idx = getShardIndex(size);
-        std::lock_guard<std::mutex> lock(m_shards[idx].mutex);
-
-        auto& stats = m_shards[idx].stats[size];
-        stats.allocCount.fetch_add(1, std::memory_order_relaxed);
-        stats.totalSize.fetch_add(size, std::memory_order_relaxed);
-        stats.lastAllocTime.store(GetTickCount(), std::memory_order_relaxed);
-    }
-
-    void UpdateHotSizes() {
-        DWORD now = GetTickCount();
-        DWORD lastUpdate = m_lastUpdate.load(std::memory_order_relaxed);
-
-        if (now - lastUpdate < 60000) {  // 每分钟更新一次
-            return;
-        }
-
-        if (!m_lastUpdate.compare_exchange_strong(lastUpdate, now, std::memory_order_acquire)) {
-            return; // 另一个线程已经开始更新
-        }
-
-        // 收集所有分片的统计数据
-        std::vector<std::pair<size_t, size_t>> allStats; // (size, count)
-
-        for (auto& shard : m_shards) {
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            for (const auto& pair : shard.stats) {
-                allStats.push_back({ pair.first, pair.second.allocCount.load() });
-            }
-        }
-
-        // 按分配次数排序
-        std::sort(allStats.begin(), allStats.end(),
-            [](const auto& a, const auto& b) {
-                return a.second > b.second;
-            });
-
-        // 更新热点大小列表
-        std::lock_guard<std::mutex> lock(m_hotSizesMutex);
-        m_hotSizes.clear();
-        for (size_t i = 0; i < min(size_t(10), allStats.size()); i++) {
-            m_hotSizes.push_back(allStats[i].first);
-        }
-    }
-
-    const std::vector<size_t> GetHotSizes() {
-        std::lock_guard<std::mutex> lock(m_hotSizesMutex);
-        return m_hotSizes; // 返回副本
-    }
-
-    void PrintStats() {
-        LogMessage("[分配分析] 常见分配大小统计:");
-
-        // 收集所有分片的统计数据
-        struct StatEntry {
-            size_t size;
-            size_t count;
-            size_t totalSize;
-        };
-
-        std::vector<StatEntry> allStats;
-
-        for (auto& shard : m_shards) {
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            for (const auto& pair : shard.stats) {
-                allStats.push_back({
-                    pair.first,
-                    pair.second.allocCount.load(),
-                    pair.second.totalSize.load()
-                    });
-            }
-        }
-
-        // 按分配次数排序
-        std::sort(allStats.begin(), allStats.end(),
-            [](const auto& a, const auto& b) {
-                return a.count > b.count;
-            });
-
-        // 输出前10个统计
-        for (size_t i = 0; i < min(size_t(10), allStats.size()); i++) {
-            const auto& entry = allStats[i];
-            LogMessage("  大小: %zu, 次数: %zu, 总内存: %zu KB",
-                entry.size, entry.count, entry.totalSize / 1024);
-        }
-    }
-};
-
-// 定义全局分配分析器 (已在 .h 中声明为 extern)
-AllocationProfiler g_allocProfiler;
-
 ///////////////////////////////////////////////////////////////////////////////
 // 辅助函数
 ///////////////////////////////////////////////////////////////////////////////
 
-// 替换原来的 LogMessage 函数 - 优化实现
-void LogMessage(const char* format, ...) {
-    // 使用线程局部存储来避免频繁分配
-    thread_local char buffer[4096];
+// 设置内存跟踪级别
+void SetMemoryTrackingLevel(MemoryTrackingLevel level) {
+    MemoryTrackingLevel oldLevel = g_trackingLevel.exchange(level);
 
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
+    // 如果从低级别提升到 Detailed 或以上，且统计线程未运行，则启动统计线程
+    if (oldLevel < MemoryTrackingLevel::Detailed &&
+        level >= MemoryTrackingLevel::Detailed &&
+        !g_statsThreadHandle) {
 
-    // 使用日志系统记录，无需修改
-    LogSystem::GetInstance().Log("%s", buffer);
+        HANDLE hThread = CreateThread(nullptr, 0, MemoryStatsThread, nullptr, 0, nullptr);
+        if (hThread) {
+            g_statsThreadHandle = hThread;
+            LOG_INFO("内存统计线程已启动（跟踪级别提升）");
+        }
+    }
+
+    // 如果从高级别降到 Basic 或以下，且统计线程正在运行，则停止统计线程
+    if (oldLevel >= MemoryTrackingLevel::Detailed &&
+        level < MemoryTrackingLevel::Detailed &&
+        g_statsThreadHandle) {
+
+        g_shouldExit.store(true);
+        DWORD waitResult = WaitForSingleObject(g_statsThreadHandle, 1000);
+        if (waitResult != WAIT_OBJECT_0) {
+            LOG_WARNING("统计线程未能在1秒内结束，强制终止");
+            TerminateThread(g_statsThreadHandle, 0);
+        }
+
+        CloseHandle(g_statsThreadHandle);
+        g_statsThreadHandle = NULL;
+        LOG_INFO("内存统计线程已停止（跟踪级别降低）");
+    }
+
+    // 根据级别调整日志系统
+    switch (level) {
+    case MemoryTrackingLevel::None:
+        LogSystem::GetInstance().SetLogLevel(LogLevel::Error);
+        break;
+    case MemoryTrackingLevel::Basic:
+        LogSystem::GetInstance().SetLogLevel(LogLevel::Info);
+        break;
+    case MemoryTrackingLevel::Detailed:
+    case MemoryTrackingLevel::Full:
+        LogSystem::GetInstance().SetLogLevel(LogLevel::Debug);
+        break;
+    }
+
+    LOG_INFO("内存跟踪级别已更改: %d -> %d",
+        static_cast<int>(oldLevel), static_cast<int>(level));
+}
+
+// 获取当前内存跟踪级别
+MemoryTrackingLevel GetMemoryTrackingLevel() {
+    return g_trackingLevel.load();
+}
+
+// 设置大块阈值
+void SetBigBlockThreshold(size_t sizeInBytes) {
+    size_t oldThreshold = g_bigThreshold.exchange(sizeInBytes);
+    LOG_INFO("大块阈值已更改: %zu -> %zu 字节", oldThreshold, sizeInBytes);
 }
 
 // 获取 Storm 虚拟内存占用
@@ -1981,13 +1915,6 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
             continue;
         }
 
-        // 3. 每分钟更新一次分配分析
-        if (currentTime - lastProfileTime > 60000) {
-            g_allocProfiler.UpdateHotSizes();
-            lastProfileTime = currentTime;
-            continue;
-        }
-
         // 4. 每分钟打印一次内存统计
         if (currentTime - lastStatsTime > 60000) {
             // 分配统计打印
@@ -2034,7 +1961,6 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
             }
 
             // 打印分配分析和内存池统计
-            g_allocProfiler.PrintStats();
             MemPool::PrintStats();
 
             lastStatsTime = currentTime;
@@ -2228,10 +2154,8 @@ void CreateStabilizingBlocks(int cleanAllCount) {
 
 // 优化分配钩子
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag) {
-    // 使用采样方式记录分配类型和大小，减少记录开销
-    if (GetTickCount() % 5 == 0) { // 仅记录20%的分配
-        g_allocProfiler.RecordAllocation(size);
-    }
+    // 记录内存分配
+    g_memoryTracker.RecordAlloc(size, name);
 
     // 检查是否在 CleanAll 后的第一次分配
     bool isAfterCleanAll = g_afterCleanAll.exchange(false, std::memory_order_acq_rel);
@@ -2247,6 +2171,9 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
 
     // 检查是否为 JassVM 相关分配 - 使用严格的识别
     if (name && size == 10408 && strstr(name, "Instance.cpp")) {
+        // 先记录分配（仅计数，不累加大小，因为JassVM池会单独记录）
+        g_memoryTracker.RecordAlloc(size, "Instance.cpp", true);
+
         void* jassPtr = JVM_MemPool::Allocate(size);
         if (jassPtr) {
             g_memStats.OnAlloc(size);
@@ -2325,15 +2252,34 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
     }
 }
 
-// 优化释放钩子(续)
 int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     if (!a1) return 1;  // 空指针认为成功
 
     void* ptr = reinterpret_cast<void*>(a1);
 
+    // 获取块信息用于记录
+    size_t blockSize = 0;
+    const char* blockSource = nullptr;
+
+    // 尝试从g_bigBlocks获取块信息
+    BigBlockInfo blockInfo;
+    bool blockFound = g_bigBlocks.find(ptr, blockInfo);
+    if (blockFound) {
+        blockSize = blockInfo.size;
+        blockSource = blockInfo.source;
+    }
+    else {
+        // 尝试使用GetBlockSize获取大小
+        blockSize = GetBlockSize(ptr);
+    }
+
+    // 记录内存释放，使用找到的源信息
+    g_memoryTracker.RecordFree(blockSize, blockSource ? blockSource : name);
+
     // 先检查是否为 JVM_MemPool 指针
     if (JVM_MemPool::IsFromPool(ptr)) {
         // 使用 JVM_MemPool 专用释放
+        g_memoryTracker.RecordFree(10408, "Instance.cpp");
         JVM_MemPool::Free(ptr);
         return 1;
     }
@@ -2346,7 +2292,7 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
         // 先执行最轻量级的检查 - 永久块检查
         permanentBlock = IsPermanentBlock(ptr);
         if (permanentBlock) {
-            return 1; // 假装成功，无需记录日志，减少日志开销
+            return 1; // 假装成功，无需记录日志
         }
 
         // 检查是否为我们管理的块
@@ -2416,10 +2362,6 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
     const char* name, DWORD src_line, DWORD flag)
 {
-    // 使用采样方式记录统计
-    if (GetTickCount() % 5 == 0) {
-        g_allocProfiler.RecordAllocation(newSize);
-    }
 
     // 基本边界情况处理
     if (!oldPtr) {
@@ -2684,6 +2626,34 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 // 钩子安装和初始化
 ///////////////////////////////////////////////////////////////////////////////
 
+// 初始化内存跟踪系统
+bool InitializeMemoryTracking() {
+    // 初始化日志系统
+    if (!LogSystem::GetInstance().Initialize("MemoryTracker.log", LogLevel::Info)) {
+        // 如果无法初始化日志，输出到标准错误
+        std::cerr << "无法初始化日志系统" << std::endl;
+        return false;
+    }
+
+    LOG_INFO("内存跟踪系统初始化开始");
+
+    // 根据跟踪级别决定是否启动统计线程
+    if (g_trackingLevel.load() >= MemoryTrackingLevel::Detailed) {
+        // 创建统计线程
+        HANDLE hThread = CreateThread(nullptr, 0, MemoryStatsThread, nullptr, 0, nullptr);
+        if (hThread) {
+            g_statsThreadHandle = hThread;
+            LOG_INFO("内存统计线程已启动");
+        }
+        else {
+            LOG_WARNING("无法启动内存统计线程");
+        }
+    }
+
+    LOG_INFO("内存跟踪系统初始化完成");
+    return true;
+}
+
 bool InitializeStormMemoryHooks() {
     // 初始化日志系统
     if (!LogSystem::GetInstance().Initialize()) {
@@ -2698,6 +2668,9 @@ bool InitializeStormMemoryHooks() {
         LogMessage("[Init] 内存安全系统初始化失败");
         return false;
     }
+
+    // 记录初始化信息
+    LogMessage("[Init] 内存跟踪系统已启用，将记录所有分配/释放操作");
 
     // 查找Storm.dll基址
     HMODULE stormDll = GetModuleHandleA("Storm.dll");
@@ -2827,6 +2800,34 @@ void StopAllWorkThreads() {
     LogMessage("[关闭] 所有工作线程已停止");
 }
 
+// 关闭内存跟踪系统
+void ShutdownMemoryTracking() {
+    LOG_INFO("内存跟踪系统关闭开始");
+
+    // 生成最终内存报告
+    g_memoryTracker.GenerateReport("FinalMemoryAllocation.log");
+    g_memoryTracker.GenerateMemoryChartReport("FinalMemoryChart.html");
+
+    // 停止统计线程
+    if (g_statsThreadHandle) {
+        // 设置退出标志
+        g_shouldExit.store(true);
+
+        // 等待线程结束
+        DWORD waitResult = WaitForSingleObject(g_statsThreadHandle, 1000);
+        if (waitResult != WAIT_OBJECT_0) {
+            LOG_WARNING("统计线程未能在1秒内结束，强制终止");
+            TerminateThread(g_statsThreadHandle, 0);
+        }
+
+        CloseHandle(g_statsThreadHandle);
+        g_statsThreadHandle = NULL;
+    }
+
+    // 关闭日志系统
+    LogSystem::GetInstance().Shutdown();
+}
+
 // 优化安全卸载钩子函数
 void SafelyDetachHooks() {
     LogMessage("[关闭] 安全卸载钩子...");
@@ -2880,6 +2881,11 @@ void SafelyDetachHooks() {
 // 优化关闭函数
 void ShutdownStormMemoryHooks() {
     LogMessage("[关闭] 退出程序...");
+
+    // 生成内存分配报告
+    LogMessage("[关闭] 正在生成内存分配报告...");
+    g_memoryTracker.GenerateReport("StormMemoryAllocation.log");
+    g_memoryTracker.GenerateMemoryChartReport("MemoryChart.html");
 
     // 1. 标记不安全期开始——必须最先执行
     g_insideUnsafePeriod.store(true, std::memory_order_release);

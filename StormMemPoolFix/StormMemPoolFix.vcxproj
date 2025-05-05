@@ -153,8 +153,9 @@
   <ItemGroup>
     <ClInclude Include="Base\fp_call.h" />
     <ClInclude Include="Base\MemorySafety.h" />
-    <ClInclude Include="Base\Logger.h" />
     <ClInclude Include="framework.h" />
+    <ClInclude Include="Log\LogSystem.h" />
+    <ClInclude Include="Log\MemoryTracker.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
     <ClInclude Include="Storm\StormFileIO.h" />
@@ -166,6 +167,8 @@
   <ItemGroup>
     <ClCompile Include="Base\MemroySafety.cpp" />
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="Log\LogSystem.cpp" />
+    <ClCompile Include="Log\MemoryTracker.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>

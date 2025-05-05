@@ -25,6 +25,12 @@
     <Filter Include="头文件\Base">
       <UniqueIdentifier>{87914a8f-aaf9-459f-ae07-6c18a416f663}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\Log">
+      <UniqueIdentifier>{013e0e8b-8f1b-4103-90ef-310bf1f5525a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Log">
+      <UniqueIdentifier>{2593c254-ec8c-4a54-99ab-f58979e86182}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framework.h">
@@ -51,14 +57,17 @@
     <ClInclude Include="Storm\tlsf.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
-    <ClInclude Include="Base\Logger.h">
-      <Filter>头文件\Base</Filter>
-    </ClInclude>
     <ClInclude Include="Base\MemorySafety.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
     <ClInclude Include="Storm\StormFileIO.h">
       <Filter>头文件\Storm</Filter>
+    </ClInclude>
+    <ClInclude Include="Log\MemoryTracker.h">
+      <Filter>头文件\Log</Filter>
+    </ClInclude>
+    <ClInclude Include="Log\LogSystem.h">
+      <Filter>头文件\Log</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -85,6 +94,12 @@
     </ClCompile>
     <ClCompile Include="Base\MemroySafety.cpp">
       <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Log\MemoryTracker.cpp">
+      <Filter>源文件\Log</Filter>
+    </ClCompile>
+    <ClCompile Include="Log\LogSystem.cpp">
+      <Filter>源文件\Log</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
