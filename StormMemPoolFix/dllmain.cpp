@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <io.h>
 #include <fcntl.h>
-#include <Base/Logger.h>
 #include <Storm/StormHook.h>
 #include <Storm/StormOffsets.h>
 #include <mimalloc.h>

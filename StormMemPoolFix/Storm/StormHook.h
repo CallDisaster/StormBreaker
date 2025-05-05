@@ -10,6 +10,9 @@
 #include <string>
 #include <psapi.h>  // 添加这个头文件
 #include <queue>
+#include <future>
+#include <Log/MemoryTracker.h>
+#include <Log/LogSystem.h>
 #pragma comment(lib, "psapi.lib")
 
 // Storm结构体定义
@@ -23,6 +26,11 @@ struct StormAllocHeader {
 };
 #pragma pack(pop)
 
+extern std::atomic<LogLevel> g_currentLogLevel;
+class AsyncLogger; // Forward declaration
+extern AsyncLogger g_asyncLogger;
+
+
 // 资源类型枚举（用于统计和泄漏分析）
 enum class ResourceType {
     Unknown,
@@ -32,6 +40,14 @@ enum class ResourceType {
     Sound,
     File,
     JassVM
+};
+
+// 控制内存跟踪级别
+enum class MemoryTrackingLevel {
+    None,       // 不跟踪
+    Basic,      // 仅跟踪基础信息
+    Detailed,   // 详细跟踪
+    Full        // 完全跟踪
 };
 
 // 大块内存信息结构
@@ -57,15 +73,6 @@ struct SpecialBlockFilter {
         : size(s), name(n), sourceLine(sl), useCustomPool(ucp) , forceSystemAlloc(fsa){
     }
 };
-
-//namespace JassVMMemory {
-//    void Initialize();
-//    void* Allocate(size_t size, const char* source, int line);
-//    void Free(void* ptr);
-//    void* Realloc(void* ptr, size_t newSize);
-//    bool IsJassVMPtr(void* ptr);
-//    void Shutdown();
-//}
 
 // 内存统计结构
 struct MemoryStats {
@@ -108,6 +115,9 @@ extern std::atomic<bool> g_insideUnsafePeriod; // 新增：标记不安全时期
 extern DWORD g_cleanAllThreadId;
 extern std::atomic<bool> g_disableMemoryReleasing;
 
+// 全局内存跟踪器
+extern MemoryTracker g_memoryTracker;
+
 // 函数声明
 bool InitializeStormMemoryHooks();
 bool HookAllStormHeapFunctions();
@@ -123,6 +133,22 @@ ResourceType GetResourceType(const char* name);
 bool AddExtraPool(size_t size, bool callerHasLock = false);
 void SafeExecuteCleanupAll();
 void SafelyDetachHooks();
+DWORD WINAPI MemoryStatsThread(LPVOID);
+
+// 初始化内存跟踪系统
+bool InitializeMemoryTracking();
+
+// 关闭内存跟踪系统
+void ShutdownMemoryTracking();
+
+// 设置内存跟踪级别
+void SetMemoryTrackingLevel(MemoryTrackingLevel level);
+
+// 获取当前内存跟踪级别
+MemoryTrackingLevel GetMemoryTrackingLevel();
+
+// 手动设置大块阈值（超过此大小的内存块会被TLSF管理）
+void SetBigBlockThreshold(size_t sizeInBytes);
 
 // Hook函数声明
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);
