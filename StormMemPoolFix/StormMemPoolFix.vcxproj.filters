@@ -101,5 +101,8 @@
     <ClCompile Include="Log\LogSystem.cpp">
       <Filter>源文件\Log</Filter>
     </ClCompile>
+    <ClCompile Include="Log\ReportViewer.cpp">
+      <Filter>源文件\Log</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

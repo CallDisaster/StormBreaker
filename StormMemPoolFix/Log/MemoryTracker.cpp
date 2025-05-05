@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+﻿#include "pc#include "pch.h"
 #include "MemoryTracker.h"
 #include <cstdio>
 #include <cstdarg>
@@ -12,15 +12,20 @@
 #include <thread>
 #include <vector>
 #include <map>
+#include <memory>
+#include <ctime>
 #include <Storm/StormHook.h>
+#include <direct.h> // For _mkdir
 
+// 全局实例定义
+MemoryTracker g_memoryTracker;
 std::atomic<LogLevel> g_currentLogLevel{ LogLevel::Info };
 
 // Global log file pointer
 static FILE* g_logFile = nullptr;
 
 // Helper function to open log file
-bool OpenLogFile(const char* filename ="MemoryTracker.log") {
+bool OpenLogFile(const char* filename = "MemoryTracker.log") {
     if (g_logFile)
         return true;
 
@@ -44,6 +49,388 @@ void CloseLogFile() {
         fclose(g_logFile);
         g_logFile = nullptr;
     }
+}
+
+// 生成唯一ID 
+std::string MemoryTracker::GenerateUniqueId() {
+    // 使用当前时间和进程ID生成唯一标识符
+    std::stringstream ss;
+    auto now = std::chrono::system_clock::now();
+    auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
+    auto epoch = now_ms.time_since_epoch();
+    auto value = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
+
+    ss << std::hex << value << "-" << GetCurrentProcessId();
+    return ss.str();
+}
+
+// 初始化内存追踪器
+bool MemoryTracker::Initialize(const char* reportsDir) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 生成新的会话ID
+    m_sessionId = GenerateUniqueId();
+
+    // 设置报告目录
+    m_reportsDirectory = reportsDir ? reportsDir : "MemoryReports";
+
+    // 确保目录存在
+    if (!EnsureDirectoryExists(m_reportsDirectory)) {
+        LogMessage("[MemoryTracker] 无法创建报告目录: %s", m_reportsDirectory.c_str());
+        return false;
+    }
+
+    // 加载现有报告
+    LoadReports(m_reportsDirectory.c_str());
+
+    // 清理旧会话的报告
+    CleanupOldReports();
+
+    LogMessage("[MemoryTracker] 初始化完成，会话ID: %s, 报告目录: %s",
+        m_sessionId.c_str(), m_reportsDirectory.c_str());
+    return true;
+}
+
+// 关闭内存追踪器
+void MemoryTracker::Shutdown() {
+    // 停止定时报告
+    StopPeriodicReporting();
+
+    // 生成最终报告
+    GenerateAndStoreReport();
+
+    LogMessage("[MemoryTracker] 已关闭");
+}
+
+// 开始定时生成报告
+void MemoryTracker::StartPeriodicReporting(unsigned int period_ms) {
+    // 确保之前的线程已经停止
+    StopPeriodicReporting();
+
+    // 重置停止标志
+    m_stopReporting.store(false);
+
+    // 启动新的定时报告线程
+    m_periodicReportThread = std::thread(&MemoryTracker::PeriodicReportThreadFunc, this, period_ms);
+
+    LogMessage("[MemoryTracker] 已启动定时报告，间隔: %u ms", period_ms);
+}
+
+// 停止定时生成报告
+void MemoryTracker::StopPeriodicReporting() {
+    if (m_periodicReportThread.joinable()) {
+        // 设置停止标志
+        m_stopReporting.store(true);
+
+        // 等待线程结束
+        m_periodicReportThread.join();
+
+        LogMessage("[MemoryTracker] 已停止定时报告");
+    }
+}
+
+// 定时报告线程函数
+void MemoryTracker::PeriodicReportThreadFunc(unsigned int period_ms) {
+    while (!m_stopReporting.load()) {
+        // 等待指定时间或直到停止标志被设置
+        for (unsigned int i = 0; i < period_ms / 100 && !m_stopReporting.load(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (m_stopReporting.load()) break;
+
+        // 生成并存储报告
+        try {
+            std::string reportName = m_reportsDirectory + "/MemoryReport_" +
+                GetTimeString() + ".html";
+
+            MemoryReportData reportData = GenerateAndStoreReport(reportName.c_str());
+
+            LogMessage("[MemoryTracker] 定时报告已生成: %s", reportName.c_str());
+        }
+        catch (const std::exception& e) {
+            LogMessage("[MemoryTracker] 生成定时报告时出错: %s", e.what());
+        }
+        catch (...) {
+            LogMessage("[MemoryTracker] 生成定时报告时出现未知错误");
+        }
+    }
+}
+
+// 创建目录
+bool MemoryTracker::EnsureDirectoryExists(const std::string& dirPath) {
+    // 使用_mkdir创建目录
+    int result = _mkdir(dirPath.c_str());
+    return (result == 0 || errno == EEXIST);
+}
+
+// 获取目录下的所有HTML报告文件
+std::vector<std::string> MemoryTracker::GetReportFiles(const std::string& directory) {
+    std::vector<std::string> files;
+
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind;
+
+    std::string searchPath = directory + "/*.html";
+    hFind = FindFirstFileA(searchPath.c_str(), &findData);
+
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            // 排除. 和 ..
+            if (strcmp(findData.cFileName, ".") != 0 && strcmp(findData.cFileName, "..") != 0) {
+                std::string fullPath = directory + "/" + findData.cFileName;
+                files.push_back(fullPath);
+            }
+        } while (FindNextFileA(hFind, &findData) != 0);
+
+        FindClose(hFind);
+    }
+
+    return files;
+}
+
+// 清除非当前会话的报告
+void MemoryTracker::CleanupOldReports() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 获取当前目录下的所有HTML文件
+    std::vector<std::string> files = GetReportFiles(m_reportsDirectory);
+
+    // 遍历所有文件，删除非当前会话的报告
+    for (const auto& file : files) {
+        MemoryReportData reportData;
+        if (ParseReportData(file, reportData)) {
+            if (reportData.sessionId != m_sessionId) {
+                // 删除文件
+                if (DeleteFileA(file.c_str())) {
+                    LogMessage("[MemoryTracker] 已删除旧会话报告: %s", file.c_str());
+                }
+                else {
+                    LogMessage("[MemoryTracker] 无法删除旧会话报告: %s, 错误码: %d",
+                        file.c_str(), GetLastError());
+                }
+            }
+        }
+    }
+
+    // 重新加载报告
+    LoadReports(m_reportsDirectory.c_str());
+}
+
+// 从目录中加载所有历史报告数据
+bool MemoryTracker::LoadReports(const char* directory) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 清空历史记录
+    m_reportHistory.clear();
+
+    // 使用指定目录或默认目录
+    std::string dirPath = directory ? directory : m_reportsDirectory;
+
+    // 获取所有HTML文件
+    std::vector<std::string> files = GetReportFiles(dirPath);
+
+    // 解析每个文件并加载数据
+    for (const auto& file : files) {
+        MemoryReportData reportData;
+        if (ParseReportData(file, reportData)) {
+            // 只存储当前会话的报告
+            if (reportData.sessionId == m_sessionId) {
+                m_reportHistory.push_back(reportData);
+            }
+        }
+    }
+
+    // 按时间排序
+    std::sort(m_reportHistory.begin(), m_reportHistory.end(),
+        [](const MemoryReportData& a, const MemoryReportData& b) {
+            return a.timestamp < b.timestamp;
+        });
+
+    LogMessage("[MemoryTracker] 已加载 %zu 个当前会话的报告", m_reportHistory.size());
+    return true;
+}
+
+// 解析HTML报告中的数据
+bool MemoryTracker::ParseReportData(const std::string& filePath, MemoryReportData& reportData) {
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    // 初始化为无效数据
+    reportData = MemoryReportData();
+    reportData.reportPath = filePath;
+
+    std::string line;
+    bool foundSessionId = false;
+    bool foundTimestamp = false;
+
+    // 查找会话ID和时间戳
+    while (std::getline(file, line) && (!foundSessionId || !foundTimestamp)) {
+        // 查找会话ID
+        size_t sessionPos = line.find("data-session-id=\"");
+        if (!foundSessionId && sessionPos != std::string::npos) {
+            sessionPos += 16; // "data-session-id=\"" 的长度
+            size_t endPos = line.find("\"", sessionPos);
+            if (endPos != std::string::npos) {
+                reportData.sessionId = line.substr(sessionPos, endPos - sessionPos);
+                foundSessionId = true;
+            }
+        }
+
+        // 查找时间戳
+        size_t timestampPos = line.find("data-timestamp=\"");
+        if (!foundTimestamp && timestampPos != std::string::npos) {
+            timestampPos += 16; // "data-timestamp=\"" 的长度
+            size_t endPos = line.find("\"", timestampPos);
+            if (endPos != std::string::npos) {
+                reportData.timestamp = line.substr(timestampPos, endPos - timestampPos);
+                foundTimestamp = true;
+            }
+        }
+
+        // 查找总分配次数
+        size_t allocCountPos = line.find("data-total-alloc-count=\"");
+        if (allocCountPos != std::string::npos) {
+            allocCountPos += 23; // "data-total-alloc-count=\"" 的长度
+            size_t endPos = line.find("\"", allocCountPos);
+            if (endPos != std::string::npos) {
+                reportData.totalAllocations = std::stoull(line.substr(allocCountPos, endPos - allocCountPos));
+            }
+        }
+
+        // 查找总释放次数
+        size_t freeCountPos = line.find("data-total-free-count=\"");
+        if (freeCountPos != std::string::npos) {
+            freeCountPos += 22; // "data-total-free-count=\"" 的长度
+            size_t endPos = line.find("\"", freeCountPos);
+            if (endPos != std::string::npos) {
+                reportData.totalFrees = std::stoull(line.substr(freeCountPos, endPos - freeCountPos));
+            }
+        }
+
+        // 查找未释放数量
+        size_t unreleasedPos = line.find("data-unreleased-count=\"");
+        if (unreleasedPos != std::string::npos) {
+            unreleasedPos += 23; // "data-unreleased-count=\"" 的长度
+            size_t endPos = line.find("\"", unreleasedPos);
+            if (endPos != std::string::npos) {
+                reportData.unreleased = std::stoull(line.substr(unreleasedPos, endPos - unreleasedPos));
+            }
+        }
+
+        // 查找总分配内存
+        size_t allocSizePos = line.find("data-total-alloc-mb=\"");
+        if (allocSizePos != std::string::npos) {
+            allocSizePos += 21; // "data-total-alloc-mb=\"" 的长度
+            size_t endPos = line.find("\"", allocSizePos);
+            if (endPos != std::string::npos) {
+                reportData.totalAllocatedMB = std::stod(line.substr(allocSizePos, endPos - allocSizePos));
+            }
+        }
+
+        // 查找总释放内存
+        size_t freeSizePos = line.find("data-total-free-mb=\"");
+        if (freeSizePos != std::string::npos) {
+            freeSizePos += 20; // "data-total-free-mb=\"" 的长度
+            size_t endPos = line.find("\"", freeSizePos);
+            if (endPos != std::string::npos) {
+                reportData.totalFreedMB = std::stod(line.substr(freeSizePos, endPos - freeSizePos));
+            }
+        }
+
+        // 查找泄漏内存
+        size_t leakSizePos = line.find("data-leaked-mb=\"");
+        if (leakSizePos != std::string::npos) {
+            leakSizePos += 16; // "data-leaked-mb=\"" 的长度
+            size_t endPos = line.find("\"", leakSizePos);
+            if (endPos != std::string::npos) {
+                reportData.leakedMemoryMB = std::stod(line.substr(leakSizePos, endPos - leakSizePos));
+            }
+        }
+    }
+
+    // 如果缺少关键数据，视为解析失败
+    if (!foundSessionId || !foundTimestamp) {
+        return false;
+    }
+
+    return true;
+}
+
+// 生成报告并存储数据到历史记录
+MemoryReportData MemoryTracker::GenerateAndStoreReport(const char* filename) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 准备报告数据
+    MemoryReportData reportData;
+    reportData.sessionId = m_sessionId;
+    reportData.timestamp = GetTimeString();
+
+    // 计算统计数据
+    size_t totalAlloc = 0;
+    size_t totalFree = 0;
+    size_t totalUnreleased = 0;
+    size_t totalAllocBytes = 0;
+    size_t totalFreeBytes = 0;
+    size_t totalLeakBytes = 0;
+
+    for (const auto& pair : m_records) {
+        const auto& record = pair.second;
+
+        totalAlloc += record.GetAllocCount();
+        totalFree += record.GetFreeCount();
+        totalUnreleased += record.GetUnreleasedCount();
+        totalAllocBytes += record.GetTotalAllocSize();
+        totalFreeBytes += record.GetTotalFreeSize();
+        totalLeakBytes += record.GetUnreleasedMemory();
+
+        // 解析类型名称
+        std::string key = pair.first;
+        size_t delimPos = key.find('_');
+        if (delimPos != std::string::npos) {
+            std::string typeName = key.substr(delimPos + 1);
+            double sizeMB = (double)record.GetTotalAllocSize() / (1024 * 1024);
+
+            // 累加同类型的分配内存
+            reportData.typeAllocation[typeName] += sizeMB;
+        }
+    }
+
+    // 保存统计数据
+    reportData.totalAllocations = totalAlloc;
+    reportData.totalFrees = totalFree;
+    reportData.unreleased = totalUnreleased;
+    reportData.totalAllocatedMB = (double)totalAllocBytes / (1024 * 1024);
+    reportData.totalFreedMB = (double)totalFreeBytes / (1024 * 1024);
+    reportData.leakedMemoryMB = (double)totalLeakBytes / (1024 * 1024);
+
+    // 生成报告文件
+    std::string reportPath;
+    if (filename) {
+        reportPath = filename;
+    }
+    else {
+        // 默认文件名
+        reportPath = m_reportsDirectory + "/MemoryReport_" + reportData.timestamp + ".html";
+    }
+
+    reportData.reportPath = reportPath;
+
+    // 存储到历史记录
+    m_reportHistory.push_back(reportData);
+
+    // 按时间排序
+    std::sort(m_reportHistory.begin(), m_reportHistory.end(),
+        [](const MemoryReportData& a, const MemoryReportData& b) {
+            return a.timestamp < b.timestamp;
+        });
+
+    // 生成HTML报告
+    GenerateBootstrapHtmlReport(reportPath.c_str(), m_records, m_reportHistory.size() > 1);
+
+    return reportData;
 }
 
 // MemoryTracker implementation
@@ -200,6 +587,7 @@ void MemoryTracker::GenerateReport(const char* filename) {
     // Write report header
     report << "==================== Storm Memory Allocation Report ====================" << std::endl;
     report << "Generated at: " << GetTimeString() << std::endl;
+    report << "Session ID: " << m_sessionId << std::endl;
     report << "=" << std::string(60, '=') << "=" << std::endl;
     report << std::left << std::setw(40) << "Allocation Type" << " | "
         << std::right << std::setw(10) << "Size(bytes)" << " | "
@@ -331,19 +719,29 @@ void MemoryTracker::GenerateReport(const char* filename) {
 }
 
 // Generate HTML chart memory report
-void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
+void MemoryTracker::GenerateMemoryChartReport(const char* filename, bool compareWithPrevious) {
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 使用新的Bootstrap报告生成
+    GenerateBootstrapHtmlReport(filename, m_records, compareWithPrevious);
+
+    LogMessage("[MemoryTracker] 内存图表报告已生成: %s", filename);
+}
+
+// ======== Bootstrap HTML Report Generation ========
+void MemoryTracker::GenerateBootstrapHtmlReport(
+    const char* filename,
+    const std::unordered_map<std::string, MemoryTrackRecord>& records,
+    bool compareWithPrevious) {
 
     // Open HTML file
     std::ofstream report(filename);
     if (!report.is_open()) {
-        LogMessage("[MemoryTracker] Cannot create memory report: %s", filename);
+        LogMessage("[MemoryTracker] 无法创建内存报告: %s", filename);
         return;
     }
 
-    LogMessage("[MemoryTracker] Starting to generate memory report...");
-
-    // ==== Data preprocessing - do most calculations in C++ ====
+    // ==== 数据预处理 ====
     size_t totalAlloc = 0;
     size_t totalFree = 0;
     size_t totalUnreleased = 0;
@@ -351,7 +749,7 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
     size_t totalFreeBytes = 0;
     size_t totalLeakBytes = 0;
 
-    // Type statistics structure
+    // 类型统计结构
     struct TypeStats {
         std::string name;
         size_t size;
@@ -364,9 +762,11 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
         size_t peakAlloc;
     };
 
-    // Collect and preprocess data
     std::vector<TypeStats> allStats;
-    for (const auto& pair : m_records) {
+    std::map<std::string, double> typeAllocation; // 按类型分组的分配
+
+    // 处理所有记录
+    for (const auto& pair : records) {
         std::string key = pair.first;
         size_t underscorePos = key.find('_');
         std::string sizeStr = key.substr(0, underscorePos);
@@ -377,7 +777,7 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
         size_t unreleased = record.GetUnreleasedCount();
         size_t leakSize = record.GetUnreleasedMemory();
 
-        // Add to statistics
+        // 添加到统计
         allStats.push_back({
             name,
             size,
@@ -390,7 +790,19 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
             record.peakAlloc
             });
 
-        // Accumulate totals
+        // 统计按类型分组
+        // 从name提取类型（简化版）
+        std::string typeName = name;
+        // 只取第一部分作为类型
+        size_t spacePos = typeName.find(' ');
+        if (spacePos != std::string::npos) {
+            typeName = typeName.substr(0, spacePos);
+        }
+
+        // 累加同类型的分配内存
+        typeAllocation[typeName] += (double)record.totalAllocSize / (1024 * 1024);
+
+        // 累计总数
         totalAlloc += record.allocCount;
         totalFree += record.freeCount;
         totalUnreleased += unreleased;
@@ -399,16 +811,16 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
         totalLeakBytes += leakSize;
     }
 
-    // Sort by allocation size
+    // 按分配大小排序
     std::sort(allStats.begin(), allStats.end(), [](const auto& a, const auto& b) {
         return a.allocSize > b.allocSize;
         });
 
-    // Limit to top 1000 records for display to reduce browser load
+    // 限制显示条目数
     const size_t MAX_DISPLAY_RECORDS = 1000;
     if (allStats.size() > MAX_DISPLAY_RECORDS) {
-        // Aggregate remaining data
-        TypeStats otherStats = { "Other Types (Aggregated)", 0, 0, 0, 0, 0, 0, 0, 0 };
+        // 聚合剩余数据
+        TypeStats otherStats = { "其他类型 (汇总)", 0, 0, 0, 0, 0, 0, 0, 0 };
 
         for (size_t i = MAX_DISPLAY_RECORDS; i < allStats.size(); i++) {
             otherStats.allocCount += allStats[i].allocCount;
@@ -420,23 +832,23 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
             otherStats.peakAlloc += allStats[i].peakAlloc;
         }
 
-        // Truncate the list
+        // 截断列表
         allStats.resize(MAX_DISPLAY_RECORDS);
 
-        // Add aggregated entry
+        // 添加聚合条目
         if (otherStats.allocCount > 0) {
             allStats.push_back(otherStats);
         }
     }
 
-    // Get top 10 largest allocations (for chart)
+    // 提取前10大内存分配
     std::vector<TypeStats> top10Stats;
     size_t numTop = min(size_t(10), allStats.size());
     for (size_t i = 0; i < numTop; i++) {
         top10Stats.push_back(allStats[i]);
     }
 
-    // Get top 10 largest memory leaks (for chart)
+    // 提取前10大内存泄漏
     std::vector<TypeStats> top10Leaks;
     std::sort(allStats.begin(), allStats.end(), [](const auto& a, const auto& b) {
         return a.leakSize > b.leakSize;
@@ -449,466 +861,711 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
         }
     }
 
-    // Generate three different sorted JSON data (allocation, free, difference)
-    std::stringstream allocJsonStream;
-    std::stringstream freeJsonStream;
-    std::stringstream diffJsonStream;
-
-    // Sort by allocation size
+    // 按分配大小重新排序
     std::sort(allStats.begin(), allStats.end(), [](const auto& a, const auto& b) {
         return a.allocSize > b.allocSize;
         });
 
-    allocJsonStream << "[";
-    for (size_t i = 0; i < allStats.size(); i++) {
-        const auto& stat = allStats[i];
-        if (i > 0) allocJsonStream << ",";
-        allocJsonStream << "{\"name\":\"" << stat.name << "\",";
-        allocJsonStream << "\"size\":" << stat.size << ",";
-        allocJsonStream << "\"allocCount\":" << stat.allocCount << ",";
-        allocJsonStream << "\"allocSize\":" << (double)stat.allocSize / (1024 * 1024) << ",";
-        allocJsonStream << "\"peakAlloc\":" << stat.peakAlloc << "}";
+    // 获取前一个报告数据进行比较
+    MemoryReportData prevReport;
+    MemoryReportData* prevReportPtr = nullptr;
+
+    if (compareWithPrevious && m_reportHistory.size() > 0) {
+        // 当前报告是最新的，所以取倒数第二个
+        if (m_reportHistory.size() > 1) {
+            prevReport = m_reportHistory[m_reportHistory.size() - 2];
+            prevReportPtr = &prevReport;
+        }
     }
-    allocJsonStream << "]";
 
-    // Sort by free size
-    std::sort(allStats.begin(), allStats.end(), [](const auto& a, const auto& b) {
-        return a.freeSize > b.freeSize;
-        });
+    // ==== 开始生成HTML ====
 
-    freeJsonStream << "[";
-    for (size_t i = 0; i < allStats.size(); i++) {
-        const auto& stat = allStats[i];
-        if (i > 0) freeJsonStream << ",";
-        freeJsonStream << "{\"name\":\"" << stat.name << "\",";
-        freeJsonStream << "\"size\":" << stat.size << ",";
-        freeJsonStream << "\"freeCount\":" << stat.freeCount << ",";
-        freeJsonStream << "\"freeSize\":" << (double)stat.freeSize / (1024 * 1024) << ",";
-        double efficiency = stat.allocSize > 0 ?
-            ((double)stat.freeSize / stat.allocSize) * 100.0 : 0.0;
-        freeJsonStream << "\"efficiency\":" << efficiency << "}";
+    report << "<!DOCTYPE html>\n<html lang=\"zh\">\n<head>\n";
+    report << "  <meta charset=\"UTF-8\">\n";
+    report << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n";
+    report << "  <title>Storm内存分析报告 - " << GetTimeString() << "</title>\n";
+
+    // Bootstrap 5 CSS
+    report << "  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n";
+
+    // Chart.js
+    report << "  <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n";
+
+    // Datatable CSS
+    report << "  <link href=\"https://cdn.datatables.net/1.13.4/css/dataTables.bootstrap5.min.css\" rel=\"stylesheet\">\n";
+
+    // Font Awesome
+    report << "  <link href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\" rel=\"stylesheet\">\n";
+
+    // 添加元数据 (用于报告解析)
+    report << "  <meta data-session-id=\"" << m_sessionId << "\" content=\"\">\n";
+    report << "  <meta data-timestamp=\"" << GetTimeString() << "\" content=\"\">\n";
+    report << "  <meta data-total-alloc-count=\"" << totalAlloc << "\" content=\"\">\n";
+    report << "  <meta data-total-free-count=\"" << totalFree << "\" content=\"\">\n";
+    report << "  <meta data-unreleased-count=\"" << totalUnreleased << "\" content=\"\">\n";
+    report << "  <meta data-total-alloc-mb=\"" << (double)totalAllocBytes / (1024 * 1024) << "\" content=\"\">\n";
+    report << "  <meta data-total-free-mb=\"" << (double)totalFreeBytes / (1024 * 1024) << "\" content=\"\">\n";
+    report << "  <meta data-leaked-mb=\"" << (double)totalLeakBytes / (1024 * 1024) << "\" content=\"\">\n";
+
+    // 自定义样式
+    report << "  <style>\n";
+    report << "    :root {\n";
+    report << "      --primary-color: #0d6efd;\n";
+    report << "      --secondary-color: #6c757d;\n";
+    report << "      --success-color: #198754;\n";
+    report << "      --danger-color: #dc3545;\n";
+    report << "      --warning-color: #ffc107;\n";
+    report << "      --info-color: #0dcaf0;\n";
+    report << "    }\n";
+    report << "    .trend-up { color: var(--danger-color); }\n";
+    report << "    .trend-down { color: var(--success-color); }\n";
+    report << "    .trend-neutral { color: var(--secondary-color); }\n";
+    report << "    .card-dashboard { transition: all 0.3s ease; }\n";
+    report << "    .card-dashboard:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.1); }\n";
+    report << "    .chart-container { height: 300px; }\n";
+    report << "    .table-responsive { max-height: 600px; }\n";
+    report << "    .fas { margin-right: 5px; }\n";
+    report << "    .navbar-brand img { max-height: 40px; }\n";
+    report << "    body { padding-top: 60px; }\n";
+    report << "  </style>\n";
+    report << "</head>\n";
+
+    report << "<body>\n";
+
+    // 导航栏
+    report << "  <nav class=\"navbar navbar-expand-lg navbar-dark bg-dark fixed-top\">\n";
+    report << "    <div class=\"container-fluid\">\n";
+    report << "      <a class=\"navbar-brand\" href=\"#\">Storm内存追踪器</a>\n";
+    report << "      <button class=\"navbar-toggler\" type=\"button\" data-bs-toggle=\"collapse\" data-bs-target=\"#navbarNav\">\n";
+    report << "        <span class=\"navbar-toggler-icon\"></span>\n";
+    report << "      </button>\n";
+    report << "      <div class=\"collapse navbar-collapse\" id=\"navbarNav\">\n";
+    report << "        <ul class=\"navbar-nav me-auto\">\n";
+    report << "          <li class=\"nav-item\"><a class=\"nav-link active\" href=\"#overview\">概览</a></li>\n";
+    report << "          <li class=\"nav-item\"><a class=\"nav-link\" href=\"#charts\">图表分析</a></li>\n";
+    report << "          <li class=\"nav-item\"><a class=\"nav-link\" href=\"#data-tables\">详细数据</a></li>\n";
+    report << "          <li class=\"nav-item\"><a class=\"nav-link\" href=\"#leaks\">内存泄漏</a></li>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        report << "          <li class=\"nav-item\"><a class=\"nav-link\" href=\"#comparison\">数据对比</a></li>\n";
     }
-    freeJsonStream << "]";
+    report << "        </ul>\n";
+    report << "        <span class=\"navbar-text\">会话ID: " << m_sessionId.substr(0, 8) << "...</span>\n";
+    report << "      </div>\n";
+    report << "    </div>\n";
+    report << "  </nav>\n\n";
 
-    // Sort by unreleased count
+    // 主容器
+    report << "  <div class=\"container-fluid mt-4\">\n";
+
+    // 页面标题和信息
+    report << "    <div class=\"row mb-4\">\n";
+    report << "      <div class=\"col-12\">\n";
+    report << "        <div class=\"card shadow-sm\">\n";
+    report << "          <div class=\"card-body\">\n";
+    report << "            <h1 class=\"card-title\">Storm内存分析报告</h1>\n";
+    report << "            <p class=\"card-text\">生成时间: " << GetTimeString() << "</p>\n";
+    report << "            <p class=\"card-text\">会话ID: " << m_sessionId << "</p>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        report << "            <p class=\"card-text\">与前次报告比较: " << prevReportPtr->timestamp << "</p>\n";
+    }
+    report << "          </div>\n";
+    report << "        </div>\n";
+    report << "      </div>\n";
+    report << "    </div>\n\n";
+
+    // ===== 概览部分 =====
+    report << "    <section id=\"overview\" class=\"mb-5\">\n";
+    report << "      <h2 class=\"mb-4\">内存使用概览</h2>\n";
+    report << "      <div class=\"row g-4\">\n";
+
+    // 总分配次数卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card bg-light text-dark h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-plus-circle\"></i>总分配次数</h5>\n";
+    report << "              <h2>" << totalAlloc << "</h2>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        double allocDiff = (double)totalAlloc - prevReportPtr->totalAllocations;
+        double allocPercent = prevReportPtr->totalAllocations > 0 ?
+            (allocDiff / prevReportPtr->totalAllocations) * 100 : 0;
+
+        report << "              <p class=\"";
+        if (allocDiff > 0) report << "trend-up";
+        else if (allocDiff < 0) report << "trend-down";
+        else report << "trend-neutral";
+        report << "\">";
+
+        if (allocDiff > 0) report << "<i class=\"fas fa-arrow-up\"></i>";
+        else if (allocDiff < 0) report << "<i class=\"fas fa-arrow-down\"></i>";
+        else report << "<i class=\"fas fa-equals\"></i>";
+
+        report << std::fixed << std::setprecision(2) << std::abs(allocPercent) << "% ";
+        report << "(" << (allocDiff > 0 ? "+" : "") << allocDiff << ")</p>\n";
+    }
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 总释放次数卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card bg-light text-dark h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-minus-circle\"></i>总释放次数</h5>\n";
+    report << "              <h2>" << totalFree << "</h2>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        double freeDiff = (double)totalFree - prevReportPtr->totalFrees;
+        double freePercent = prevReportPtr->totalFrees > 0 ?
+            (freeDiff / prevReportPtr->totalFrees) * 100 : 0;
+
+        report << "              <p class=\"";
+        if (freeDiff > 0) report << "trend-up";
+        else if (freeDiff < 0) report << "trend-down";
+        else report << "trend-neutral";
+        report << "\">";
+
+        if (freeDiff > 0) report << "<i class=\"fas fa-arrow-up\"></i>";
+        else if (freeDiff < 0) report << "<i class=\"fas fa-arrow-down\"></i>";
+        else report << "<i class=\"fas fa-equals\"></i>";
+
+        report << std::fixed << std::setprecision(2) << std::abs(freePercent) << "% ";
+        report << "(" << (freeDiff > 0 ? "+" : "") << freeDiff << ")</p>\n";
+    }
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 未释放内存卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card " << (totalUnreleased > 0 ? "bg-warning" : "bg-success") << " text-dark h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-exclamation-triangle\"></i>未释放内存块</h5>\n";
+    report << "              <h2>" << totalUnreleased << "</h2>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        double unreaDiff = (double)totalUnreleased - prevReportPtr->unreleased;
+        double unreaPercent = prevReportPtr->unreleased > 0 ?
+            (unreaDiff / prevReportPtr->unreleased) * 100 : 0;
+
+        report << "              <p class=\"";
+        if (unreaDiff > 0) report << "trend-up";
+        else if (unreaDiff < 0) report << "trend-down";
+        else report << "trend-neutral";
+        report << "\">";
+
+        if (unreaDiff > 0) report << "<i class=\"fas fa-arrow-up\"></i>";
+        else if (unreaDiff < 0) report << "<i class=\"fas fa-arrow-down\"></i>";
+        else report << "<i class=\"fas fa-equals\"></i>";
+
+        report << std::fixed << std::setprecision(2) << std::abs(unreaPercent) << "% ";
+        report << "(" << (unreaDiff > 0 ? "+" : "") << unreaDiff << ")</p>\n";
+    }
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 内存泄漏卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card " << (totalLeakBytes > 0 ? "bg-danger" : "bg-success") << " text-" << (totalLeakBytes > 0 ? "white" : "dark") << " h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-memory\"></i>内存泄漏</h5>\n";
+    report << "              <h2>" << std::fixed << std::setprecision(2) << (double)totalLeakBytes / (1024 * 1024) << " MB</h2>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        double leakDiff = (double)totalLeakBytes / (1024 * 1024) - prevReportPtr->leakedMemoryMB;
+        double leakPercent = prevReportPtr->leakedMemoryMB > 0 ?
+            (leakDiff / prevReportPtr->leakedMemoryMB) * 100 : 0;
+
+        report << "              <p class=\"";
+        // 注意：对于泄漏，增加是负面的，减少是正面的
+        if (leakDiff > 0) report << "text-warning";
+        else if (leakDiff < 0) report << "text-info";
+        else report << "text-light";
+        report << "\">";
+
+        if (leakDiff > 0) report << "<i class=\"fas fa-arrow-up\"></i>";
+        else if (leakDiff < 0) report << "<i class=\"fas fa-arrow-down\"></i>";
+        else report << "<i class=\"fas fa-equals\"></i>";
+
+        report << std::fixed << std::setprecision(2) << std::abs(leakPercent) << "% ";
+        report << "(" << (leakDiff > 0 ? "+" : "") << std::fixed << std::setprecision(2) << leakDiff << " MB)</p>\n";
+    }
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 总分配内存卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card bg-light text-dark h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-chart-area\"></i>总分配内存</h5>\n";
+    report << "              <h2>" << std::fixed << std::setprecision(2) << (double)totalAllocBytes / (1024 * 1024) << " MB</h2>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        double allocMBDiff = (double)totalAllocBytes / (1024 * 1024) - prevReportPtr->totalAllocatedMB;
+        double allocMBPercent = prevReportPtr->totalAllocatedMB > 0 ?
+            (allocMBDiff / prevReportPtr->totalAllocatedMB) * 100 : 0;
+
+        report << "              <p class=\"";
+        if (allocMBDiff > 0) report << "trend-up";
+        else if (allocMBDiff < 0) report << "trend-down";
+        else report << "trend-neutral";
+        report << "\">";
+
+        if (allocMBDiff > 0) report << "<i class=\"fas fa-arrow-up\"></i>";
+        else if (allocMBDiff < 0) report << "<i class=\"fas fa-arrow-down\"></i>";
+        else report << "<i class=\"fas fa-equals\"></i>";
+
+        report << std::fixed << std::setprecision(2) << std::abs(allocMBPercent) << "% ";
+        report << "(" << (allocMBDiff > 0 ? "+" : "") << std::fixed << std::setprecision(2) << allocMBDiff << " MB)</p>\n";
+    }
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 总释放内存卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card bg-light text-dark h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-trash-alt\"></i>总释放内存</h5>\n";
+    report << "              <h2>" << std::fixed << std::setprecision(2) << (double)totalFreeBytes / (1024 * 1024) << " MB</h2>\n";
+    if (compareWithPrevious && prevReportPtr) {
+        double freeMBDiff = (double)totalFreeBytes / (1024 * 1024) - prevReportPtr->totalFreedMB;
+        double freeMBPercent = prevReportPtr->totalFreedMB > 0 ?
+            (freeMBDiff / prevReportPtr->totalFreedMB) * 100 : 0;
+
+        report << "              <p class=\"";
+        if (freeMBDiff > 0) report << "trend-up";
+        else if (freeMBDiff < 0) report << "trend-down";
+        else report << "trend-neutral";
+        report << "\">";
+
+        if (freeMBDiff > 0) report << "<i class=\"fas fa-arrow-up\"></i>";
+        else if (freeMBDiff < 0) report << "<i class=\"fas fa-arrow-down\"></i>";
+        else report << "<i class=\"fas fa-equals\"></i>";
+
+        report << std::fixed << std::setprecision(2) << std::abs(freeMBPercent) << "% ";
+        report << "(" << (freeMBDiff > 0 ? "+" : "") << std::fixed << std::setprecision(2) << freeMBDiff << " MB)</p>\n";
+    }
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 资源数量卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card bg-info text-dark h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-database\"></i>资源类型数量</h5>\n";
+    report << "              <h2>" << typeAllocation.size() << "</h2>\n";
+    report << "              <p>资源类型详情见图表分析</p>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 记录条目数卡片
+    report << "        <div class=\"col-md-6 col-lg-4 col-xl-3\">\n";
+    report << "          <div class=\"card bg-info text-dark h-100 card-dashboard shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <h5 class=\"card-title\"><i class=\"fas fa-list\"></i>记录条目数</h5>\n";
+    report << "              <h2>" << allStats.size() << "</h2>\n";
+    report << "              <p>查看详细表格了解更多</p>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    report << "      </div>\n";
+    report << "    </section>\n\n";
+
+    // ===== 图表部分 =====
+    report << "    <section id=\"charts\" class=\"mb-5\">\n";
+    report << "      <h2 class=\"mb-4\">图表分析</h2>\n";
+
+    // 内存分布图表 & 类型分布饼图
+    report << "      <div class=\"row g-4 mb-4\">\n";
+    report << "        <div class=\"col-md-6\">\n";
+    report << "          <div class=\"card shadow-sm\">\n";
+    report << "            <div class=\"card-header bg-primary text-white\">\n";
+    report << "              <h5 class=\"mb-0\">内存分配/释放分布</h5>\n";
+    report << "            </div>\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <div class=\"chart-container\">\n";
+    report << "                <canvas id=\"memoryDistributionChart\"></canvas>\n";
+    report << "              </div>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    report << "        <div class=\"col-md-6\">\n";
+    report << "          <div class=\"card shadow-sm\">\n";
+    report << "            <div class=\"card-header bg-primary text-white\">\n";
+    report << "              <h5 class=\"mb-0\">资源类型分布</h5>\n";
+    report << "            </div>\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <div class=\"chart-container\">\n";
+    report << "                <canvas id=\"resourceTypeChart\"></canvas>\n";
+    report << "              </div>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+    report << "      </div>\n";
+
+    // Top 10分配 & Top 10泄漏
+    report << "      <div class=\"row g-4\">\n";
+    report << "        <div class=\"col-md-6\">\n";
+    report << "          <div class=\"card shadow-sm\">\n";
+    report << "            <div class=\"card-header bg-primary text-white\">\n";
+    report << "              <h5 class=\"mb-0\">前10大内存消耗</h5>\n";
+    report << "            </div>\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <div class=\"chart-container\">\n";
+    report << "                <canvas id=\"top10Chart\"></canvas>\n";
+    report << "              </div>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    report << "        <div class=\"col-md-6\">\n";
+    report << "          <div class=\"card shadow-sm\">\n";
+    report << "            <div class=\"card-header bg-danger text-white\">\n";
+    report << "              <h5 class=\"mb-0\">前10大内存泄漏</h5>\n";
+    report << "            </div>\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <div class=\"chart-container\">\n";
+    report << "                <canvas id=\"leakChart\"></canvas>\n";
+    report << "              </div>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+    report << "      </div>\n";
+    report << "    </section>\n\n";
+
+    // ===== 对比部分（如果有前一个报告数据）=====
+    if (compareWithPrevious && prevReportPtr) {
+        report << "    <section id=\"comparison\" class=\"mb-5\">\n";
+        report << "      <h2 class=\"mb-4\">与前次报告对比</h2>\n";
+        report << "      <div class=\"card shadow-sm\">\n";
+        report << "        <div class=\"card-header bg-info text-dark\">\n";
+        report << "          <h5 class=\"mb-0\">内存使用变化趋势</h5>\n";
+        report << "        </div>\n";
+        report << "        <div class=\"card-body\">\n";
+        report << "          <div class=\"chart-container\">\n";
+        report << "            <canvas id=\"trendChart\"></canvas>\n";
+        report << "          </div>\n";
+        report << "        </div>\n";
+        report << "      </div>\n";
+        report << "    </section>\n\n";
+    }
+    // ===== 详细数据表格部分 =====
+    report << "    <section id=\"data-tables\" class=\"mb-5\">\n";
+    report << "      <h2 class=\"mb-4\">详细数据</h2>\n";
+
+    // 表格切换标签
+    report << "      <ul class=\"nav nav-tabs mb-4\" id=\"myTab\" role=\"tablist\">\n";
+    report << "        <li class=\"nav-item\" role=\"presentation\">\n";
+    report << "          <button class=\"nav-link active\" id=\"alloc-tab\" data-bs-toggle=\"tab\" data-bs-target=\"#alloc-tab-pane\" type=\"button\">分配表</button>\n";
+    report << "        </li>\n";
+    report << "        <li class=\"nav-item\" role=\"presentation\">\n";
+    report << "          <button class=\"nav-link\" id=\"free-tab\" data-bs-toggle=\"tab\" data-bs-target=\"#free-tab-pane\" type=\"button\">释放表</button>\n";
+    report << "        </li>\n";
+    report << "        <li class=\"nav-item\" role=\"presentation\">\n";
+    report << "          <button class=\"nav-link\" id=\"diff-tab\" data-bs-toggle=\"tab\" data-bs-target=\"#diff-tab-pane\" type=\"button\">差异表</button>\n";
+    report << "        </li>\n";
+    report << "      </ul>\n";
+
+    // 搜索框
+    report << "      <div class=\"row mb-4\">\n";
+    report << "        <div class=\"col-md-12\">\n";
+    report << "          <div class=\"input-group\">\n";
+    report << "            <span class=\"input-group-text\"><i class=\"fas fa-search\"></i></span>\n";
+    report << "            <input type=\"text\" id=\"globalSearchInput\" class=\"form-control\" placeholder=\"在所有表中搜索...\">\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+    report << "      </div>\n";
+
+    // 表格内容
+    report << "      <div class=\"tab-content\" id=\"myTabContent\">\n";
+
+    // 分配表
+    report << "        <div class=\"tab-pane fade show active\" id=\"alloc-tab-pane\" role=\"tabpanel\" aria-labelledby=\"alloc-tab\">\n";
+    report << "          <div class=\"card shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <div class=\"table-responsive\">\n";
+    report << "                <table id=\"allocTable\" class=\"table table-striped table-hover\">\n";
+    report << "                  <thead class=\"table-primary\">\n";
+    report << "                    <tr>\n";
+    report << "                      <th>分配类型</th>\n";
+    report << "                      <th>大小(字节)</th>\n";
+    report << "                      <th>分配次数</th>\n";
+    report << "                      <th>总分配(MB)</th>\n";
+    report << "                      <th>峰值分配</th>\n";
+    report << "                    </tr>\n";
+    report << "                  </thead>\n";
+    report << "                  <tbody id=\"allocTableBody\">\n";
+    report << "                  </tbody>\n";
+    report << "                </table>\n";
+    report << "              </div>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 释放表
+    report << "        <div class=\"tab-pane fade\" id=\"free-tab-pane\" role=\"tabpanel\" aria-labelledby=\"free-tab\">\n";
+    report << "          <div class=\"card shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <div class=\"table-responsive\">\n";
+    report << "                <table id=\"freeTable\" class=\"table table-striped table-hover\">\n";
+    report << "                  <thead class=\"table-primary\">\n";
+    report << "                    <tr>\n";
+    report << "                      <th>分配类型</th>\n";
+    report << "                      <th>大小(字节)</th>\n";
+    report << "                      <th>释放次数</th>\n";
+    report << "                      <th>总释放(MB)</th>\n";
+    report << "                      <th>效率(%)</th>\n";
+    report << "                    </tr>\n";
+    report << "                  </thead>\n";
+    report << "                  <tbody id=\"freeTableBody\">\n";
+    report << "                  </tbody>\n";
+    report << "                </table>\n";
+    report << "              </div>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+
+    // 差异表
+    report << "        <div class=\"tab-pane fade\" id=\"diff-tab-pane\" role=\"tabpanel\" aria-labelledby=\"diff-tab\">\n";
+    report << "          <div class=\"card shadow-sm\">\n";
+    report << "            <div class=\"card-body\">\n";
+    report << "              <div class=\"table-responsive\">\n";
+    report << "                <table id=\"diffTable\" class=\"table table-striped table-hover\">\n";
+    report << "                  <thead class=\"table-primary\">\n";
+    report << "                    <tr>\n";
+    report << "                      <th>分配类型</th>\n";
+    report << "                      <th>大小(字节)</th>\n";
+    report << "                      <th>分配次数</th>\n";
+    report << "                      <th>释放次数</th>\n";
+    report << "                      <th>未释放</th>\n";
+    report << "                      <th>泄漏(MB)</th>\n";
+    report << "                    </tr>\n";
+    report << "                  </thead>\n";
+    report << "                  <tbody id=\"diffTableBody\">\n";
+    report << "                  </tbody>\n";
+    report << "                </table>\n";
+    report << "              </div>\n";
+    report << "            </div>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
+    report << "      </div>\n";
+    report << "    </section>\n\n";
+
+    // ===== 内存泄漏分析部分 =====
+    report << "    <section id=\"leaks\" class=\"mb-5\">\n";
+    report << "      <h2 class=\"mb-4\">内存泄漏分析</h2>\n";
+    report << "      <div class=\"card shadow-sm\">\n";
+    report << "        <div class=\"card-header bg-danger text-white\">\n";
+    report << "          <h5 class=\"mb-0\">潜在内存泄漏点 (最大分配/释放差异)</h5>\n";
+    report << "        </div>\n";
+    report << "        <div class=\"card-body\">\n";
+    report << "          <div class=\"table-responsive\">\n";
+    report << "            <table id=\"leakTable\" class=\"table table-striped table-hover\">\n";
+    report << "              <thead class=\"table-danger\">\n";
+    report << "                <tr>\n";
+    report << "                  <th>分配类型</th>\n";
+    report << "                  <th>大小(字节)</th>\n";
+    report << "                  <th>分配次数</th>\n";
+    report << "                  <th>释放次数</th>\n";
+    report << "                  <th>未释放</th>\n";
+    report << "                  <th>泄漏(MB)</th>\n";
+    report << "                  <th>状态</th>\n";
+    report << "                </tr>\n";
+    report << "              </thead>\n";
+    report << "              <tbody>\n";
+
+    // 排序找出前20大内存泄漏点
     std::sort(allStats.begin(), allStats.end(), [](const auto& a, const auto& b) {
         return a.leakSize > b.leakSize;
         });
 
-    diffJsonStream << "[";
-    for (size_t i = 0; i < allStats.size(); i++) {
-        const auto& stat = allStats[i];
-        if (stat.unreleased == 0) continue; // Skip fully released
+    int leakCount = 0;
+    for (const auto& item : allStats) {
+        // 只显示有泄漏的条目
+        if (item.leakSize == 0) continue;
 
-        if (i > 0 && diffJsonStream.str().length() > 1) diffJsonStream << ",";
-        diffJsonStream << "{\"name\":\"" << stat.name << "\",";
-        diffJsonStream << "\"size\":" << stat.size << ",";
-        diffJsonStream << "\"allocCount\":" << stat.allocCount << ",";
-        diffJsonStream << "\"freeCount\":" << stat.freeCount << ",";
-        diffJsonStream << "\"unreleased\":" << stat.unreleased << ",";
-        diffJsonStream << "\"leakSize\":" << (double)stat.leakSize / (1024 * 1024) << "}";
+        // 计算泄漏百分比
+        double leakRatio = item.allocSize > 0 ?
+            (double)item.leakSize / item.allocSize * 100 : 0;
+
+        // 确定泄漏等级
+        std::string leakStatus;
+        std::string leakClass;
+
+        if (leakRatio > 80) {
+            leakStatus = "严重";
+            leakClass = "bg-danger text-white";
+        }
+        else if (leakRatio > 50) {
+            leakStatus = "高";
+            leakClass = "bg-warning";
+        }
+        else if (leakRatio > 20) {
+            leakStatus = "中";
+            leakClass = "bg-info";
+        }
+        else {
+            leakStatus = "低";
+            leakClass = "bg-success text-white";
+        }
+
+        report << "                <tr>\n";
+        report << "                  <td>" << item.name << "</td>\n";
+        report << "                  <td>" << item.size << "</td>\n";
+        report << "                  <td>" << item.allocCount << "</td>\n";
+        report << "                  <td>" << item.freeCount << "</td>\n";
+        report << "                  <td>" << item.unreleased << "</td>\n";
+        report << "                  <td>" << std::fixed << std::setprecision(2)
+            << (double)item.leakSize / (1024 * 1024) << "</td>\n";
+        report << "                  <td><span class=\"badge " << leakClass << "\">"
+            << leakStatus << "</span></td>\n";
+        report << "                </tr>\n";
+
+        leakCount++;
+        if (leakCount >= 20) break; // 只显示前20条
     }
-    diffJsonStream << "]";
 
-    LogMessage("[MemoryTracker] Data preprocessing complete, generating HTML...");
+    if (leakCount == 0) {
+        report << "                <tr><td colspan=\"7\" class=\"text-center\">没有检测到内存泄漏</td></tr>\n";
+    }
 
-    // ==== Generate HTML content ====
-    report << "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
-    report << "  <meta charset=\"UTF-8\">\n";
-    report << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n";
-    report << "  <title>Storm Memory Analysis Report</title>\n";
-    report << "  <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n";
-    report << "  <style>\n";
-    report << "    :root {\n";
-    report << "      --primary-color: #2c3e50;\n";
-    report << "      --secondary-color: #3498db;\n";
-    report << "      --bg-color: #f8f9fa;\n";
-    report << "      --text-color: #333;\n";
-    report << "      --border-color: #ddd;\n";
-    report << "      --warning-color: #e74c3c;\n";
-    report << "      --success-color: #2ecc71;\n";
-    report << "    }\n";
-    report << "    body {\n";
-    report << "      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;\n";
-    report << "      line-height: 1.6;\n";
-    report << "      color: var(--text-color);\n";
-    report << "      background-color: var(--bg-color);\n";
-    report << "      margin: 0;\n";
-    report << "      padding: 20px;\n";
-    report << "    }\n";
-    report << "    .container {\n";
-    report << "      max-width: 1200px;\n";
-    report << "      margin: 0 auto;\n";
-    report << "    }\n";
-    report << "    header {\n";
-    report << "      background-color: var(--primary-color);\n";
-    report << "      color: white;\n";
-    report << "      padding: 1rem;\n";
-    report << "      border-radius: 5px;\n";
-    report << "      margin-bottom: 2rem;\n";
-    report << "    }\n";
-    report << "    h1, h2, h3 {\n";
-    report << "      margin-top: 0;\n";
-    report << "    }\n";
-    report << "    .chart-container {\n";
-    report << "      background-color: white;\n";
-    report << "      border-radius: 5px;\n";
-    report << "      box-shadow: 0 2px 4px rgba(0,0,0,0.1);\n";
-    report << "      padding: 1rem;\n";
-    report << "      margin-bottom: 2rem;\n";
-    report << "    }\n";
-    report << "    .chart-row {\n";
-    report << "      display: flex;\n";
-    report << "      flex-wrap: wrap;\n";
-    report << "      margin: 0 -15px;\n";
-    report << "    }\n";
-    report << "    .chart-col {\n";
-    report << "      flex: 1;\n";
-    report << "      min-width: 300px;\n";
-    report << "      padding: 0 15px;\n";
-    report << "      margin-bottom: 30px;\n";
-    report << "    }\n";
-    report << "    .chart-title {\n";
-    report << "      padding: 10px;\n";
-    report << "      background-color: var(--primary-color);\n";
-    report << "      color: white;\n";
-    report << "      border-top-left-radius: 5px;\n";
-    report << "      border-top-right-radius: 5px;\n";
-    report << "      margin-bottom: 0;\n";
-    report << "    }\n";
-    report << "    .chart-body {\n";
-    report << "      padding: 15px;\n";
-    report << "      border: 1px solid var(--border-color);\n";
-    report << "      border-top: none;\n";
-    report << "      border-bottom-left-radius: 5px;\n";
-    report << "      border-bottom-right-radius: 5px;\n";
-    report << "    }\n";
-    report << "    .table-container {\n";
-    report << "      max-height: 600px;\n";
-    report << "      overflow-y: auto;\n";
-    report << "      position: relative;\n";
-    report << "    }\n";
-    report << "    table {\n";
-    report << "      width: 100%;\n";
-    report << "      border-collapse: collapse;\n";
-    report << "      margin-top: 1rem;\n";
-    report << "      box-shadow: 0 2px 4px rgba(0,0,0,0.1);\n";
-    report << "    }\n";
-    report << "    th, td {\n";
-    report << "      text-align: left;\n";
-    report << "      padding: 12px 15px;\n";
-    report << "      border-bottom: 1px solid var(--border-color);\n";
-    report << "    }\n";
-    report << "    th {\n";
-    report << "      background-color: var(--primary-color);\n";
-    report << "      color: white;\n";
-    report << "      position: sticky;\n";
-    report << "      top: 0;\n";
-    report << "      z-index: 10;\n";
-    report << "    }\n";
-    report << "    tr:nth-child(even) {\n";
-    report << "      background-color: rgba(0,0,0,0.02);\n";
-    report << "    }\n";
-    report << "    tr:hover {\n";
-    report << "      background-color: rgba(0,0,0,0.05);\n";
-    report << "    }\n";
-    report << "    .warning {\n";
-    report << "      color: var(--warning-color);\n";
-    report << "      font-weight: bold;\n";
-    report << "    }\n";
-    report << "    .summary-box {\n";
-    report << "      display: flex;\n";
-    report << "      flex-wrap: wrap;\n";
-    report << "      margin-bottom: 2rem;\n";
-    report << "    }\n";
-    report << "    .summary-item {\n";
-    report << "      flex: 1;\n";
-    report << "      min-width: 200px;\n";
-    report << "      padding: 1rem;\n";
-    report << "      margin: 10px;\n";
-    report << "      background-color: white;\n";
-    report << "      border-radius: 5px;\n";
-    report << "      box-shadow: 0 2px 4px rgba(0,0,0,0.1);\n";
-    report << "      text-align: center;\n";
-    report << "    }\n";
-    report << "    .summary-number {\n";
-    report << "      font-size: 2.5rem;\n";
-    report << "      font-weight: bold;\n";
-    report << "      margin: 0.5rem 0;\n";
-    report << "      color: var(--secondary-color);\n";
-    report << "    }\n";
-    report << "    .summary-label {\n";
-    report << "      font-size: 1rem;\n";
-    report << "      color: var(--primary-color);\n";
-    report << "    }\n";
-    report << "    .leak-warning {\n";
-    report << "      background-color: var(--warning-color);\n";
-    report << "      color: white;\n";
-    report << "    }\n";
-    report << "    .search-box {\n";
-    report << "      margin-bottom: 1rem;\n";
-    report << "      width: 100%;\n";
-    report << "    }\n";
-    report << "    .search-input {\n";
-    report << "      width: 100%;\n";
-    report << "      padding: 10px;\n";
-    report << "      border: 1px solid var(--border-color);\n";
-    report << "      border-radius: 5px;\n";
-    report << "      font-size: 16px;\n";
-    report << "    }\n";
-    report << "    .tabs {\n";
-    report << "      display: flex;\n";
-    report << "      margin-bottom: 1rem;\n";
-    report << "    }\n";
-    report << "    .tab {\n";
-    report << "      padding: 10px 20px;\n";
-    report << "      background-color: #f1f1f1;\n";
-    report << "      border: 1px solid var(--border-color);\n";
-    report << "      cursor: pointer;\n";
-    report << "      margin-right: 5px;\n";
-    report << "      border-radius: 5px 5px 0 0;\n";
-    report << "    }\n";
-    report << "    .tab.active {\n";
-    report << "      background-color: var(--primary-color);\n";
-    report << "      color: white;\n";
-    report << "      border-bottom: none;\n";
-    report << "    }\n";
-    report << "    .tab-content {\n";
-    report << "      display: none;\n";
-    report << "      padding: 15px;\n";
-    report << "      border: 1px solid var(--border-color);\n";
-    report << "      border-radius: 0 5px 5px 5px;\n";
-    report << "      background-color: white;\n";
-    report << "    }\n";
-    report << "    .tab-content.active {\n";
-    report << "      display: block;\n";
-    report << "    }\n";
-    report << "    .search-highlight {\n";
-    report << "      background-color: yellow;\n";
-    report << "      font-weight: bold;\n";
-    report << "    }\n";
-    report << "    .pagination {\n";
-    report << "      display: flex;\n";
-    report << "      justify-content: center;\n";
-    report << "      margin-top: 15px;\n";
-    report << "    }\n";
-    report << "    .pagination button {\n";
-    report << "      margin: 0 5px;\n";
-    report << "      padding: 5px 10px;\n";
-    report << "      border: 1px solid var(--border-color);\n";
-    report << "      background-color: white;\n";
-    report << "      cursor: pointer;\n";
-    report << "      border-radius: 3px;\n";
-    report << "    }\n";
-    report << "    .pagination button.active {\n";
-    report << "      background-color: var(--primary-color);\n";
-    report << "      color: white;\n";
-    report << "    }\n";
-    report << "    .pagination button:disabled {\n";
-    report << "      opacity: 0.5;\n";
-    report << "      cursor: not-allowed;\n";
-    report << "    }\n";
-    report << "    .loading {\n";
-    report << "      text-align: center;\n";
-    report << "      padding: 20px;\n";
-    report << "      font-size: 18px;\n";
-    report << "      color: var(--secondary-color);\n";
-    report << "    }\n";
-    report << "  </style>\n";
-    report << "</head>\n<body>\n";
-
-    // 页面内容
-    report << "<div class=\"container\">\n";
-
-    // 标题
-    report << "  <header>\n";
-    report << "    <h1>Storm内存分配分析报告</h1>\n";
-    report << "    <p>生成时间: " << GetTimeString() << "</p>\n";
-    report << "  </header>\n";
-
-    // 概要信息
-    report << "  <div class=\"summary-box\">\n";
-
-    report << "    <div class=\"summary-item\">\n";
-    report << "      <div class=\"summary-number\">" << totalAlloc << "</div>\n";
-    report << "      <div class=\"summary-label\">总分配次数</div>\n";
-    report << "    </div>\n";
-
-    report << "    <div class=\"summary-item\">\n";
-    report << "      <div class=\"summary-number\">" << totalFree << "</div>\n";
-    report << "      <div class=\"summary-label\">总释放次数</div>\n";
-    report << "    </div>\n";
-
-    report << "    <div class=\"summary-item";
-    if (totalUnreleased > 0) report << " leak-warning";
-    report << "\">\n";
-    report << "      <div class=\"summary-number\">" << totalUnreleased << "</div>\n";
-    report << "      <div class=\"summary-label\">未释放数量</div>\n";
-    report << "    </div>\n";
-
-    report << "    <div class=\"summary-item\">\n";
-    report << "      <div class=\"summary-number\">" << std::fixed << std::setprecision(2)
-        << (double)totalAllocBytes / (1024 * 1024) << " MB</div>\n";
-    report << "      <div class=\"summary-label\">总分配内存</div>\n";
-    report << "    </div>\n";
-
-    report << "    <div class=\"summary-item\">\n";
-    report << "      <div class=\"summary-number\">" << std::fixed << std::setprecision(2)
-        << (double)totalFreeBytes / (1024 * 1024) << " MB</div>\n";
-    report << "      <div class=\"summary-label\">总释放内存</div>\n";
-    report << "    </div>\n";
-
-    report << "    <div class=\"summary-item";
-    if (totalLeakBytes > 0) report << " leak-warning";
-    report << "\">\n";
-    report << "      <div class=\"summary-number\">" << std::fixed << std::setprecision(2)
-        << (double)totalLeakBytes / (1024 * 1024) << " MB</div>\n";
-    report << "      <div class=\"summary-label\">内存泄漏</div>\n";
-    report << "    </div>\n";
-
-    report << "  </div>\n";
-
-    // 图表行
-    report << "  <div class=\"chart-row\">\n";
-
-    // 内存分布图表
-    report << "    <div class=\"chart-col\">\n";
-    report << "      <h2 class=\"chart-title\">内存分配/释放分布</h2>\n";
-    report << "      <div class=\"chart-body\">\n";
-    report << "        <canvas id=\"memoryDistributionChart\"></canvas>\n";
+    report << "              </tbody>\n";
+    report << "            </table>\n";
+    report << "          </div>\n";
+    report << "        </div>\n";
     report << "      </div>\n";
-    report << "    </div>\n";
+    report << "    </section>\n";
 
-    // Top 10分配图表
-    report << "    <div class=\"chart-col\">\n";
-    report << "      <h2 class=\"chart-title\">前10大内存消耗</h2>\n";
-    report << "      <div class=\"chart-body\">\n";
-    report << "        <canvas id=\"top10Chart\"></canvas>\n";
-    report << "      </div>\n";
-    report << "    </div>\n";
-    report << "  </div>\n";
+    // 关闭主容器
+    report << "  </div>\n\n";
 
-    // 第二行图表（泄漏）
-    report << "  <div class=\"chart-row\">\n";
-    report << "    <div class=\"chart-col\">\n";
-    report << "      <h2 class=\"chart-title\">前10大内存泄漏</h2>\n";
-    report << "      <div class=\"chart-body\">\n";
-    report << "        <canvas id=\"leakChart\"></canvas>\n";
-    report << "      </div>\n";
-    report << "    </div>\n";
-    report << "  </div>\n";
+    // ===== JavaScript 部分 =====
+    report << "  <!-- Bootstrap JS -->\n";
+    report << "  <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js\"></script>\n";
 
-    // 表格部分
-    report << "  <h2>详细内存分配记录</h2>\n";
+    // DataTables JS
+    report << "  <script src=\"https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js\"></script>\n";
+    report << "  <script src=\"https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js\"></script>\n";
+    report << "  <script src=\"https://code.jquery.com/jquery-3.6.0.min.js\"></script>\n";
 
-    // 选项卡
-    report << "  <div class=\"tabs\">\n";
-    report << "    <div class=\"tab active\" onclick=\"showTab('alloc-table')\">分配表</div>\n";
-    report << "    <div class=\"tab\" onclick=\"showTab('free-table')\">释放表</div>\n";
-    report << "    <div class=\"tab\" onclick=\"showTab('diff-table')\">差异表</div>\n";
-    report << "  </div>\n";
-
-    // 搜索框
-    report << "  <div class=\"search-box\">\n";
-    report << "    <input type=\"text\" id=\"globalSearchInput\" class=\"search-input\" ";
-    report << "placeholder=\"在所有表中搜索...\" />\n";
-    report << "  </div>\n";
-
-    // 分配表
-    report << "  <div id=\"alloc-table\" class=\"tab-content active\">\n";
-    report << "    <div class=\"table-container\">\n";
-    report << "      <table id=\"allocTable\">\n";
-    report << "        <thead>\n";
-    report << "          <tr>\n";
-    report << "            <th data-sort=\"text\">分配类型 <span class=\"sort-icon\">▼</span></th>\n";
-    report << "            <th data-sort=\"number\">大小(字节)</th>\n";
-    report << "            <th data-sort=\"number\">分配次数</th>\n";
-    report << "            <th data-sort=\"number\">总分配(MB)</th>\n";
-    report << "            <th data-sort=\"number\">峰值分配</th>\n";
-    report << "          </tr>\n";
-    report << "        </thead>\n";
-    report << "        <tbody id=\"allocTableBody\">\n";
-    report << "          <tr><td colspan=\"5\" class=\"loading\">加载中...</td></tr>\n";
-    report << "        </tbody>\n";
-    report << "      </table>\n";
-    report << "    </div>\n";
-    report << "    <div id=\"allocPagination\" class=\"pagination\"></div>\n";
-    report << "  </div>\n";
-
-    // 释放表
-    report << "  <div id=\"free-table\" class=\"tab-content\">\n";
-    report << "    <div class=\"table-container\">\n";
-    report << "      <table id=\"freeTable\">\n";
-    report << "        <thead>\n";
-    report << "          <tr>\n";
-    report << "            <th data-sort=\"text\">分配类型 <span class=\"sort-icon\">▼</span></th>\n";
-    report << "            <th data-sort=\"number\">大小(字节)</th>\n";
-    report << "            <th data-sort=\"number\">释放次数</th>\n";
-    report << "            <th data-sort=\"number\">总释放(MB)</th>\n";
-    report << "            <th data-sort=\"number\">效率(%)</th>\n";
-    report << "          </tr>\n";
-    report << "        </thead>\n";
-    report << "        <tbody id=\"freeTableBody\">\n";
-    report << "          <tr><td colspan=\"5\" class=\"loading\">加载中...</td></tr>\n";
-    report << "        </tbody>\n";
-    report << "      </table>\n";
-    report << "    </div>\n";
-    report << "    <div id=\"freePagination\" class=\"pagination\"></div>\n";
-    report << "  </div>\n";
-
-    // 差异表
-    report << "  <div id=\"diff-table\" class=\"tab-content\">\n";
-    report << "    <div class=\"table-container\">\n";
-    report << "      <table id=\"diffTable\">\n";
-    report << "        <thead>\n";
-    report << "          <tr>\n";
-    report << "            <th data-sort=\"text\">分配类型 <span class=\"sort-icon\">▼</span></th>\n";
-    report << "            <th data-sort=\"number\">大小(字节)</th>\n";
-    report << "            <th data-sort=\"number\">分配次数</th>\n";
-    report << "            <th data-sort=\"number\">释放次数</th>\n";
-    report << "            <th data-sort=\"number\">未释放</th>\n";
-    report << "            <th data-sort=\"number\">泄漏(MB)</th>\n";
-    report << "          </tr>\n";
-    report << "        </thead>\n";
-    report << "        <tbody id=\"diffTableBody\">\n";
-    report << "          <tr><td colspan=\"6\" class=\"loading\">加载中...</td></tr>\n";
-    report << "        </tbody>\n";
-    report << "      </table>\n";
-    report << "    </div>\n";
-    report << "    <div id=\"diffPagination\" class=\"pagination\"></div>\n";
-    report << "  </div>\n";
-
-    // JavaScript - 使用高效数据处理和虚拟滚动
-    report << "<script>\n";
+    // 内联JavaScript代码
+    report << "  <script>\n";
 
     // 内存分布数据
-    report << "// 内存分布数据\n";
-    report << "const memoryDistributionData = {\n";
-    report << "  labels: ['已分配', '已释放', '未释放'],\n";
-    report << "  datasets: [{\n";
-    report << "    label: '内存(MB)',\n";
-    report << "    data: ["
+    report << "    // 内存分布数据\n";
+    report << "    const memoryDistributionData = {\n";
+    report << "      labels: ['已分配', '已释放', '未释放'],\n";
+    report << "      datasets: [{\n";
+    report << "        label: '内存(MB)',\n";
+    report << "        data: ["
         << (double)totalAllocBytes / (1024 * 1024) << ", "
         << (double)totalFreeBytes / (1024 * 1024) << ", "
         << (double)totalLeakBytes / (1024 * 1024) << "],\n";
-    report << "    backgroundColor: [\n";
-    report << "      'rgba(54, 162, 235, 0.5)',\n";
-    report << "      'rgba(75, 192, 192, 0.5)',\n";
-    report << "      'rgba(255, 99, 132, 0.5)'\n";
-    report << "    ],\n";
-    report << "    borderColor: [\n";
-    report << "      'rgba(54, 162, 235, 1)',\n";
-    report << "      'rgba(75, 192, 192, 1)',\n";
-    report << "      'rgba(255, 99, 132, 1)'\n";
-    report << "    ],\n";
-    report << "    borderWidth: 1\n";
-    report << "  }]\n";
-    report << "};\n\n";
+    report << "        backgroundColor: [\n";
+    report << "          'rgba(54, 162, 235, 0.5)',\n";
+    report << "          'rgba(75, 192, 192, 0.5)',\n";
+    report << "          'rgba(255, 99, 132, 0.5)'\n";
+    report << "        ],\n";
+    report << "        borderColor: [\n";
+    report << "          'rgba(54, 162, 235, 1)',\n";
+    report << "          'rgba(75, 192, 192, 1)',\n";
+    report << "          'rgba(255, 99, 132, 1)'\n";
+    report << "        ],\n";
+    report << "        borderWidth: 1\n";
+    report << "      }]\n";
+    report << "    };\n\n";
+
+    // 资源类型分布数据
+    report << "    // 资源类型分布数据\n";
+    report << "    const typeData = {\n";
+    report << "      labels: [";
+
+    // 提取类型数据
+    std::vector<std::pair<std::string, double>> typeItems;
+    for (const auto& pair : typeAllocation) {
+        typeItems.push_back({ pair.first, pair.second });
+    }
+
+    // 按大小排序
+    std::sort(typeItems.begin(), typeItems.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+        });
+
+    // 限制显示的类型数量，合并小类型为"其他"
+    const size_t MAX_TYPE_DISPLAY = 10;
+    double otherTypesMB = 0.0;
+
+    for (size_t i = 0; i < typeItems.size(); i++) {
+        if (i < MAX_TYPE_DISPLAY) {
+            if (i > 0) report << ", ";
+            report << "'" << typeItems[i].first << "'";
+        }
+        else {
+            otherTypesMB += typeItems[i].second;
+        }
+    }
+
+    if (otherTypesMB > 0.0) {
+        if (!typeItems.empty() && typeItems.size() > MAX_TYPE_DISPLAY) {
+            report << ", '其他类型'";
+        }
+    }
+
+    report << "],\n";
+    report << "      datasets: [{\n";
+    report << "        label: '分配内存(MB)',\n";
+    report << "        data: [";
+
+    for (size_t i = 0; i < typeItems.size(); i++) {
+        if (i < MAX_TYPE_DISPLAY) {
+            if (i > 0) report << ", ";
+            report << typeItems[i].second;
+        }
+    }
+
+    if (otherTypesMB > 0.0) {
+        if (!typeItems.empty() && typeItems.size() > MAX_TYPE_DISPLAY) {
+            report << ", " << otherTypesMB;
+        }
+    }
+
+    report << "],\n";
+    report << "        backgroundColor: [\n";
+    report << "          'rgba(255, 99, 132, 0.5)',\n";
+    report << "          'rgba(54, 162, 235, 0.5)',\n";
+    report << "          'rgba(255, 206, 86, 0.5)',\n";
+    report << "          'rgba(75, 192, 192, 0.5)',\n";
+    report << "          'rgba(153, 102, 255, 0.5)',\n";
+    report << "          'rgba(255, 159, 64, 0.5)',\n";
+    report << "          'rgba(199, 199, 199, 0.5)',\n";
+    report << "          'rgba(83, 102, 255, 0.5)',\n";
+    report << "          'rgba(78, 205, 196, 0.5)',\n";
+    report << "          'rgba(232, 65, 24, 0.5)',\n";
+    report << "          'rgba(160, 160, 160, 0.5)'\n";
+    report << "        ],\n";
+    report << "        borderColor: [\n";
+    report << "          'rgba(255, 99, 132, 1)',\n";
+    report << "          'rgba(54, 162, 235, 1)',\n";
+    report << "          'rgba(255, 206, 86, 1)',\n";
+    report << "          'rgba(75, 192, 192, 1)',\n";
+    report << "          'rgba(153, 102, 255, 1)',\n";
+    report << "          'rgba(255, 159, 64, 1)',\n";
+    report << "          'rgba(199, 199, 199, 1)',\n";
+    report << "          'rgba(83, 102, 255, 1)',\n";
+    report << "          'rgba(78, 205, 196, 1)',\n";
+    report << "          'rgba(232, 65, 24, 1)',\n";
+    report << "          'rgba(160, 160, 160, 1)'\n";
+    report << "        ],\n";
+    report << "        borderWidth: 1\n";
+    report << "      }]\n";
+    report << "    };\n\n";
 
     // Top 10 最大分配数据
-    report << "// Top 10 分配数据\n";
-    report << "const top10Data = {\n";
-    report << "  labels: [";
+    report << "    // Top 10 分配数据\n";
+    report << "    const top10Data = {\n";
+    report << "      labels: [";
     for (size_t i = 0; i < top10Stats.size(); i++) {
         if (i > 0) report << ", ";
         std::string name = top10Stats[i].name;
@@ -918,24 +1575,24 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
         report << "'" << name << "'";
     }
     report << "],\n";
-    report << "  datasets: [{\n";
-    report << "    label: '内存(MB)',\n";
-    report << "    data: [";
+    report << "      datasets: [{\n";
+    report << "        label: '内存(MB)',\n";
+    report << "        data: [";
     for (size_t i = 0; i < top10Stats.size(); i++) {
         if (i > 0) report << ", ";
         report << (double)top10Stats[i].allocSize / (1024 * 1024);
     }
     report << "],\n";
-    report << "    backgroundColor: 'rgba(54, 162, 235, 0.5)',\n";
-    report << "    borderColor: 'rgba(54, 162, 235, 1)',\n";
-    report << "    borderWidth: 1\n";
-    report << "  }]\n";
-    report << "};\n\n";
+    report << "        backgroundColor: 'rgba(54, 162, 235, 0.5)',\n";
+    report << "        borderColor: 'rgba(54, 162, 235, 1)',\n";
+    report << "        borderWidth: 1\n";
+    report << "      }]\n";
+    report << "    };\n\n";
 
     // Top 10 泄漏数据
-    report << "// Top 10 泄漏数据\n";
-    report << "const leakData = {\n";
-    report << "  labels: [";
+    report << "    // Top 10 泄漏数据\n";
+    report << "    const leakData = {\n";
+    report << "      labels: [";
     for (size_t i = 0; i < top10Leaks.size(); i++) {
         if (i > 0) report << ", ";
         std::string name = top10Leaks[i].name;
@@ -945,455 +1602,368 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename) {
         report << "'" << name << "'";
     }
     report << "],\n";
-    report << "  datasets: [{\n";
-    report << "    label: '泄漏内存(MB)',\n";
-    report << "    data: [";
+    report << "      datasets: [{\n";
+    report << "        label: '泄漏内存(MB)',\n";
+    report << "        data: [";
     for (size_t i = 0; i < top10Leaks.size(); i++) {
         if (i > 0) report << ", ";
         report << (double)top10Leaks[i].leakSize / (1024 * 1024);
     }
     report << "],\n";
-    report << "    backgroundColor: 'rgba(255, 99, 132, 0.5)',\n";
-    report << "    borderColor: 'rgba(255, 99, 132, 1)',\n";
-    report << "    borderWidth: 1\n";
-    report << "  }]\n";
-    report << "};\n\n";
+    report << "        backgroundColor: 'rgba(255, 99, 132, 0.5)',\n";
+    report << "        borderColor: 'rgba(255, 99, 132, 1)',\n";
+    report << "        borderWidth: 1\n";
+    report << "      }]\n";
+    report << "    };\n\n";
 
-    // 表格数据 (从C++预处理)
-    report << "// 表格数据 - 预处理\n";
-    report << "const allocTableData = " << allocJsonStream.str() << ";\n";
-    report << "const freeTableData = " << freeJsonStream.str() << ";\n";
-    report << "const diffTableData = " << diffJsonStream.str() << ";\n\n";
+    // 趋势图数据（如果有前一个报告）
+    if (compareWithPrevious && prevReportPtr) {
+        report << "    // 趋势变化数据\n";
+        report << "    const trendData = {\n";
+        report << "      labels: ['前次报告', '当前报告'],\n";
+        report << "      datasets: [\n";
+        report << "        {\n";
+        report << "          label: '总分配内存(MB)',\n";
+        report << "          data: [" << prevReportPtr->totalAllocatedMB << ", "
+            << (double)totalAllocBytes / (1024 * 1024) << "],\n";
+        report << "          backgroundColor: 'rgba(54, 162, 235, 0.5)',\n";
+        report << "          borderColor: 'rgba(54, 162, 235, 1)',\n";
+        report << "          borderWidth: 2\n";
+        report << "        },\n";
+        report << "        {\n";
+        report << "          label: '总释放内存(MB)',\n";
+        report << "          data: [" << prevReportPtr->totalFreedMB << ", "
+            << (double)totalFreeBytes / (1024 * 1024) << "],\n";
+        report << "          backgroundColor: 'rgba(75, 192, 192, 0.5)',\n";
+        report << "          borderColor: 'rgba(75, 192, 192, 1)',\n";
+        report << "          borderWidth: 2\n";
+        report << "        },\n";
+        report << "        {\n";
+        report << "          label: '内存泄漏(MB)',\n";
+        report << "          data: [" << prevReportPtr->leakedMemoryMB << ", "
+            << (double)totalLeakBytes / (1024 * 1024) << "],\n";
+        report << "          backgroundColor: 'rgba(255, 99, 132, 0.5)',\n";
+        report << "          borderColor: 'rgba(255, 99, 132, 1)',\n";
+        report << "          borderWidth: 2\n";
+        report << "        }\n";
+        report << "      ]\n";
+        report << "    };\n\n";
+    }
 
-    // 用于数据处理、分页和显示的JavaScript函数
-    report << "// 全局变量\n";
-    report << "let currentPage = {\n";
-    report << "  'allocTable': 1,\n";
-    report << "  'freeTable': 1,\n";
-    report << "  'diffTable': 1\n";
-    report << "};\n";
-    report << "const pageSize = 50; // 每页显示记录数\n";
-    report << "let sortConfig = {\n";
-    report << "  'allocTable': { column: 3, direction: 'desc' },\n";
-    report << "  'freeTable': { column: 3, direction: 'desc' },\n";
-    report << "  'diffTable': { column: 5, direction: 'desc' }\n";
-    report << "};\n";
-    report << "let filterText = '';\n\n";
+    // 表格数据
+    report << "    // 表格数据\n";
+    report << "    const allocTableData = [];\n";
+    report << "    const freeTableData = [];\n";
+    report << "    const diffTableData = [];\n\n";
 
-    // 选项卡切换函数
-    report << "// 切换选项卡\n";
-    report << "function showTab(tabId) {\n";
-    report << "  // 隐藏所有选项卡内容\n";
-    report << "  const tabContents = document.getElementsByClassName('tab-content');\n";
-    report << "  for (let i = 0; i < tabContents.length; i++) {\n";
-    report << "    tabContents[i].classList.remove('active');\n";
-    report << "  }\n";
-    report << "  \n";
-    report << "  // 取消激活所有选项卡\n";
-    report << "  const tabs = document.getElementsByClassName('tab');\n";
-    report << "  for (let i = 0; i < tabs.length; i++) {\n";
-    report << "    tabs[i].classList.remove('active');\n";
-    report << "  }\n";
-    report << "  \n";
-    report << "  // 激活选中的选项卡和内容\n";
-    report << "  document.getElementById(tabId).classList.add('active');\n";
-    report << "  const activeTab = document.querySelector(`.tab[onclick*=\"${tabId}\"]`);\n";
-    report << "  if (activeTab) activeTab.classList.add('active');\n";
-    report << "  \n";
-    report << "  // 延迟加载相应表格，防止浏览器冻结\n";
-    report << "  setTimeout(() => {\n";
-    report << "    if (tabId === 'alloc-table') {\n";
-    report << "      renderTable('allocTable', allocTableData);\n";
-    report << "    } else if (tabId === 'free-table') {\n";
-    report << "      renderTable('freeTable', freeTableData);\n";
-    report << "    } else if (tabId === 'diff-table') {\n";
-    report << "      renderTable('diffTable', diffTableData);\n";
-    report << "    }\n";
-    report << "  }, 50);\n";
-    report << "}\n\n";
+    // 填充表格数据
+    report << "    // 填充分配表数据\n";
+    for (const auto& item : allStats) {
+        report << "    allocTableData.push({name: '" << item.name
+            << "', size: " << item.size
+            << ", allocCount: " << item.allocCount
+            << ", allocSizeMB: " << std::fixed << std::setprecision(2) << (double)item.allocSize / (1024 * 1024)
+            << ", peakAlloc: " << item.peakAlloc
+            << "});\n";
+    }
+    report << "\n";
 
-    // 表格渲染函数
-    report << "// 渲染表格数据（分页、排序和过滤）\n";
-    report << "function renderTable(tableId, data) {\n";
-    report << "  const tbody = document.getElementById(`${tableId}Body`);\n";
-    report << "  const filteredData = filterData(data, filterText);\n";
-    report << "  const sortedData = sortData(filteredData, tableId);\n";
-    report << "  \n";
-    report << "  // 计算分页\n";
-    report << "  const totalPages = Math.ceil(sortedData.length / pageSize);\n";
-    report << "  if (currentPage[tableId] > totalPages && totalPages > 0) {\n";
-    report << "    currentPage[tableId] = totalPages;\n";
-    report << "  }\n";
-    report << "  \n";
-    report << "  // 获取当前页数据\n";
-    report << "  const startIndex = (currentPage[tableId] - 1) * pageSize;\n";
-    report << "  const endIndex = Math.min(startIndex + pageSize, sortedData.length);\n";
-    report << "  const pageData = sortedData.slice(startIndex, endIndex);\n";
-    report << "  \n";
-    report << "  // 清空表格\n";
-    report << "  tbody.innerHTML = '';\n";
-    report << "  \n";
-    report << "  // 没有数据的处理\n";
-    report << "  if (pageData.length === 0) {\n";
-    report << "    const tr = document.createElement('tr');\n";
-    report << "    const td = document.createElement('td');\n";
-    report << "    td.setAttribute('colspan', tableId === 'diffTable' ? '6' : '5');\n";
-    report << "    td.textContent = filteredData.length === 0 ? '没有匹配的数据' : '没有数据';\n";
-    report << "    td.style.textAlign = 'center';\n";
-    report << "    tr.appendChild(td);\n";
-    report << "    tbody.appendChild(tr);\n";
-    report << "  } else {\n";
-    report << "    // 添加数据行\n";
-    report << "    pageData.forEach(item => {\n";
-    report << "      const tr = document.createElement('tr');\n";
-    report << "      \n";
-    report << "      // 根据表格类型添加不同列\n";
-    report << "      if (tableId === 'allocTable') {\n";
-    report << "        addCell(tr, item.name, filterText);\n";
-    report << "        addCell(tr, item.size);\n";
-    report << "        addCell(tr, item.allocCount);\n";
-    report << "        addCell(tr, item.allocSize.toFixed(2));\n";
-    report << "        addCell(tr, item.peakAlloc);\n";
-    report << "      } else if (tableId === 'freeTable') {\n";
-    report << "        addCell(tr, item.name, filterText);\n";
-    report << "        addCell(tr, item.size);\n";
-    report << "        addCell(tr, item.freeCount);\n";
-    report << "        addCell(tr, item.freeSize.toFixed(2));\n";
+    report << "    // 填充释放表数据\n";
+    for (const auto& item : allStats) {
+        // 计算效率
+        double efficiency = item.allocSize > 0 ?
+            ((double)item.freeSize / item.allocSize) * 100.0 : 0.0;
+
+        report << "    freeTableData.push({name: '" << item.name
+            << "', size: " << item.size
+            << ", freeCount: " << item.freeCount
+            << ", freeSizeMB: " << std::fixed << std::setprecision(2) << (double)item.freeSize / (1024 * 1024)
+            << ", efficiency: " << std::fixed << std::setprecision(1) << efficiency
+            << "});\n";
+    }
+    report << "\n";
+
+    report << "    // 填充差异表数据\n";
+    for (const auto& item : allStats) {
+        // 只有存在未释放的才加入差异表
+        if (item.unreleased > 0) {
+            report << "    diffTableData.push({name: '" << item.name
+                << "', size: " << item.size
+                << ", allocCount: " << item.allocCount
+                << ", freeCount: " << item.freeCount
+                << ", unreleased: " << item.unreleased
+                << ", leakSizeMB: " << std::fixed << std::setprecision(2) << (double)item.leakSize / (1024 * 1024)
+                << "});\n";
+        }
+    }
+    report << "\n";
+
+    // 页面加载函数
+    report << "    // 页面加载完成后初始化\n";
+    report << "    document.addEventListener('DOMContentLoaded', function() {\n";
+
+    // 绘制内存分布图表
+    report << "      // 绘制内存分布图表\n";
+    report << "      const memDistCtx = document.getElementById('memoryDistributionChart').getContext('2d');\n";
+    report << "      new Chart(memDistCtx, {\n";
+    report << "        type: 'bar',\n";
+    report << "        data: memoryDistributionData,\n";
+    report << "        options: {\n";
+    report << "          responsive: true,\n";
+    report << "          maintainAspectRatio: false,\n";
+    report << "          plugins: {\n";
+    report << "            legend: { display: false },\n";
+    report << "            tooltip: {\n";
+    report << "              callbacks: {\n";
+    report << "                label: function(context) {\n";
+    report << "                  return context.dataset.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
+    report << "                }\n";
+    report << "              }\n";
+    report << "            }\n";
+    report << "          },\n";
+    report << "          scales: { y: { beginAtZero: true, title: { display: true, text: 'MB' } } }\n";
+    report << "        }\n";
+    report << "      });\n\n";
+
+    // 绘制资源类型分布图表
+    report << "      // 绘制资源类型分布图表\n";
+    report << "      const typeCtx = document.getElementById('resourceTypeChart').getContext('2d');\n";
+    report << "      new Chart(typeCtx, {\n";
+    report << "        type: 'pie',\n";
+    report << "        data: typeData,\n";
+    report << "        options: {\n";
+    report << "          responsive: true,\n";
+    report << "          maintainAspectRatio: false,\n";
+    report << "          plugins: {\n";
+    report << "            legend: { position: 'right' },\n";
+    report << "            tooltip: {\n";
+    report << "              callbacks: {\n";
+    report << "                label: function(context) {\n";
+    report << "                  return context.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
+    report << "                }\n";
+    report << "              }\n";
+    report << "            }\n";
+    report << "          }\n";
+    report << "        }\n";
+    report << "      });\n\n";
+
+    // 绘制Top 10分配图表
+    report << "      // 绘制Top 10分配图表\n";
+    report << "      const top10Ctx = document.getElementById('top10Chart').getContext('2d');\n";
+    report << "      new Chart(top10Ctx, {\n";
+    report << "        type: 'bar',\n";
+    report << "        data: top10Data,\n";
+    report << "        options: {\n";
+    report << "          responsive: true,\n";
+    report << "          maintainAspectRatio: false,\n";
+    report << "          indexAxis: 'y',\n";
+    report << "          plugins: {\n";
+    report << "            legend: { display: false },\n";
+    report << "            tooltip: {\n";
+    report << "              callbacks: {\n";
+    report << "                label: function(context) {\n";
+    report << "                  return context.dataset.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
+    report << "                }\n";
+    report << "              }\n";
+    report << "            }\n";
+    report << "          },\n";
+    report << "          scales: { x: { beginAtZero: true, title: { display: true, text: 'MB' } } }\n";
+    report << "        }\n";
+    report << "      });\n\n";
+
+    // 绘制泄漏图表
+    report << "      // 绘制泄漏图表\n";
+    report << "      const leakCtx = document.getElementById('leakChart').getContext('2d');\n";
+    report << "      new Chart(leakCtx, {\n";
+    report << "        type: 'bar',\n";
+    report << "        data: leakData,\n";
+    report << "        options: {\n";
+    report << "          responsive: true,\n";
+    report << "          maintainAspectRatio: false,\n";
+    report << "          indexAxis: 'y',\n";
+    report << "          plugins: {\n";
+    report << "            legend: { display: false },\n";
+    report << "            tooltip: {\n";
+    report << "              callbacks: {\n";
+    report << "                label: function(context) {\n";
+    report << "                  return context.dataset.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
+    report << "                }\n";
+    report << "              }\n";
+    report << "            }\n";
+    report << "          },\n";
+    report << "          scales: { x: { beginAtZero: true, title: { display: true, text: 'MB' } } }\n";
+    report << "        }\n";
+    report << "      });\n\n";
+
+    // 如果有前一个报告，绘制趋势图
+    if (compareWithPrevious && prevReportPtr) {
+        report << "      // 绘制趋势变化图表\n";
+        report << "      const trendCtx = document.getElementById('trendChart').getContext('2d');\n";
+        report << "      new Chart(trendCtx, {\n";
+        report << "        type: 'line',\n";
+        report << "        data: trendData,\n";
+        report << "        options: {\n";
+        report << "          responsive: true,\n";
+        report << "          maintainAspectRatio: false,\n";
+        report << "          plugins: {\n";
+        report << "            tooltip: {\n";
+        report << "              callbacks: {\n";
+        report << "                label: function(context) {\n";
+        report << "                  return context.dataset.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
+        report << "                }\n";
+        report << "              }\n";
+        report << "            }\n";
+        report << "          },\n";
+        report << "          scales: { \n";
+        report << "            y: { beginAtZero: true, title: { display: true, text: 'MB' } }\n";
+        report << "          },\n";
+        report << "          elements: {\n";
+        report << "            line: { tension: 0.3 }, // 使线条平滑\n";
+        report << "            point: { radius: 5 }\n";
+        report << "          }\n";
+        report << "        }\n";
+        report << "      });\n\n";
+    }
+
+    // 初始化数据表格
+    report << "      // 创建表格渲染函数\n";
+    report << "      function renderTable(tableId, data) {\n";
+    report << "        const tableBodyId = tableId + 'Body';\n";
+    report << "        const tbody = document.getElementById(tableBodyId);\n";
+    report << "        tbody.innerHTML = '';\n";
     report << "        \n";
-    report << "        // 效率单元格，颜色标记\n";
+    report << "        const searchText = document.getElementById('globalSearchInput').value.toLowerCase();\n";
+    report << "        \n";
+    report << "        // 过滤数据\n";
+    report << "        const filteredData = searchText ? \n";
+    report << "          data.filter(item => item.name.toLowerCase().includes(searchText)) : data;\n";
+    report << "        \n";
+    report << "        // 创建表格行\n";
+    report << "        filteredData.forEach(item => {\n";
+    report << "          const tr = document.createElement('tr');\n";
+    report << "          \n";
+    report << "          // 根据表格ID添加不同的单元格\n";
+    report << "          if (tableId === 'allocTable') {\n";
+    report << "            addCell(tr, item.name, searchText);\n";
+    report << "            addCell(tr, item.size);\n";
+    report << "            addCell(tr, item.allocCount);\n";
+    report << "            addCell(tr, item.allocSizeMB);\n";
+    report << "            addCell(tr, item.peakAlloc);\n";
+    report << "          } else if (tableId === 'freeTable') {\n";
+    report << "            addCell(tr, item.name, searchText);\n";
+    report << "            addCell(tr, item.size);\n";
+    report << "            addCell(tr, item.freeCount);\n";
+    report << "            addCell(tr, item.freeSizeMB);\n";
+    report << "            \n";
+    report << "            // 效率单元格，颜色标记\n";
+    report << "            const td = document.createElement('td');\n";
+    report << "            if (item.efficiency < 90) {\n";
+    report << "              td.classList.add('text-danger');\n";
+    report << "            }\n";
+    report << "            td.textContent = item.efficiency;\n";
+    report << "            tr.appendChild(td);\n";
+    report << "          } else if (tableId === 'diffTable') {\n";
+    report << "            addCell(tr, item.name, searchText);\n";
+    report << "            addCell(tr, item.size);\n";
+    report << "            addCell(tr, item.allocCount);\n";
+    report << "            addCell(tr, item.freeCount);\n";
+    report << "            \n";
+    report << "            // 未释放单元格，标记警告\n";
+    report << "            const tdUnreleased = document.createElement('td');\n";
+    report << "            tdUnreleased.classList.add('text-danger');\n";
+    report << "            tdUnreleased.textContent = item.unreleased;\n";
+    report << "            tr.appendChild(tdUnreleased);\n";
+    report << "            \n";
+    report << "            // 泄漏大小单元格，标记警告\n";
+    report << "            const tdLeak = document.createElement('td');\n";
+    report << "            tdLeak.classList.add('text-danger');\n";
+    report << "            tdLeak.textContent = item.leakSizeMB;\n";
+    report << "            tr.appendChild(tdLeak);\n";
+    report << "          }\n";
+    report << "          \n";
+    report << "          tbody.appendChild(tr);\n";
+    report << "        });\n";
+    report << "        \n";
+    report << "        // 如果没有数据\n";
+    report << "        if (filteredData.length === 0) {\n";
+    report << "          const tr = document.createElement('tr');\n";
+    report << "          const td = document.createElement('td');\n";
+    report << "          td.setAttribute('colspan', tableId === 'diffTable' ? '6' : '5');\n";
+    report << "          td.textContent = '没有匹配的数据';\n";
+    report << "          td.style.textAlign = 'center';\n";
+    report << "          tr.appendChild(td);\n";
+    report << "          tbody.appendChild(tr);\n";
+    report << "        }\n";
+    report << "      }\n\n";
+
+    // 添加单元格辅助函数
+    report << "      // 添加表格单元格，支持搜索高亮\n";
+    report << "      function addCell(tr, content, searchText = '') {\n";
     report << "        const td = document.createElement('td');\n";
-    report << "        if (item.efficiency < 90) {\n";
-    report << "          td.classList.add('warning');\n";
-    report << "        }\n";
-    report << "        td.textContent = item.efficiency.toFixed(1);\n";
-    report << "        tr.appendChild(td);\n";
-    report << "      } else if (tableId === 'diffTable') {\n";
-    report << "        addCell(tr, item.name, filterText);\n";
-    report << "        addCell(tr, item.size);\n";
-    report << "        addCell(tr, item.allocCount);\n";
-    report << "        addCell(tr, item.freeCount);\n";
     report << "        \n";
-    report << "        // 未释放单元格，标记警告\n";
-    report << "        const tdUnreleased = document.createElement('td');\n";
-    report << "        tdUnreleased.classList.add('warning');\n";
-    report << "        tdUnreleased.textContent = item.unreleased;\n";
-    report << "        tr.appendChild(tdUnreleased);\n";
-    report << "        \n";
-    report << "        // 泄漏大小单元格，标记警告\n";
-    report << "        const tdLeak = document.createElement('td');\n";
-    report << "        tdLeak.classList.add('warning');\n";
-    report << "        tdLeak.textContent = item.leakSize.toFixed(2);\n";
-    report << "        tr.appendChild(tdLeak);\n";
-    report << "      }\n";
-    report << "      \n";
-    report << "      tbody.appendChild(tr);\n";
-    report << "    });\n";
-    report << "  }\n";
-    report << "  \n";
-    report << "  // 更新分页控件\n";
-    report << "  updatePagination(tableId, totalPages, filteredData.length);\n";
-    report << "  \n";
-    report << "  // 更新排序图标\n";
-    report << "  updateSortIcons(tableId);\n";
-    report << "}\n\n";
-
-    // 添加单元格函数
-    report << "// 添加表格单元格，支持搜索高亮\n";
-    report << "function addCell(tr, content, searchText = '') {\n";
-    report << "  const td = document.createElement('td');\n";
-    report << "  \n";
-    report << "  if (searchText && typeof content === 'string' && content.toLowerCase().includes(searchText.toLowerCase())) {\n";
-    report << "    // 高亮搜索匹配文本\n";
-    report << "    const regex = new RegExp(`(${searchText})`, 'gi');\n";
-    report << "    td.innerHTML = content.replace(regex, '<span class=\"search-highlight\">$1</span>');\n";
-    report << "  } else {\n";
-    report << "    td.textContent = content;\n";
-    report << "  }\n";
-    report << "  \n";
-    report << "  tr.appendChild(td);\n";
-    report << "}\n\n";
-
-    // 数据过滤函数
-    report << "// 过滤数据\n";
-    report << "function filterData(data, filterText) {\n";
-    report << "  if (!filterText) return data;\n";
-    report << "  \n";
-    report << "  const searchLower = filterText.toLowerCase();\n";
-    report << "  return data.filter(item => {\n";
-    report << "    return item.name.toLowerCase().includes(searchLower);\n";
-    report << "  });\n";
-    report << "}\n\n";
-
-    // 数据排序函数
-    report << "// 排序数据\n";
-    report << "function sortData(data, tableId) {\n";
-    report << "  const { column, direction } = sortConfig[tableId];\n";
-    report << "  \n";
-    report << "  return [...data].sort((a, b) => {\n";
-    report << "    let valueA, valueB;\n";
-    report << "    \n";
-    report << "    if (tableId === 'allocTable') {\n";
-    report << "      switch(column) {\n";
-    report << "        case 0: valueA = a.name; valueB = b.name; break;\n";
-    report << "        case 1: valueA = a.size; valueB = b.size; break;\n";
-    report << "        case 2: valueA = a.allocCount; valueB = b.allocCount; break;\n";
-    report << "        case 3: valueA = a.allocSize; valueB = b.allocSize; break;\n";
-    report << "        case 4: valueA = a.peakAlloc; valueB = b.peakAlloc; break;\n";
-    report << "        default: valueA = a.allocSize; valueB = b.allocSize;\n";
-    report << "      }\n";
-    report << "    } else if (tableId === 'freeTable') {\n";
-    report << "      switch(column) {\n";
-    report << "        case 0: valueA = a.name; valueB = b.name; break;\n";
-    report << "        case 1: valueA = a.size; valueB = b.size; break;\n";
-    report << "        case 2: valueA = a.freeCount; valueB = b.freeCount; break;\n";
-    report << "        case 3: valueA = a.freeSize; valueB = b.freeSize; break;\n";
-    report << "        case 4: valueA = a.efficiency; valueB = b.efficiency; break;\n";
-    report << "        default: valueA = a.freeSize; valueB = b.freeSize;\n";
-    report << "      }\n";
-    report << "    } else if (tableId === 'diffTable') {\n";
-    report << "      switch(column) {\n";
-    report << "        case 0: valueA = a.name; valueB = b.name; break;\n";
-    report << "        case 1: valueA = a.size; valueB = b.size; break;\n";
-    report << "        case 2: valueA = a.allocCount; valueB = b.allocCount; break;\n";
-    report << "        case 3: valueA = a.freeCount; valueB = b.freeCount; break;\n";
-    report << "        case 4: valueA = a.unreleased; valueB = b.unreleased; break;\n";
-    report << "        case 5: valueA = a.leakSize; valueB = b.leakSize; break;\n";
-    report << "        default: valueA = a.leakSize; valueB = b.leakSize;\n";
-    report << "      }\n";
-    report << "    }\n";
-    report << "    \n";
-    report << "    // 处理字符串与数字比较\n";
-    report << "    if (typeof valueA === 'string') {\n";
-    report << "      return direction === 'asc' \n";
-    report << "        ? valueA.localeCompare(valueB) \n";
-    report << "        : valueB.localeCompare(valueA);\n";
-    report << "    } else {\n";
-    report << "      return direction === 'asc' \n";
-    report << "        ? valueA - valueB \n";
-    report << "        : valueB - valueA;\n";
-    report << "    }\n";
-    report << "  });\n";
-    report << "}\n\n";
-
-    // 更新分页控件
-    report << "// 更新分页控件\n";
-    report << "function updatePagination(tableId, totalPages, totalRecords) {\n";
-    report << "  const paginationDiv = document.getElementById(`${tableId}Pagination`);\n";
-    report << "  paginationDiv.innerHTML = '';\n";
-    report << "  \n";
-    report << "  if (totalPages <= 1) return;\n";
-    report << "  \n";
-    report << "  // 显示记录总数\n";
-    report << "  const recordInfo = document.createElement('span');\n";
-    report << "  recordInfo.textContent = `共 ${totalRecords} 条记录，${totalPages} 页`;\n";
-    report << "  recordInfo.style.marginRight = '15px';\n";
-    report << "  paginationDiv.appendChild(recordInfo);\n";
-    report << "  \n";
-    report << "  // 上一页按钮\n";
-    report << "  const prevBtn = document.createElement('button');\n";
-    report << "  prevBtn.textContent = '上一页';\n";
-    report << "  prevBtn.disabled = currentPage[tableId] === 1;\n";
-    report << "  prevBtn.onclick = () => {\n";
-    report << "    if (currentPage[tableId] > 1) {\n";
-    report << "      currentPage[tableId]--;\n";
-    report << "      renderTable(tableId, tableId === 'allocTable' ? allocTableData : tableId === 'freeTable' ? freeTableData : diffTableData);\n";
-    report << "    }\n";
-    report << "  };\n";
-    report << "  paginationDiv.appendChild(prevBtn);\n";
-    report << "  \n";
-    report << "  // 页码按钮\n";
-    report << "  const maxButtons = 5; // 最多显示的页码按钮数\n";
-    report << "  let startPage = Math.max(1, currentPage[tableId] - Math.floor(maxButtons / 2));\n";
-    report << "  let endPage = Math.min(totalPages, startPage + maxButtons - 1);\n";
-    report << "  \n";
-    report << "  if (endPage - startPage + 1 < maxButtons) {\n";
-    report << "    startPage = Math.max(1, endPage - maxButtons + 1);\n";
-    report << "  }\n";
-    report << "  \n";
-    report << "  for (let i = startPage; i <= endPage; i++) {\n";
-    report << "    const pageBtn = document.createElement('button');\n";
-    report << "    pageBtn.textContent = i;\n";
-    report << "    pageBtn.classList.toggle('active', i === currentPage[tableId]);\n";
-    report << "    pageBtn.onclick = () => {\n";
-    report << "      currentPage[tableId] = i;\n";
-    report << "      renderTable(tableId, tableId === 'allocTable' ? allocTableData : tableId === 'freeTable' ? freeTableData : diffTableData);\n";
-    report << "    };\n";
-    report << "    paginationDiv.appendChild(pageBtn);\n";
-    report << "  }\n";
-    report << "  \n";
-    report << "  // 下一页按钮\n";
-    report << "  const nextBtn = document.createElement('button');\n";
-    report << "  nextBtn.textContent = '下一页';\n";
-    report << "  nextBtn.disabled = currentPage[tableId] === totalPages;\n";
-    report << "  nextBtn.onclick = () => {\n";
-    report << "    if (currentPage[tableId] < totalPages) {\n";
-    report << "      currentPage[tableId]++;\n";
-    report << "      renderTable(tableId, tableId === 'allocTable' ? allocTableData : tableId === 'freeTable' ? freeTableData : diffTableData);\n";
-    report << "    }\n";
-    report << "  };\n";
-    report << "  paginationDiv.appendChild(nextBtn);\n";
-    report << "}\n\n";
-
-    // 更新排序图标
-    report << "// 更新排序图标\n";
-    report << "function updateSortIcons(tableId) {\n";
-    report << "  const table = document.getElementById(tableId);\n";
-    report << "  const headers = table.querySelectorAll('th');\n";
-    report << "  \n";
-    report << "  headers.forEach((header, index) => {\n";
-    report << "    const sortIcon = header.querySelector('.sort-icon');\n";
-    report << "    if (sortIcon) {\n";
-    report << "      if (index === sortConfig[tableId].column) {\n";
-    report << "        sortIcon.textContent = sortConfig[tableId].direction === 'asc' ? '▲' : '▼';\n";
-    report << "      } else {\n";
-    report << "        sortIcon.textContent = '';\n";
-    report << "      }\n";
-    report << "    }\n";
-    report << "  });\n";
-    report << "}\n\n";
-
-    // 设置表头点击排序
-    report << "// 设置表头点击排序\n";
-    report << "function setupTableSorting() {\n";
-    report << "  const tables = ['allocTable', 'freeTable', 'diffTable'];\n";
-    report << "  \n";
-    report << "  tables.forEach(tableId => {\n";
-    report << "    const table = document.getElementById(tableId);\n";
-    report << "    const headers = table.querySelectorAll('th');\n";
-    report << "    \n";
-    report << "    headers.forEach((header, index) => {\n";
-    report << "      header.addEventListener('click', () => {\n";
-    report << "        // 点击当前排序列，切换排序方向\n";
-    report << "        if (sortConfig[tableId].column === index) {\n";
-    report << "          sortConfig[tableId].direction = sortConfig[tableId].direction === 'asc' ? 'desc' : 'asc';\n";
+    report << "        if (searchText && typeof content === 'string' && content.toLowerCase().includes(searchText)) {\n";
+    report << "          // 高亮搜索匹配文本\n";
+    report << "          const regex = new RegExp(`(${searchText})`, 'gi');\n";
+    report << "          td.innerHTML = content.replace(regex, '<span class=\"bg-warning\">$1</span>');\n";
     report << "        } else {\n";
-    report << "          // 点击新列，设置为默认降序\n";
-    report << "          sortConfig[tableId].column = index;\n";
-    report << "          sortConfig[tableId].direction = 'desc';\n";
+    report << "          td.textContent = content;\n";
     report << "        }\n";
     report << "        \n";
-    report << "        // 重新渲染表格\n";
-    report << "        renderTable(tableId, tableId === 'allocTable' ? allocTableData : tableId === 'freeTable' ? freeTableData : diffTableData);\n";
+    report << "        tr.appendChild(td);\n";
+    report << "      }\n\n";
+
+    // 初始化表格
+    report << "      // 初始化表格\n";
+    report << "      renderTable('allocTable', allocTableData);\n";
+    report << "      renderTable('freeTable', freeTableData);\n";
+    report << "      renderTable('diffTable', diffTableData);\n\n";
+
+    // 设置搜索功能
+    report << "      // 设置搜索功能\n";
+    report << "      const searchInput = document.getElementById('globalSearchInput');\n";
+    report << "      searchInput.addEventListener('input', function() {\n";
+    report << "        // 获取当前活动的选项卡\n";
+    report << "        const activeTab = document.querySelector('.tab-pane.active');\n";
+    report << "        const activeTabId = activeTab.id;\n";
+    report << "        \n";
+    report << "        // 根据活动选项卡更新对应表格\n";
+    report << "        if (activeTabId === 'alloc-tab-pane') {\n";
+    report << "          renderTable('allocTable', allocTableData);\n";
+    report << "        } else if (activeTabId === 'free-tab-pane') {\n";
+    report << "          renderTable('freeTable', freeTableData);\n";
+    report << "        } else if (activeTabId === 'diff-tab-pane') {\n";
+    report << "          renderTable('diffTable', diffTableData);\n";
+    report << "        }\n";
+    report << "      });\n\n";
+
+    // 设置选项卡切换事件
+    report << "      // 设置选项卡切换事件\n";
+    report << "      const tabButtons = document.querySelectorAll('[data-bs-toggle=\"tab\"]');\n";
+    report << "      tabButtons.forEach(button => {\n";
+    report << "        button.addEventListener('shown.bs.tab', function(event) {\n";
+    report << "          const targetId = event.target.getAttribute('data-bs-target');\n";
+    report << "          const targetPaneId = targetId.replace('#', '').replace('-pane', '');\n";
+    report << "          \n";
+    report << "          // 更新对应表格\n";
+    report << "          if (targetPaneId === 'alloc-tab') {\n";
+    report << "            renderTable('allocTable', allocTableData);\n";
+    report << "          } else if (targetPaneId === 'free-tab') {\n";
+    report << "            renderTable('freeTable', freeTableData);\n";
+    report << "          } else if (targetPaneId === 'diff-tab') {\n";
+    report << "            renderTable('diffTable', diffTableData);\n";
+    report << "          }\n";
+    report << "        });\n";
     report << "      });\n";
     report << "    });\n";
-    report << "  });\n";
-    report << "}\n\n";
+    report << "  </script>\n";
 
-    // 搜索函数
-    report << "// 设置搜索功能\n";
-    report << "function setupSearch() {\n";
-    report << "  const searchInput = document.getElementById('globalSearchInput');\n";
-    report << "  \n";
-    report << "  searchInput.addEventListener('input', () => {\n";
-    report << "    filterText = searchInput.value.trim();\n";
-    report << "    \n";
-    report << "    // 重置所有表格到第一页\n";
-    report << "    currentPage.allocTable = 1;\n";
-    report << "    currentPage.freeTable = 1;\n";
-    report << "    currentPage.diffTable = 1;\n";
-    report << "    \n";
-    report << "    // 仅渲染当前活动表格\n";
-    report << "    const activeTab = document.querySelector('.tab-content.active');\n";
-    report << "    if (activeTab.id === 'alloc-table') {\n";
-    report << "      renderTable('allocTable', allocTableData);\n";
-    report << "    } else if (activeTab.id === 'free-table') {\n";
-    report << "      renderTable('freeTable', freeTableData);\n";
-    report << "    } else if (activeTab.id === 'diff-table') {\n";
-    report << "      renderTable('diffTable', diffTableData);\n";
-    report << "    }\n";
-    report << "  });\n";
-    report << "}\n\n";
-
-    // 页面加载完成后执行
-    report << "// 页面加载完成后初始化\n";
-    report << "window.onload = function() {\n";
-    report << "  // 绘制内存分布图表\n";
-    report << "  const memDistCtx = document.getElementById('memoryDistributionChart').getContext('2d');\n";
-    report << "  new Chart(memDistCtx, {\n";
-    report << "    type: 'bar',\n";
-    report << "    data: memoryDistributionData,\n";
-    report << "    options: {\n";
-    report << "      responsive: true,\n";
-    report << "      plugins: {\n";
-    report << "        legend: { display: false },\n";
-    report << "        tooltip: {\n";
-    report << "          callbacks: {\n";
-    report << "            label: function(context) {\n";
-    report << "              return context.dataset.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
-    report << "            }\n";
-    report << "          }\n";
-    report << "        }\n";
-    report << "      },\n";
-    report << "      scales: { y: { beginAtZero: true, title: { display: true, text: 'MB' } } }\n";
-    report << "    }\n";
-    report << "  });\n\n";
-
-    // Top 10 图表
-    report << "  // 绘制Top 10分配图表\n";
-    report << "  const top10Ctx = document.getElementById('top10Chart').getContext('2d');\n";
-    report << "  new Chart(top10Ctx, {\n";
-    report << "    type: 'bar',\n";
-    report << "    data: top10Data,\n";
-    report << "    options: {\n";
-    report << "      responsive: true,\n";
-    report << "      indexAxis: 'y',\n";
-    report << "      plugins: {\n";
-    report << "        legend: { display: false },\n";
-    report << "        tooltip: {\n";
-    report << "          callbacks: {\n";
-    report << "            label: function(context) {\n";
-    report << "              return context.dataset.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
-    report << "            }\n";
-    report << "          }\n";
-    report << "        }\n";
-    report << "      },\n";
-    report << "      scales: { x: { beginAtZero: true, title: { display: true, text: 'MB' } } }\n";
-    report << "    }\n";
-    report << "  });\n\n";
-
-    // 泄漏图表
-    report << "  // 绘制泄漏图表\n";
-    report << "  const leakCtx = document.getElementById('leakChart').getContext('2d');\n";
-    report << "  new Chart(leakCtx, {\n";
-    report << "    type: 'bar',\n";
-    report << "    data: leakData,\n";
-    report << "    options: {\n";
-    report << "      responsive: true,\n";
-    report << "      indexAxis: 'y',\n";
-    report << "      plugins: {\n";
-    report << "        legend: { display: false },\n";
-    report << "        tooltip: {\n";
-    report << "          callbacks: {\n";
-    report << "            label: function(context) {\n";
-    report << "              return context.dataset.label + ': ' + context.raw.toFixed(2) + ' MB';\n";
-    report << "            }\n";
-    report << "          }\n";
-    report << "        }\n";
-    report << "      },\n";
-    report << "      scales: { x: { beginAtZero: true, title: { display: true, text: 'MB' } } }\n";
-    report << "    }\n";
-    report << "  });\n\n";
-
-    // 初始化表格和功能
-    report << "  // 设置表格排序和搜索\n";
-    report << "  setupTableSorting();\n";
-    report << "  setupSearch();\n";
-    report << "  \n";
-    report << "  // 延迟加载表格数据，防止浏览器冻结\n";
-    report << "  setTimeout(() => {\n";
-    report << "    renderTable('allocTable', allocTableData);\n";
-    report << "  }, 100);\n";
-    report << "};\n";
-
-    report << "</script>\n";
-    report << "</div>\n";
     report << "</body>\n</html>\n";
 
     report.close();
-    LogMessage("[内存跟踪器] 内存图表报告已生成: %s", filename);
+    LogMessage("[MemoryTracker] 生成精美报告: %s", filename);
 }
 
-// 异步生成内存报告实现 - 简化版不返回future
+// Async HTML chart report generation - 简化实现，移除std::filesystem相关依赖
 void MemoryTracker::GenerateMemoryChartReportAsync(
     const char* html_filename, const char* data_dir) {
     // 如果已经有报告正在生成，则跳过
@@ -1410,8 +1980,9 @@ void MemoryTracker::GenerateMemoryChartReportAsync(
     }
 
     // 创建并分离线程
-    std::thread([this, records_snapshot, html_filename = std::string(html_filename), data_dir = std::string(data_dir)]() {
-        this->GenerateMemoryChartReportInternal(std::move(records_snapshot), html_filename, data_dir);
+    std::thread([this, records_snapshot, html_filename = std::string(html_filename),
+        data_dir = std::string(data_dir)]() {
+            this->GenerateMemoryChartReportInternal(std::move(records_snapshot), html_filename, data_dir);
         }).detach();
 
     LogMessage("[MemoryTracker] 已启动异步报告生成: %s", html_filename);
@@ -1430,26 +2001,17 @@ void MemoryTracker::GenerateMemoryChartReportInternal(
     }
 
     try {
-        // 检查目录是否存在 - 使用Windows API代替std::filesystem
-        if (!CreateDirectoryA(data_dir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-            LogMessage("[MemoryTracker] 无法创建目录: %s, 错误码: %d", data_dir.c_str(), GetLastError());
+        // 检查目录是否存在
+        if (!EnsureDirectoryExists(data_dir)) {
+            LogMessage("[MemoryTracker] 无法创建目录: %s", data_dir.c_str());
         }
 
         LogMessage("[MemoryTracker] 开始异步生成内存报告: %s", html_filename.c_str());
 
-        // 创建与同步版本相同的报告，但使用快照
-        std::ofstream report(html_filename);
-        if (!report.is_open()) {
-            LogMessage("[MemoryTracker] 无法创建内存报告文件: %s", html_filename.c_str());
-            m_isGeneratingReport.store(false);
-            return;
-        }
+        // 使用Bootstrap生成报告
+        GenerateBootstrapHtmlReport(html_filename.c_str(), records_snapshot, true);
 
-        // 这里重复同步版本的实现，但使用快照数据
-        // 可以复用同步版本的实现，将报告代码抽取为共用函数
-
-        // 关闭文件和标志
-        report.close();
+        // 关闭标志
         m_isGeneratingReport.store(false);
         LogMessage("[MemoryTracker] 异步内存报告已完成: %s", html_filename.c_str());
     }
@@ -1457,5 +2019,8 @@ void MemoryTracker::GenerateMemoryChartReportInternal(
         LogMessage("[MemoryTracker] 生成报告异常: %s", e.what());
         m_isGeneratingReport.store(false);
     }
+    catch (...) {
+        LogMessage("[MemoryTracker] 生成报告出现未知错误");
+        m_isGeneratingReport.store(false);
+    }
 }
-
