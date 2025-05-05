@@ -63,6 +63,7 @@ static std::atomic<bool> g_disableMemoryReleasing{ false };
 HANDLE g_statsThreadHandle = NULL;
 std::condition_variable g_shutdownCondition; // 新增：优雅关闭条件变量
 std::mutex g_shutdownMutex;                 // 新增：关闭互斥量
+std::atomic<size_t> g_peakVirtualMemoryUsage{ 0 }; // 初始化为0
 
 // 全局变量定义
 std::atomic<size_t> g_bigThreshold{ 128 * 1024 };      // 默认128KB为大块阈值
@@ -249,10 +250,6 @@ Storm_MemAlloc_t    s_origStormAlloc = nullptr;
 Storm_MemFree_t     s_origStormFree = nullptr;
 Storm_MemReAlloc_t  s_origStormReAlloc = nullptr;
 StormHeap_CleanupAll_t s_origCleanupAll = nullptr;
-
-// g_freedBy... definitions are moved to StormHeapHook.cpp as static variables
-// std::atomic<size_t> g_freedByAllocHook{ 0 };
-// std::atomic<size_t> g_freedByFreeHook{ 0 };
 
 // 日志文件句柄 (保持 static，仅限此文件)
 static FILE* g_logFile = nullptr;
@@ -559,6 +556,36 @@ MemoryTrackingLevel GetMemoryTrackingLevel() {
     return g_trackingLevel.load();
 }
 
+size_t GetProcessVirtualMemoryUsage() {
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    pmc.cb = sizeof(pmc);
+
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PPROCESS_MEMORY_COUNTERS)&pmc, sizeof(pmc))) {
+        return pmc.PrivateUsage; // 返回进程的虚拟内存使用量（Private Bytes）
+    }
+
+    return 0; // 获取失败则返回0
+}
+
+void UpdatePeakMemoryUsage() {
+    size_t currentVMUsage = GetProcessVirtualMemoryUsage();
+    size_t currentPeak = g_peakVirtualMemoryUsage.load(std::memory_order_relaxed);
+
+    while (currentVMUsage > currentPeak) {
+        if (g_peakVirtualMemoryUsage.compare_exchange_weak(currentPeak, currentVMUsage, std::memory_order_relaxed)) {
+            // 仅在有显著变化时记录日志（如增加1MB以上）
+            if (currentVMUsage - currentPeak > 1024 * 1024) {
+                LogMessage("[内存] 新程序虚拟内存峰值: %zu MB (+%zu KB)",
+                    currentVMUsage / (1024 * 1024),
+                    (currentVMUsage - currentPeak) / 1024);
+            }
+            break;
+        }
+        // 如果CAS失败，获取最新的峰值再尝试
+        currentPeak = g_peakVirtualMemoryUsage.load(std::memory_order_relaxed);
+    }
+}
+
 // 设置大块阈值
 void SetBigBlockThreshold(size_t sizeInBytes) {
     size_t oldThreshold = g_bigThreshold.exchange(sizeInBytes);
@@ -606,6 +633,16 @@ void GenerateMemoryReport(bool forceWrite) {
     size_t cachedBlocks = g_largeBlockCache.GetCacheSize();
     size_t asyncQueueSize = g_asyncReleaser.GetQueueSize();
 
+    // 获取当前程序虚拟内存使用量和峰值
+    size_t currentVMUsage = GetProcessVirtualMemoryUsage();
+    size_t peakVMUsage = g_peakVirtualMemoryUsage.load(std::memory_order_relaxed);
+
+    // 确保峰值不小于当前值
+    if (currentVMUsage > peakVMUsage) {
+        peakVMUsage = currentVMUsage;
+        g_peakVirtualMemoryUsage.store(currentVMUsage, std::memory_order_relaxed);
+    }
+
     // 计算使用率
     double tlsfUsagePercent = tlsfTotal > 0 ? (tlsfUsed * 100.0 / tlsfTotal) : 0.0;
 
@@ -615,38 +652,36 @@ void GenerateMemoryReport(bool forceWrite) {
     pmc.cb = sizeof(pmc);
 
     size_t workingSetMB = 0;
-    size_t virtualMemMB = 0;
 
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
         workingSetMB = pmc.WorkingSetSize / (1024 * 1024);
-        virtualMemMB = pmc.PagefileUsage / (1024 * 1024);
     }
 
     // 获取当前时间
     SYSTEMTIME st;
     GetLocalTime(&st);
 
-    // 生成报告文本
+    // 生成报告文本，添加程序虚拟内存峰值
     char reportBuffer[2048];
     int len = sprintf_s(reportBuffer,
         "===== 内存使用报告 =====\n"
         "时间: %02d:%02d:%02d\n"
+        "程序虚拟内存: %zu MB (峰值: %zu MB)\n"
         "Storm 虚拟内存: %zu MB\n"
         "TLSF 内存池: %zu MB / %zu MB (%.1f%%)\n"
         "TLSF 管理块数量: %zu\n"
         "大块缓存: %zu 个\n"
         "异步释放队列: %zu 个\n"
         "工作集大小: %zu MB\n"
-        "虚拟内存总量: %zu MB\n"
         "========================\n",
         st.wHour, st.wMinute, st.wSecond,
+        currentVMUsage / (1024 * 1024), peakVMUsage / (1024 * 1024),  // 添加程序虚拟内存和峰值
         stormVMUsage / (1024 * 1024),
         tlsfUsed / (1024 * 1024), tlsfTotal / (1024 * 1024), tlsfUsagePercent,
         managed,
         cachedBlocks,
         asyncQueueSize,
-        workingSetMB,
-        virtualMemMB
+        workingSetMB
     );
 
     // 同时输出到控制台和日志
@@ -662,14 +697,25 @@ void PrintMemoryStatus() {
     size_t tlsfUsed = GetTLSFPoolUsage();
     size_t tlsfTotal = GetTLSFPoolTotal();
 
+    // 获取当前程序虚拟内存和峰值
+    size_t currentVMUsage = GetProcessVirtualMemoryUsage();
+    size_t peakVMUsage = g_peakVirtualMemoryUsage.load(std::memory_order_relaxed);
+
+    // 确保峰值不小于当前值
+    if (currentVMUsage > peakVMUsage) {
+        peakVMUsage = currentVMUsage;
+        g_peakVirtualMemoryUsage.store(currentVMUsage, std::memory_order_relaxed);
+    }
+
     // 获取当前时间
     SYSTEMTIME st;
     GetLocalTime(&st);
 
-    // 格式化到缓冲区
+    // 格式化到缓冲区，添加程序虚拟内存峰值
     sprintf_s(buffer, sizeof(buffer),
-        "[%02d:%02d:%02d] [内存] Storm: %zu MB, TLSF: %zu/%zu MB (%.1f%%)",
+        "[%02d:%02d:%02d] [内存] 程序VM: %zu/%zu MB, Storm: %zu MB, TLSF: %zu/%zu MB (%.1f%%)",
         st.wHour, st.wMinute, st.wSecond,
+        currentVMUsage / (1024 * 1024), peakVMUsage / (1024 * 1024),
         stormVMUsage / (1024 * 1024),
         tlsfUsed / (1024 * 1024),
         tlsfTotal / (1024 * 1024),
@@ -2177,6 +2223,10 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         void* jassPtr = JVM_MemPool::Allocate(size);
         if (jassPtr) {
             g_memStats.OnAlloc(size);
+
+            // 更新程序虚拟内存峰值
+            UpdatePeakMemoryUsage();
+
             return reinterpret_cast<size_t>(jassPtr);
         }
         // 分配失败回退到 Storm
@@ -2206,6 +2256,10 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             g_bigBlocks.insert(userPtr, info);
 
             g_memStats.OnAlloc(size);
+
+            // 更新程序虚拟内存峰值
+            UpdatePeakMemoryUsage();
+
             return reinterpret_cast<size_t>(userPtr);
         }
 
@@ -2215,7 +2269,16 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
 
         if (!rawPtr) {
             LogMessage("[Alloc] TLSF 分配失败: %zu 字节, 回退到 Storm", size);
-            return s_origStormAlloc(ecx, edx, size, name, src_line, flag);
+            size_t ret = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
+
+            if (ret) {
+                g_memStats.OnAlloc(size);
+
+                // 更新程序虚拟内存峰值
+                UpdatePeakMemoryUsage();
+            }
+
+            return ret;
         }
 
         // 设置用户指针和兼容头
@@ -2240,6 +2303,10 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         g_bigBlocks.insert(userPtr, info);
 
         g_memStats.OnAlloc(size);
+
+        // 更新程序虚拟内存峰值
+        UpdatePeakMemoryUsage();
+
         return reinterpret_cast<size_t>(userPtr);
     }
     else {
@@ -2247,6 +2314,9 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         size_t ret = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         if (ret) {
             g_memStats.OnAlloc(size);
+
+            // 更新程序虚拟内存峰值
+            UpdatePeakMemoryUsage();
         }
         return ret;
     }

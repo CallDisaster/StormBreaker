@@ -114,6 +114,7 @@ extern thread_local bool tls_inCleanAll;
 extern std::atomic<bool> g_insideUnsafePeriod; // 新增：标记不安全时期
 extern DWORD g_cleanAllThreadId;
 extern std::atomic<bool> g_disableMemoryReleasing;
+extern std::atomic<size_t> g_peakVirtualMemoryUsage; // 添加全局变量跟踪峰值内存使用量
 
 // 全局内存跟踪器
 extern MemoryTracker g_memoryTracker;
