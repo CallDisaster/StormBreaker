@@ -352,21 +352,21 @@ char* __fastcall Hook_StormHeap_CombineFreeBlocks(int a1, unsigned __int16* bloc
     return result;
 }
 
-DWORD* __fastcall Hooked_StormHeap_RebuildFreeList(DWORD* heap) {
-    // 调用原始函数
-    DWORD* result = s_origStormHeap_RebuildFreeList(heap);
-
-    // 检查内存使用量，主动回收未使用的内存池
-    static DWORD lastCleanupTime = 0;
-    DWORD currentTime = GetTickCount();
-
-    if (currentTime - lastCleanupTime > 30000) { // 每30秒
-        lastCleanupTime = currentTime;
-        MemPool::CheckAndFreeUnusedPools();
-    }
-
-    return result;
-}
+//DWORD* __fastcall Hooked_StormHeap_RebuildFreeList(DWORD* heap) {
+//    // 调用原始函数
+//    DWORD* result = s_origStormHeap_RebuildFreeList(heap);
+//
+//    // 检查内存使用量，主动回收未使用的内存池
+//    static DWORD lastCleanupTime = 0;
+//    DWORD currentTime = GetTickCount();
+//
+//    if (currentTime - lastCleanupTime > 30000) { // 每30秒
+//        lastCleanupTime = currentTime;
+//        MemPool::CheckAndFreeUnusedPools();
+//    }
+//
+//    return result;
+//}
 
 // ============== 其他 Hook (保留空壳) ==============
 
@@ -409,7 +409,7 @@ bool HookAllStormHeapFunctions()
 
     // 如果你想 Hook 更多:
     // DetourAttach(&(PVOID&)s_origStormHeap_RebuildFreeList,  Hooked_StormHeap_RebuildFreeList);
-    DetourAttach(&(PVOID&)s_origStormHeap_CombineFreeBlocks,Hooked_StormHeap_CombineFreeBlocks);
+    //DetourAttach(&(PVOID&)s_origStormHeap_CombineFreeBlocks,Hooked_StormHeap_CombineFreeBlocks);
     // ...
 
     LONG error = DetourTransactionCommit();

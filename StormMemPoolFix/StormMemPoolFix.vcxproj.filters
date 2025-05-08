@@ -31,6 +31,12 @@
     <Filter Include="源文件\Log">
       <UniqueIdentifier>{2593c254-ec8c-4a54-99ab-f58979e86182}</UniqueIdentifier>
     </Filter>
+    <Filter Include="源文件\Storm\Fix">
+      <UniqueIdentifier>{140f86cd-b2b8-4790-866a-6a766e781e25}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\Storm\Fix">
+      <UniqueIdentifier>{3f30a80b-4147-4445-92e1-396252511dd2}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framework.h">
@@ -69,6 +75,12 @@
     <ClInclude Include="Log\LogSystem.h">
       <Filter>头文件\Log</Filter>
     </ClInclude>
+    <ClInclude Include="Log\ReportViewer.h">
+      <Filter>头文件\Log</Filter>
+    </ClInclude>
+    <ClInclude Include="Storm\Fix\AudioMemoryTracker.h">
+      <Filter>头文件\Storm\Fix</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -103,6 +115,9 @@
     </ClCompile>
     <ClCompile Include="Log\ReportViewer.cpp">
       <Filter>源文件\Log</Filter>
+    </ClCompile>
+    <ClCompile Include="Storm\Fix\AudioMemoryTracker.cpp">
+      <Filter>源文件\Storm\Fix</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

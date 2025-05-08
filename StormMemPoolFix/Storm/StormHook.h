@@ -58,6 +58,7 @@ struct BigBlockInfo {
     const char* source; // 分配来源
     DWORD  srcLine;     // 源代码行号
     ResourceType type;  // 资源类型
+    int specialFlags;   // 特殊标志: 0=普通, 1=音频池内存
 };
 
 // 缓存特殊大块的过滤条件（优化频繁分配的特定模式）

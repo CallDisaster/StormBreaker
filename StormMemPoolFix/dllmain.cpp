@@ -29,9 +29,53 @@ void CreateConsole()
 
 }
 
+bool IsRunningInYDWE() {
+    // 方法1: 检查进程名
+    char processName[MAX_PATH] = { 0 };
+    GetModuleFileNameA(NULL, processName, MAX_PATH);
+
+    // 提取文件名
+    const char* fileName = strrchr(processName, '\\');
+    fileName = fileName ? fileName + 1 : processName;
+
+    // 判断进程名
+    if (_stricmp(fileName, "YDWE.exe") == 0 ||
+        _stricmp(fileName, "worldeditydwe.exe") == 0) {
+        return true;
+    }
+
+    // 方法2: 检查是否有YDWE特有的模块
+    HMODULE hYDWEModule = GetModuleHandleA("YDWEBase.dll"); // YDWE的核心DLL
+    if (hYDWEModule != NULL) {
+        return true;
+    }
+
+    // 方法3: 检查窗口标题
+    char windowTitle[256] = { 0 };
+    HWND hWnd = GetForegroundWindow(); // 或尝试GetConsoleWindow()
+    GetWindowTextA(hWnd, windowTitle, sizeof(windowTitle));
+
+    if (strstr(windowTitle, "YDWE") != NULL) {
+        return true;
+    }
+
+    // 方法4: 直接检查环境变量或特定文件路径
+    char warcraft3Path[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableA("YDWE_PATH", warcraft3Path, MAX_PATH) > 0) {
+        return true; // YDWE可能设置了环境变量
+    }
+
+    return false;
+}
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     int featureActivationCount = 0;
+
+    // 检查是否在YDWE中运行
+    if (IsRunningInYDWE()) {
+        std::cout << "拒绝编辑器访问插件！" << std::endl;
+        return TRUE;
+    }
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
@@ -76,7 +120,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         break;
 
     case DLL_PROCESS_DETACH:
-        // 关闭钩子
+        if (IsRunningInYDWE()) {
+            std::cout << "拒绝编辑器访问插件！" << std::endl;
+            return TRUE;
+        }
         ShutdownStormMemoryHooks();
         break;
     }

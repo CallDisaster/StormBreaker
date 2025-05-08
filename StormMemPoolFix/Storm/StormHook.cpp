@@ -17,6 +17,8 @@
 #include "MemoryPool.h"
 #include <concurrent_queue.h>    // 新增并发队列支持
 #include <condition_variable>    // 新增条件变量支持
+#include "../Log/ReportViewer.h"  // 添加ReportViewer头文件
+#include "Fix/AudioMemoryTracker.h"
 
 #include <fstream>
 #include <iomanip>
@@ -32,12 +34,9 @@ constexpr size_t BATCH_PROCESS_SIZE = 128;    // 批处理大小
 constexpr size_t ASYNC_QUEUE_CAPACITY = 4096; // 异步队列容量
 
 // 当前内存跟踪级别
-static std::atomic<MemoryTrackingLevel> g_trackingLevel{ MemoryTrackingLevel::Basic };
+static std::atomic<MemoryTrackingLevel> g_trackingLevel{ MemoryTrackingLevel::Detailed };
 
 MemorySafety& g_MemSafety = MemorySafety::GetInstance();
-
-// 全局内存跟踪器实例化
-MemoryTracker g_memoryTracker;
 
 // 特殊块过滤器列表 - 无需修改
 static std::vector<SpecialBlockFilter> g_specialFilters = {
@@ -1931,6 +1930,8 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
     DWORD lastStatsTime = GetTickCount();
     DWORD lastReportTime = GetTickCount();
     DWORD lastProfileTime = GetTickCount();
+    DWORD lastAudioStatsTime = GetTickCount(); // 音频池统计
+    DWORD lastAudioCleanupTime = GetTickCount(); // 音频清理计时
 
     while (!g_shouldExit.load(std::memory_order_acquire)) {
         // 使用条件变量等待而不是Sleep
@@ -1945,6 +1946,7 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
         DWORD currentTime = GetTickCount();
 
         // 使用批处理减少锁争用，同一时间只做一种操作
+
         // 1. 每30秒生成内存报告
         if (currentTime - lastReportTime > 30000) {
             GenerateMemoryReport();
@@ -1961,7 +1963,25 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
             continue;
         }
 
-        // 4. 每分钟打印一次内存统计
+        // 3. 每60秒打印音频池统计
+        if (currentTime - lastAudioStatsTime > 60000) {
+            g_AudioPool.PrintStats();
+            lastAudioStatsTime = currentTime;
+            continue;
+        }
+
+        // 4. 每3分钟清理非活跃音频（不影响正在播放的音频）
+        if (currentTime - lastAudioCleanupTime > 180000) {
+            if (!g_cleanAllInProgress && !g_insideUnsafePeriod.load(std::memory_order_acquire)) {
+                // 清理超过2分钟未使用的非活跃音频
+                LogMessage("[AudioPool] 开始非活跃音频清理...");
+                g_AudioPool.CleanupInactive(120000);
+            }
+            lastAudioCleanupTime = currentTime;
+            continue;
+        }
+
+        // 5. 每分钟打印一次内存统计
         if (currentTime - lastStatsTime > 60000) {
             // 分配统计打印
             size_t allocTotal = g_memStats.totalAllocated.load(std::memory_order_relaxed);
@@ -2215,7 +2235,54 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             }).detach();
     }
 
-    // 检查是否为 JassVM 相关分配 - 使用严格的识别
+    // 检查是否为音频相关内存分配
+    bool isAudioAlloc = IsAudioMemoryAllocation(name, src_line);
+
+    // 音频特殊处理 - 优先使用音频内存池
+    if (isAudioAlloc) {
+        // 首先尝试从音频池分配
+        void* audioPtr = g_AudioPool.Allocate(size);
+        if (audioPtr) {
+            // 记录统计
+            g_memStats.OnAlloc(size);
+
+            // 将用户数据包装成Storm格式 (添加头部)
+            void* rawPtr = VirtualAlloc(NULL, sizeof(StormAllocHeader), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (rawPtr) {
+                // 设置Storm兼容的头部
+                StormAllocHeader* header = static_cast<StormAllocHeader*>(rawPtr);
+                header->HeapPtr = SPECIAL_MARKER;
+                header->Size = static_cast<DWORD>(size);
+                header->AlignPadding = 0;
+                header->Flags = 0x4 | 0x8;  // 标记为大块VirtualAlloc + 特殊指针
+                header->Magic = STORM_MAGIC;
+
+                // 记录到大块跟踪表
+                BigBlockInfo info;
+                info.rawPtr = rawPtr;
+                info.size = size;
+                info.timestamp = GetTickCount();
+                info.source = name ? _strdup(name) : nullptr;
+                info.srcLine = src_line;
+                info.type = ResourceType::Sound;
+
+                // 特殊标记为音频池内存
+                info.specialFlags = 1;  // 使用特殊标志字段标记为音频池内存
+
+                // 使用分片哈希表记录
+                g_bigBlocks.insert(audioPtr, info);
+
+                UpdatePeakMemoryUsage();
+
+                // 返回用户指针
+                return reinterpret_cast<size_t>(audioPtr);
+            }
+
+            // 如果头部分配失败，继续使用常规方法
+        }
+    }
+
+    // 检查是否为 JassVM 相关分配
     if (name && size == 10408 && strstr(name, "Instance.cpp")) {
         // 先记录分配（仅计数，不累加大小，因为JassVM池会单独记录）
         g_memoryTracker.RecordAlloc(size, "Instance.cpp", true);
@@ -2251,6 +2318,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             info.source = name ? _strdup(name) : nullptr;
             info.srcLine = src_line;
             info.type = GetResourceType(name);
+            info.specialFlags = 0;  // 普通块
 
             // 添加到分片哈希表
             g_bigBlocks.insert(userPtr, info);
@@ -2298,6 +2366,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         info.source = name ? _strdup(name) : nullptr;
         info.srcLine = src_line;
         info.type = GetResourceType(name);
+        info.specialFlags = 0;  // 普通块
 
         // 添加到分片哈希表
         g_bigBlocks.insert(userPtr, info);
@@ -2343,8 +2412,28 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
         blockSize = GetBlockSize(ptr);
     }
 
-    // 记录内存释放，使用找到的源信息
+    // 记录内存释放
     g_memoryTracker.RecordFree(blockSize, blockSource ? blockSource : name);
+
+    // 检查是否为音频池内存
+    bool isAudioPoolMemory = (blockFound && blockInfo.specialFlags == 1);
+    if (isAudioPoolMemory) {
+        // 对于音频池内存，标记为非活跃但不实际释放
+        g_AudioPool.MarkActive(ptr, false);
+
+        // 从跟踪表中移除
+        if (blockFound) {
+            // 释放Storm头部内存
+            if (blockInfo.rawPtr) {
+                VirtualFree(blockInfo.rawPtr, 0, MEM_RELEASE);
+            }
+
+            g_bigBlocks.erase(ptr);
+            g_memStats.OnFree(blockInfo.size);
+        }
+
+        return 1;
+    }
 
     // 先检查是否为 JVM_MemPool 指针
     if (JVM_MemPool::IsFromPool(ptr)) {
@@ -2376,9 +2465,6 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     // 常规释放流程
     if (ourBlock) {
         // 获取块信息
-        BigBlockInfo blockInfo;
-        bool blockFound = g_bigBlocks.find(ptr, blockInfo);
-
         if (blockFound) {
             // 从哈希表中移除块信息 - 在erase内部释放source指针
             g_bigBlocks.erase(ptr);
@@ -2795,6 +2881,7 @@ bool InitializeStormMemoryHooks() {
     HANDLE hThread = CreateThread(nullptr, 0, MemoryStatsThread, nullptr, 0, nullptr);
     if (hThread) {
         g_statsThreadHandle = hThread;
+        LogMessage("[Init] 内存统计线程已启动");
     }
 
     void* stabilizer = MemPool::CreateStabilizingBlock(32, "初始稳定块");
@@ -2948,7 +3035,6 @@ void SafelyDetachHooks() {
     LogMessage("[关闭] 钩子卸载%s", (result == NO_ERROR ? "成功" : "失败"));
 }
 
-// 优化关闭函数
 void ShutdownStormMemoryHooks() {
     LogMessage("[关闭] 退出程序...");
 
@@ -2956,6 +3042,10 @@ void ShutdownStormMemoryHooks() {
     LogMessage("[关闭] 正在生成内存分配报告...");
     g_memoryTracker.GenerateReport("StormMemoryAllocation.log");
     g_memoryTracker.GenerateMemoryChartReport("MemoryChart.html");
+
+    // 音频池统计
+    LogMessage("[关闭] 音频内存池统计...");
+    g_AudioPool.PrintStats();
 
     // 1. 标记不安全期开始——必须最先执行
     g_insideUnsafePeriod.store(true, std::memory_order_release);
@@ -2987,15 +3077,19 @@ void ShutdownStormMemoryHooks() {
     g_permanentBlocks.clear();
     g_tempStabilizers.clear();
 
-    // 9. 清理JassVM内存池 - 同样禁用实际释放
+    // 9. 清理音频内存池
+    LogMessage("[关闭] 清理音频内存池...");
+    g_AudioPool.Cleanup();
+
+    // 10. 清理JassVM内存池 - 同样禁用实际释放
     LogMessage("[关闭] 关闭JassVM内存管理...");
     JVM_MemPool::Cleanup();
 
-    // 10. 清理TLSF内存池 - 上面已经禁用了实际释放
+    // 11. 清理TLSF内存池 - 上面已经禁用了实际释放
     LogMessage("[关闭] 关闭TLSF内存池...");
     MemPool::Shutdown();
 
-    // 11. 关闭日志系统
+    // 12. 关闭日志系统
     LogMessage("[关闭] 关闭完成，正在关闭日志系统");
     LogSystem::GetInstance().Shutdown();
 }

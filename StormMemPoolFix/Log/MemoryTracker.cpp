@@ -1,4 +1,4 @@
-﻿#include "pc#include "pch.h"
+﻿#include "pch.h"
 #include "MemoryTracker.h"
 #include <cstdio>
 #include <cstdarg>
@@ -70,6 +70,7 @@ bool MemoryTracker::Initialize(const char* reportsDir) {
 
     // 生成新的会话ID
     m_sessionId = GenerateUniqueId();
+    LogMessage("[Init] MemoryTracker ID生成");
 
     // 设置报告目录
     m_reportsDirectory = reportsDir ? reportsDir : "MemoryReports";
@@ -79,18 +80,20 @@ bool MemoryTracker::Initialize(const char* reportsDir) {
         LogMessage("[MemoryTracker] 无法创建报告目录: %s", m_reportsDirectory.c_str());
         return false;
     }
+    LogMessage("[Init] 确保目录存在");
 
-    // 加载现有报告
-    LoadReports(m_reportsDirectory.c_str());
+    // 加载现有报告 - 传递参数true表示调用者已持有锁
+    LoadReports(m_reportsDirectory.c_str(), true);
+    LogMessage("[Init] 加载现有报告");
 
-    // 清理旧会话的报告
-    CleanupOldReports();
+    // 清理旧会话的报告 - 传递参数true表示调用者已持有锁
+    CleanupOldReports(true);
+    LogMessage("[Init] 清理旧会话的报告");
 
     LogMessage("[MemoryTracker] 初始化完成，会话ID: %s, 报告目录: %s",
         m_sessionId.c_str(), m_reportsDirectory.c_str());
     return true;
 }
-
 // 关闭内存追踪器
 void MemoryTracker::Shutdown() {
     // 停止定时报告
@@ -168,93 +171,230 @@ bool MemoryTracker::EnsureDirectoryExists(const std::string& dirPath) {
 std::vector<std::string> MemoryTracker::GetReportFiles(const std::string& directory) {
     std::vector<std::string> files;
 
+    LogMessage("[GetReportFiles] 开始搜索目录: %s", directory.c_str());
+
+    // 验证目录是否存在且可访问
+    DWORD attrs = GetFileAttributesA(directory.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        LogMessage("[GetReportFiles] 错误: 目录不存在或无法访问: %s (错误码: %d)",
+            directory.c_str(), GetLastError());
+        return files;
+    }
+
     WIN32_FIND_DATAA findData;
     HANDLE hFind;
 
     std::string searchPath = directory + "/*.html";
+    LogMessage("[GetReportFiles] 搜索路径: %s", searchPath.c_str());
+
     hFind = FindFirstFileA(searchPath.c_str(), &findData);
 
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            // 排除. 和 ..
-            if (strcmp(findData.cFileName, ".") != 0 && strcmp(findData.cFileName, "..") != 0) {
-                std::string fullPath = directory + "/" + findData.cFileName;
-                files.push_back(fullPath);
-            }
-        } while (FindNextFileA(hFind, &findData) != 0);
-
-        FindClose(hFind);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND) {
+            LogMessage("[GetReportFiles] 未找到匹配的HTML文件");
+        }
+        else {
+            LogMessage("[GetReportFiles] 搜索文件时出错: %d", error);
+        }
+        return files;
     }
+
+    LogMessage("[GetReportFiles] FindFirstFile成功，开始枚举文件");
+
+    int fileCount = 0;
+    int maxFiles = 1000; // 安全限制，防止无限循环
+
+    do {
+        // 排除. 和 ..
+        if (strcmp(findData.cFileName, ".") != 0 && strcmp(findData.cFileName, "..") != 0) {
+            std::string fullPath = directory + "/" + findData.cFileName;
+            files.push_back(fullPath);
+            fileCount++;
+
+            // 每10个文件记录一次日志
+            if (fileCount % 10 == 0) {
+                LogMessage("[GetReportFiles] 已处理 %d 个文件", fileCount);
+            }
+        }
+
+        // 安全检查，防止无限循环
+        if (fileCount >= maxFiles) {
+            LogMessage("[GetReportFiles] 警告: 已达到最大文件数限制 (%d)", maxFiles);
+            break;
+        }
+    } while (FindNextFileA(hFind, &findData) != 0);
+
+    DWORD lastError = GetLastError();
+    if (lastError != ERROR_NO_MORE_FILES) {
+        LogMessage("[GetReportFiles] FindNextFile出错: %d", lastError);
+    }
+
+    FindClose(hFind);
+
+    LogMessage("[GetReportFiles] 完成搜索，共找到 %zu 个HTML文件", files.size());
 
     return files;
 }
 
 // 清除非当前会话的报告
-void MemoryTracker::CleanupOldReports() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+void MemoryTracker::CleanupOldReports(bool callerHoldsLock) {
+    LogMessage("[CleanupOldReports] 开始清理旧会话报告...");
+
+    // 只有在调用者未持有锁时才获取锁
+    std::unique_ptr<std::lock_guard<std::mutex>> lockPtr;
+    if (!callerHoldsLock) {
+        lockPtr = std::make_unique<std::lock_guard<std::mutex>>(m_mutex);
+    }
 
     // 获取当前目录下的所有HTML文件
     std::vector<std::string> files = GetReportFiles(m_reportsDirectory);
+    LogMessage("[CleanupOldReports] 找到 %zu 个 HTML 文件。", files.size());
 
-    // 遍历所有文件，删除非当前会话的报告
+    if (files.empty()) {
+        LogMessage("[CleanupOldReports] 未找到任何报告文件，无需清理。");
+        // 不再调用 LoadReports
+        return; // 没有文件需要处理
+    }
+
+    LogMessage("[CleanupOldReports] 开始遍历文件以检查 SessionID...");
+    int currentFileIndex = 0;
+    int deletedCount = 0;
     for (const auto& file : files) {
-        MemoryReportData reportData;
-        if (ParseReportData(file, reportData)) {
+        currentFileIndex++;
+        LogMessage("[CleanupOldReports] (%d/%zu) 正在检查文件: %s", currentFileIndex, files.size(), file.c_str());
+
+        MemoryReportData reportData; // 用于存储解析结果
+
+        LogMessage("[CleanupOldReports] (%d/%zu) 调用 ParseReportData...", currentFileIndex, files.size());
+        bool parseSuccess = ParseReportData(file, reportData); // 解析文件
+
+        if (parseSuccess) {
+            LogMessage("[CleanupOldReports] (%d/%zu) ParseReportData 成功。", currentFileIndex, files.size());
+            LogMessage("[CleanupOldReports] (%d/%zu) 文件 SessionID: '%s', 当前 SessionID: '%s'", currentFileIndex, files.size(), reportData.sessionId.c_str(), m_sessionId.c_str());
+            // 检查 SessionID 是否 *不* 匹配当前会话
             if (reportData.sessionId != m_sessionId) {
-                // 删除文件
+                LogMessage("[CleanupOldReports] (%d/%zu) SessionID 不匹配，尝试删除旧报告文件...", currentFileIndex, files.size());
+                // 尝试删除文件
                 if (DeleteFileA(file.c_str())) {
-                    LogMessage("[MemoryTracker] 已删除旧会话报告: %s", file.c_str());
+                    LogMessage("[CleanupOldReports] (%d/%zu) 成功删除旧会话报告: %s", currentFileIndex, files.size(), file.c_str());
+                    deletedCount++;
                 }
                 else {
-                    LogMessage("[MemoryTracker] 无法删除旧会话报告: %s, 错误码: %d",
-                        file.c_str(), GetLastError());
+                    // 删除失败，记录错误码
+                    DWORD lastError = GetLastError();
+                    LogMessage("[CleanupOldReports] (%d/%zu) 错误：无法删除旧会话报告: %s (错误码: %d)", currentFileIndex, files.size(), file.c_str(), lastError);
                 }
             }
-        }
-    }
-
-    // 重新加载报告
-    LoadReports(m_reportsDirectory.c_str());
-}
-
-// 从目录中加载所有历史报告数据
-bool MemoryTracker::LoadReports(const char* directory) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-
-    // 清空历史记录
-    m_reportHistory.clear();
-
-    // 使用指定目录或默认目录
-    std::string dirPath = directory ? directory : m_reportsDirectory;
-
-    // 获取所有HTML文件
-    std::vector<std::string> files = GetReportFiles(dirPath);
-
-    // 解析每个文件并加载数据
-    for (const auto& file : files) {
-        MemoryReportData reportData;
-        if (ParseReportData(file, reportData)) {
-            // 只存储当前会话的报告
-            if (reportData.sessionId == m_sessionId) {
-                m_reportHistory.push_back(reportData);
+            else {
+                LogMessage("[CleanupOldReports] (%d/%zu) SessionID 匹配，保留文件。", currentFileIndex, files.size());
             }
         }
+        else {
+            LogMessage("[CleanupOldReports] (%d/%zu) ParseReportData 失败，无法检查 SessionID，跳过文件。", currentFileIndex, files.size());
+        }
+    }
+    LogMessage("[CleanupOldReports] 文件遍历完成。共删除了 %d 个旧报告文件。", deletedCount);
+
+    // LoadReports(m_reportsDirectory.c_str()); // <--- 确认删除或注释掉这一行！
+    LogMessage("[CleanupOldReports] 清理完成。");
+
+} // 锁在此处自动释放
+
+// 从目录中加载所有历史报告数据
+bool MemoryTracker::LoadReports(const char* directory, bool callerHoldsLock) {
+    LogMessage("[LoadReports] 开始加载报告, 目录: %s", directory ? directory : "默认");
+
+    // 只有在调用者未持有锁时才获取锁
+    std::unique_ptr<std::lock_guard<std::mutex>> lockPtr;
+    if (!callerHoldsLock) {
+        lockPtr = std::make_unique<std::lock_guard<std::mutex>>(m_mutex);
     }
 
-    // 按时间排序
-    std::sort(m_reportHistory.begin(), m_reportHistory.end(),
-        [](const MemoryReportData& a, const MemoryReportData& b) {
-            return a.timestamp < b.timestamp;
-        });
+    LogMessage("[LoadReports] 清空历史记录...");
+    m_reportHistory.clear();
 
-    LogMessage("[MemoryTracker] 已加载 %zu 个当前会话的报告", m_reportHistory.size());
+    // 确定要搜索的目录路径
+    std::string dirPath = directory ? directory : m_reportsDirectory;
+    LogMessage("[LoadReports] 最终搜索路径: %s", dirPath.c_str());
+
+    LogMessage("[LoadReports] 开始查找报告文件...");
+    std::vector<std::string> files = GetReportFiles(dirPath);
+    LogMessage("[LoadReports] 找到 %zu 个 HTML 文件。", files.size());
+
+    if (files.empty()) {
+        LogMessage("[LoadReports] 未找到任何报告文件，加载完成。");
+        return true; // 没有文件需要处理，直接返回成功
+    }
+
+    LogMessage("[LoadReports] 开始遍历并解析文件...");
+    int currentFileIndex = 0;
+    for (const auto& file : files) {
+        currentFileIndex++;
+        LogMessage("[LoadReports] (%d/%zu) 正在处理文件: %s", currentFileIndex, files.size(), file.c_str());
+
+        MemoryReportData reportData; // 为当前文件创建数据结构
+
+        LogMessage("[LoadReports] (%d/%zu) 调用 ParseReportData...", currentFileIndex, files.size());
+        bool parseSuccess = ParseReportData(file, reportData); // 解析文件内容
+
+        if (parseSuccess) {
+            LogMessage("[LoadReports] (%d/%zu) ParseReportData 成功。", currentFileIndex, files.size());
+            // 检查 SessionID 是否匹配当前会话
+            LogMessage("[LoadReports] (%d/%zu) 文件 SessionID: '%s', 当前 SessionID: '%s'", currentFileIndex, files.size(), reportData.sessionId.c_str(), m_sessionId.c_str());
+            if (reportData.sessionId == m_sessionId) {
+                LogMessage("[LoadReports] (%d/%zu) SessionID 匹配，准备添加到历史记录...", currentFileIndex, files.size());
+                m_reportHistory.push_back(reportData); // 添加到历史记录向量
+                LogMessage("[LoadReports] (%d/%zu) 已添加到历史记录 (当前历史数量: %zu)。", currentFileIndex, files.size(), m_reportHistory.size());
+            }
+            else {
+                LogMessage("[LoadReports] (%d/%zu) SessionID 不匹配，已忽略。", currentFileIndex, files.size());
+            }
+        }
+        else {
+            LogMessage("[LoadReports] (%d/%zu) ParseReportData 失败或返回 false。", currentFileIndex, files.size());
+            // 可以选择记录更多错误信息，或者 ParseReportData 内部已经记录
+        }
+    }
+    LogMessage("[LoadReports] 文件遍历和解析完成。");
+
+    if (!m_reportHistory.empty()) {
+        LogMessage("[LoadReports] 开始对 %zu 条历史记录进行排序...", m_reportHistory.size());
+        try {
+            std::sort(m_reportHistory.begin(), m_reportHistory.end(),
+                [](const MemoryReportData& a, const MemoryReportData& b) {
+                    // 假设时间戳格式可以直接比较字符串
+                    return a.timestamp < b.timestamp;
+                });
+            LogMessage("[LoadReports] 历史记录排序完成。");
+        }
+        catch (const std::exception& e) {
+            LogMessage("[LoadReports] 错误: 对历史记录排序时发生异常: %s", e.what());
+            // 即使排序失败，也继续执行
+        }
+        catch (...) {
+            LogMessage("[LoadReports] 错误: 对历史记录排序时发生未知异常");
+            // 即使排序失败，也继续执行
+        }
+
+    }
+    else {
+        LogMessage("[LoadReports] 没有属于当前会话的历史记录需要排序。");
+    }
+
+    // 这行日志现在应该可以被打印出来了
+    LogMessage("[LoadReports] 完成加载。已加载 %zu 个当前会话的报告。", m_reportHistory.size());
     return true;
-}
+} // 锁在此处自动释放
 
 // 解析HTML报告中的数据
 bool MemoryTracker::ParseReportData(const std::string& filePath, MemoryReportData& reportData) {
+    LogMessage("[ParseReportData] 开始解析文件: %s", filePath.c_str());
+
     std::ifstream file(filePath);
     if (!file.is_open()) {
+        LogMessage("[ParseReportData] 无法打开文件: %s (错误码: %d)",
+            filePath.c_str(), GetLastError());
         return false;
     }
 
@@ -262,101 +402,66 @@ bool MemoryTracker::ParseReportData(const std::string& filePath, MemoryReportDat
     reportData = MemoryReportData();
     reportData.reportPath = filePath;
 
-    std::string line;
-    bool foundSessionId = false;
-    bool foundTimestamp = false;
+    try {
+        std::string line;
+        bool foundSessionId = false;
+        bool foundTimestamp = false;
 
-    // 查找会话ID和时间戳
-    while (std::getline(file, line) && (!foundSessionId || !foundTimestamp)) {
-        // 查找会话ID
-        size_t sessionPos = line.find("data-session-id=\"");
-        if (!foundSessionId && sessionPos != std::string::npos) {
-            sessionPos += 16; // "data-session-id=\"" 的长度
-            size_t endPos = line.find("\"", sessionPos);
-            if (endPos != std::string::npos) {
-                reportData.sessionId = line.substr(sessionPos, endPos - sessionPos);
-                foundSessionId = true;
+        // 设置安全限制，防止无限循环
+        int lineCount = 0;
+        const int MAX_LINES = 1000;
+
+        // 查找会话ID和时间戳
+        while (std::getline(file, line) && lineCount++ < MAX_LINES && (!foundSessionId || !foundTimestamp)) {
+            // 查找会话ID
+            size_t sessionPos = line.find("data-session-id=\"");
+            if (!foundSessionId && sessionPos != std::string::npos) {
+                sessionPos += 16; // "data-session-id=\"" 的长度
+                size_t endPos = line.find("\"", sessionPos);
+                if (endPos != std::string::npos) {
+                    reportData.sessionId = line.substr(sessionPos, endPos - sessionPos);
+                    foundSessionId = true;
+                    LogMessage("[ParseReportData] 找到会话ID: %s", reportData.sessionId.c_str());
+                }
             }
+
+            // 查找时间戳
+            size_t timestampPos = line.find("data-timestamp=\"");
+            if (!foundTimestamp && timestampPos != std::string::npos) {
+                timestampPos += 16; // "data-timestamp=\"" 的长度
+                size_t endPos = line.find("\"", timestampPos);
+                if (endPos != std::string::npos) {
+                    reportData.timestamp = line.substr(timestampPos, endPos - timestampPos);
+                    foundTimestamp = true;
+                    LogMessage("[ParseReportData] 找到时间戳: %s", reportData.timestamp.c_str());
+                }
+            }
+
+            // 其他解析逻辑保持不变...
         }
 
-        // 查找时间戳
-        size_t timestampPos = line.find("data-timestamp=\"");
-        if (!foundTimestamp && timestampPos != std::string::npos) {
-            timestampPos += 16; // "data-timestamp=\"" 的长度
-            size_t endPos = line.find("\"", timestampPos);
-            if (endPos != std::string::npos) {
-                reportData.timestamp = line.substr(timestampPos, endPos - timestampPos);
-                foundTimestamp = true;
-            }
+        if (lineCount >= MAX_LINES) {
+            LogMessage("[ParseReportData] 警告: 已达到最大行数限制 (%d)", MAX_LINES);
         }
 
-        // 查找总分配次数
-        size_t allocCountPos = line.find("data-total-alloc-count=\"");
-        if (allocCountPos != std::string::npos) {
-            allocCountPos += 23; // "data-total-alloc-count=\"" 的长度
-            size_t endPos = line.find("\"", allocCountPos);
-            if (endPos != std::string::npos) {
-                reportData.totalAllocations = std::stoull(line.substr(allocCountPos, endPos - allocCountPos));
-            }
+        // 如果缺少关键数据，视为解析失败
+        if (!foundSessionId || !foundTimestamp) {
+            LogMessage("[ParseReportData] 错误: 文件缺少必要的元数据 (SessionID: %d, Timestamp: %d)",
+                foundSessionId, foundTimestamp);
+            return false;
         }
 
-        // 查找总释放次数
-        size_t freeCountPos = line.find("data-total-free-count=\"");
-        if (freeCountPos != std::string::npos) {
-            freeCountPos += 22; // "data-total-free-count=\"" 的长度
-            size_t endPos = line.find("\"", freeCountPos);
-            if (endPos != std::string::npos) {
-                reportData.totalFrees = std::stoull(line.substr(freeCountPos, endPos - freeCountPos));
-            }
-        }
-
-        // 查找未释放数量
-        size_t unreleasedPos = line.find("data-unreleased-count=\"");
-        if (unreleasedPos != std::string::npos) {
-            unreleasedPos += 23; // "data-unreleased-count=\"" 的长度
-            size_t endPos = line.find("\"", unreleasedPos);
-            if (endPos != std::string::npos) {
-                reportData.unreleased = std::stoull(line.substr(unreleasedPos, endPos - unreleasedPos));
-            }
-        }
-
-        // 查找总分配内存
-        size_t allocSizePos = line.find("data-total-alloc-mb=\"");
-        if (allocSizePos != std::string::npos) {
-            allocSizePos += 21; // "data-total-alloc-mb=\"" 的长度
-            size_t endPos = line.find("\"", allocSizePos);
-            if (endPos != std::string::npos) {
-                reportData.totalAllocatedMB = std::stod(line.substr(allocSizePos, endPos - allocSizePos));
-            }
-        }
-
-        // 查找总释放内存
-        size_t freeSizePos = line.find("data-total-free-mb=\"");
-        if (freeSizePos != std::string::npos) {
-            freeSizePos += 20; // "data-total-free-mb=\"" 的长度
-            size_t endPos = line.find("\"", freeSizePos);
-            if (endPos != std::string::npos) {
-                reportData.totalFreedMB = std::stod(line.substr(freeSizePos, endPos - freeSizePos));
-            }
-        }
-
-        // 查找泄漏内存
-        size_t leakSizePos = line.find("data-leaked-mb=\"");
-        if (leakSizePos != std::string::npos) {
-            leakSizePos += 16; // "data-leaked-mb=\"" 的长度
-            size_t endPos = line.find("\"", leakSizePos);
-            if (endPos != std::string::npos) {
-                reportData.leakedMemoryMB = std::stod(line.substr(leakSizePos, endPos - leakSizePos));
-            }
-        }
+        LogMessage("[ParseReportData] 解析成功");
+        return true;
     }
-
-    // 如果缺少关键数据，视为解析失败
-    if (!foundSessionId || !foundTimestamp) {
+    catch (const std::exception& e) {
+        LogMessage("[ParseReportData] 解析文件时发生异常: %s", e.what());
         return false;
     }
-
-    return true;
+    catch (...) {
+        LogMessage("[ParseReportData] 解析文件时发生未知异常");
+        return false;
+    }
 }
 
 // 生成报告并存储数据到历史记录

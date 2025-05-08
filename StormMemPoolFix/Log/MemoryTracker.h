@@ -106,10 +106,10 @@ public:
     MemoryReportData GenerateAndStoreReport(const char* filename = nullptr);
 
     // 从目录中加载所有历史报告数据
-    bool LoadReports(const char* directory = nullptr);
+    bool LoadReports(const char* directory = nullptr, bool callerHoldsLock = false);
 
     // 清除非当前会话的报告
-    void CleanupOldReports();
+    void CleanupOldReports(bool callerHoldsLock = false);
 
     // 获取所有报告数据的列表
     const std::vector<MemoryReportData>& GetReportHistory() const { return m_reportHistory; }
@@ -122,6 +122,9 @@ public:
 
     // 获取当前时间字符串 - 公开此方法供其他模块使用
     std::string GetTimeString();
+
+    // 创建报告目录
+    bool EnsureDirectoryExists(const std::string& dirPath);
 
     // 生成唯一ID字符串
     static std::string GenerateUniqueId();
@@ -163,9 +166,6 @@ private:
 
     // 解析HTML报告中的数据
     bool ParseReportData(const std::string& filePath, MemoryReportData& reportData);
-
-    // 创建报告目录
-    bool EnsureDirectoryExists(const std::string& dirPath);
 
     // 获取目录下的所有HTML报告文件
     std::vector<std::string> GetReportFiles(const std::string& directory);
