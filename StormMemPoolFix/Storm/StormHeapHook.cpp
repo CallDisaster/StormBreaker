@@ -332,41 +332,41 @@ void* __fastcall StormHeap_AllocHook(DWORD* pHeap, int a2, int flags, size_t siz
     return pUserPtr;
 }
 
-char* __fastcall Hook_StormHeap_CombineFreeBlocks(int a1, unsigned __int16* blockHeader, int* a3, char* a4) {
-    // 先执行原始函数
-    char* result = s_origStormHeap_CombineFreeBlocks(a1, blockHeader, a3, a4);
+//char* __fastcall Hook_StormHeap_CombineFreeBlocks(int a1, unsigned __int16* blockHeader, int* a3, char* a4) {
+//    // 先执行原始函数
+//    char* result = s_origStormHeap_CombineFreeBlocks(a1, blockHeader, a3, a4);
+//
+//    // 检查堆状态和碎片化程度
+//    DWORD* heap = (DWORD*)a1;
+//    if (heap && heap[7] > 0 && heap[8] > 0) {
+//        // 计算碎片化率：已分配内存中的空闲比例
+//        float fragRatio = (float)heap[8] / (float)heap[7];
+//
+//        // 超过75%碎片化率时，强制整理
+//        if (fragRatio > 0.75f) {
+//            s_origStormHeap_RebuildFreeList(heap);
+//            LogMessage("[优化] 检测到高碎片化率(%.1f%%)，执行强制内存整理", fragRatio * 100.0f);
+//        }
+//    }
+//
+//    return result;
+//}
 
-    // 检查堆状态和碎片化程度
-    DWORD* heap = (DWORD*)a1;
-    if (heap && heap[7] > 0 && heap[8] > 0) {
-        // 计算碎片化率：已分配内存中的空闲比例
-        float fragRatio = (float)heap[8] / (float)heap[7];
-
-        // 超过75%碎片化率时，强制整理
-        if (fragRatio > 0.75f) {
-            s_origStormHeap_RebuildFreeList(heap);
-            LogMessage("[优化] 检测到高碎片化率(%.1f%%)，执行强制内存整理", fragRatio * 100.0f);
-        }
-    }
-
-    return result;
-}
-
-DWORD* __fastcall Hooked_StormHeap_RebuildFreeList(DWORD* heap) {
-    // 调用原始函数
-    DWORD* result = s_origStormHeap_RebuildFreeList(heap);
-
-    // 检查内存使用量，主动回收未使用的内存池
-    static DWORD lastCleanupTime = 0;
-    DWORD currentTime = GetTickCount();
-
-    if (currentTime - lastCleanupTime > 30000) { // 每30秒
-        lastCleanupTime = currentTime;
-        MemPool::CheckAndFreeUnusedPools();
-    }
-
-    return result;
-}
+//DWORD* __fastcall Hooked_StormHeap_RebuildFreeList(DWORD* heap) {
+//    // 调用原始函数
+//    DWORD* result = s_origStormHeap_RebuildFreeList(heap);
+//
+//    // 检查内存使用量，主动回收未使用的内存池
+//    static DWORD lastCleanupTime = 0;
+//    DWORD currentTime = GetTickCount();
+//
+//    if (currentTime - lastCleanupTime > 30000) { // 每30秒
+//        lastCleanupTime = currentTime;
+//        MemPool::CheckAndFreeUnusedPools();
+//    }
+//
+//    return result;
+//}
 
 // ============== 其他 Hook (保留空壳) ==============
 
@@ -409,7 +409,7 @@ bool HookAllStormHeapFunctions()
 
     // 如果你想 Hook 更多:
     // DetourAttach(&(PVOID&)s_origStormHeap_RebuildFreeList,  Hooked_StormHeap_RebuildFreeList);
-    DetourAttach(&(PVOID&)s_origStormHeap_CombineFreeBlocks,Hooked_StormHeap_CombineFreeBlocks);
+    //DetourAttach(&(PVOID&)s_origStormHeap_CombineFreeBlocks, Hook_StormHeap_CombineFreeBlocks);
     // ...
 
     LONG error = DetourTransactionCommit();

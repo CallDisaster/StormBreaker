@@ -5,7 +5,7 @@
 // Date: 2025-03-02
 // Description: 延缓 Warcraft III 旧版本 Storm.dll 的虚拟内存增长过快的问题
 
-#include "pch.h"
+#include "pch.h"    
 #include <windows.h>
 #include <iostream>
 #include <cstdio>
@@ -15,6 +15,7 @@
 #include <Storm/StormOffsets.h>
 #include <mimalloc.h>
 #include <Storm/StormHeap.h>
+#include <Game/GameHook.h>
 
 void CreateConsole()
 {
@@ -58,8 +59,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             std::cout << "StormHeapHook 初始化失败！" << std::endl;
         }
 
+        if (InitializeGameHook()) {
+            std::cout << "GameHook 初始化成功！" << std::endl;
+            featureActivationCount++;
+        }
+        else {
+            std::cout << "GameHook 初始化失败！" << std::endl;
+        }
+        
+
         // 根据 featureActivationCount 输出最终状态
-        if (featureActivationCount == 2) {
+        if (featureActivationCount == 3) {
             std::cout << "所有系统启动成功！" << std::endl;
             std::cout << "Hello StormBreaker!" << std::endl;
         }
