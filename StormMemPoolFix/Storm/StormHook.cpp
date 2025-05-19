@@ -36,9 +36,6 @@ static std::atomic<MemoryTrackingLevel> g_trackingLevel{ MemoryTrackingLevel::Ba
 
 MemorySafety& g_MemSafety = MemorySafety::GetInstance();
 
-// 全局内存跟踪器实例化
-MemoryTracker g_memoryTracker;
-
 // 特殊块过滤器列表 - 无需修改
 static std::vector<SpecialBlockFilter> g_specialFilters = {
     // JassVM 相关分配，使用独立的低地址内存
