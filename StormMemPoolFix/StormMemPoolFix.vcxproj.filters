@@ -43,6 +43,18 @@
     <Filter Include="头文件\Game\GameDllReverse">
       <UniqueIdentifier>{bb82f8b6-a176-41de-9fcf-7f01095637b5}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\Utils">
+      <UniqueIdentifier>{0ef6dedd-a732-488a-acc6-3252eab988da}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\Utils\Resource">
+      <UniqueIdentifier>{da5d2eb6-6ea0-4a4c-816a-1c63586c014e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Utils">
+      <UniqueIdentifier>{6b047329-7af2-4230-9c07-fcc6a9bbacf7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Utils\Resource">
+      <UniqueIdentifier>{b0c4bad3-b16a-4244-9099-485931be2147}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framework.h">
@@ -87,6 +99,12 @@
     <ClInclude Include="Game\GameHook.h">
       <Filter>头文件\Game</Filter>
     </ClInclude>
+    <ClInclude Include="resource.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Utils\Resource\WebResourceExtractor.h">
+      <Filter>头文件\Utils\Resource</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -128,5 +146,16 @@
     <ClCompile Include="Game\GameDllReverse\AIL.cpp">
       <Filter>源文件\Game\GameDllReverse</Filter>
     </ClCompile>
+    <ClCompile Include="Utils\Resource\WebResourceExtractor.cpp">
+      <Filter>源文件\Utils\Resource</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="StormBreaker.rc">
+      <Filter>资源文件</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Utils\Resource\index.html" />
   </ItemGroup>
 </Project>

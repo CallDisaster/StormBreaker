@@ -1,0 +1,1535 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>内存监控实时可视化面板</title>
+    
+    <!-- 核心样式与布局 -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    
+    <!-- 表格样式 -->
+    <link href="https://cdn.jsdelivr.net/npm/datatables.net-bs5@1.13.9/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+    
+    <!-- 图标库 -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    
+    <style>
+        :root {
+            --transition-speed: 400ms;
+            --card-hover-transform: translateY(-5px);
+            --card-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            --card-hover-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+        }
+        
+        body {
+            opacity: 0;
+            transition: opacity var(--transition-speed) ease;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        body.loaded {
+            opacity: 1;
+        }
+        
+        .card {
+            transition: all var(--transition-speed) ease;
+            box-shadow: var(--card-shadow);
+            border: none;
+            border-radius: 0.75rem;
+        }
+        
+        .card:hover {
+            transform: var(--card-hover-transform);
+            box-shadow: var(--card-hover-shadow);
+        }
+        
+        .stats-card {
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .stats-card .card-icon {
+            position: absolute;
+            bottom: -15px;
+            right: -15px;
+            font-size: 5rem;
+            opacity: 0.1;
+            transform: rotate(-15deg);
+        }
+        
+        .trend-up {
+            color: #dc3545;
+        }
+        
+        .trend-down {
+            color: #198754;
+        }
+        
+        .trend-neutral {
+            color: #6c757d;
+        }
+        
+        .chart-container {
+            min-height: 300px;
+            width: 100%;
+        }
+        
+        .type-row {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .type-row:hover {
+            background-color: rgba(0, 123, 255, 0.05) !important;
+        }
+        
+        .type-row.leak-warning {
+            background-color: rgba(255, 193, 7, 0.1);
+        }
+        
+        .update-pulse {
+            animation: pulse 2s;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .main-content {
+            flex: 1;
+        }
+        
+        footer {
+            margin-top: auto;
+        }
+        
+        /* 暗色模式适配 */
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --card-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+                --card-hover-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            }
+            
+            body {
+                background-color: #121212;
+                color: #e0e0e0;
+            }
+            
+            .card {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+            }
+            
+            .modal-content {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+            }
+            
+            .table {
+                color: #e0e0e0;
+            }
+            
+            .type-row:hover {
+                background-color: rgba(255, 255, 255, 0.05) !important;
+            }
+            
+            .type-row.leak-warning {
+                background-color: rgba(255, 193, 7, 0.15);
+            }
+        }
+    </style>
+</head>
+<body data-bs-theme="auto">
+    <div class="container-fluid py-4 main-content">
+        <!-- 会话信息 -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="d-flex justify-content-between align-items-center">
+                    <h1><i class="fas fa-memory me-2"></i>内存监控面板</h1>
+                    <div class="badge bg-primary fs-6 py-2 px-3">
+                        <i class="fas fa-fingerprint me-1"></i>
+                        会话ID: <span id="session-id">loading...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 核心指标卡片 -->
+        <div class="row mb-4">
+            <div class="col-md-4 col-lg-2 mb-4">
+                <div class="card stats-card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">当前虚拟内存</h6>
+                        <h3 class="card-title" id="current-vm">--</h3>
+                        <p class="card-text mb-0"><span id="current-vm-trend"></span></p>
+                        <div class="card-icon">
+                            <i class="fas fa-microchip"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-4 col-lg-2 mb-4">
+                <div class="card stats-card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">峰值虚拟内存</h6>
+                        <h3 class="card-title" id="peak-vm">--</h3>
+                        <p class="card-text mb-0">历史最高值</p>
+                        <div class="card-icon">
+                            <i class="fas fa-arrow-trend-up"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-4 col-lg-2 mb-4">
+                <div class="card stats-card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">总分配内存</h6>
+                        <h3 class="card-title" id="total-alloc">--</h3>
+                        <p class="card-text mb-0">所有类型累计</p>
+                        <div class="card-icon">
+                            <i class="fas fa-plus-circle"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-4 col-lg-2 mb-4">
+                <div class="card stats-card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">总释放内存</h6>
+                        <h3 class="card-title" id="total-freed">--</h3>
+                        <p class="card-text mb-0">所有类型累计</p>
+                        <div class="card-icon">
+                            <i class="fas fa-minus-circle"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-4 col-lg-2 mb-4">
+                <div class="card stats-card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">内存泄漏</h6>
+                        <h3 class="card-title" id="memory-leak">--</h3>
+                        <p class="card-text mb-0">分配 - 释放</p>
+                        <div class="card-icon">
+                            <i class="fas fa-exclamation-triangle"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-4 col-lg-2 mb-4">
+                <div class="card stats-card h-100">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2 text-muted">平均回收率</h6>
+                        <h3 class="card-title" id="recovery-rate">--</h3>
+                        <p class="card-text mb-0">释放 / 分配</p>
+                        <div class="card-icon">
+                            <i class="fas fa-recycle"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 时间轴趋势图 -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0"><i class="fas fa-chart-line me-2"></i>内存使用趋势</h5>
+                        <div class="btn-group" role="group">
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="zoom-1h">1小时</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="zoom-3h">3小时</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="zoom-all">全部</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="chart-container" id="timeline-chart"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 类型分配表格 -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="fas fa-table me-2"></i>内存分配类型详情</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-hover" id="types-table">
+                                <thead>
+                                    <tr>
+                                        <th>类型/文件</th>
+                                        <th>分配次数</th>
+                                        <th>分配内存(MB)</th>
+                                        <th>释放内存(MB)</th>
+                                        <th>回收率(%)</th>
+                                        <th>泄漏内存(MB)</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- 数据将通过JS动态填充 -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 底部状态栏 -->
+    <footer class="py-3 bg-body-tertiary">
+        <div class="container-fluid">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <span id="last-update">最后更新: --</span>
+                    <span class="ms-2" id="update-status"></span>
+                </div>
+                <div>
+                    <button class="btn btn-sm btn-outline-primary" id="download-json">
+                        <i class="fas fa-download me-1"></i>下载原始数据
+                    </button>
+                    <button class="btn btn-sm btn-outline-secondary ms-2" id="toggle-theme">
+                        <i class="fas fa-moon me-1"></i>切换主题
+                    </button>
+                </div>
+            </div>
+        </div>
+    </footer>
+    
+    <!-- 类型详情模态框 -->
+    <div class="modal fade" id="type-details-modal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="modal-type-name">类型详情</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="row mb-4">
+                        <div class="col-md-8">
+                            <div class="chart-container" id="type-timeline-chart"></div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="chart-container" id="type-distribution-chart"></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-12">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h6 class="mb-0">详细统计</h6>
+                                </div>
+                                <div class="card-body">
+                                    <div class="row">
+                                        <div class="col-md-3 mb-3">
+                                            <div class="card stats-card">
+                                                <div class="card-body py-2">
+                                                    <p class="card-text mb-0 text-muted small">最大分配</p>
+                                                    <h5 class="card-title mb-0" id="modal-max-alloc">--</h5>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <div class="card stats-card">
+                                                <div class="card-body py-2">
+                                                    <p class="card-text mb-0 text-muted small">最大释放</p>
+                                                    <h5 class="card-title mb-0" id="modal-max-freed">--</h5>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <div class="card stats-card">
+                                                <div class="card-body py-2">
+                                                    <p class="card-text mb-0 text-muted small">峰值净占用</p>
+                                                    <h5 class="card-title mb-0" id="modal-peak-usage">--</h5>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <div class="card stats-card">
+                                                <div class="card-body py-2">
+                                                    <p class="card-text mb-0 text-muted small">当前占用比例</p>
+                                                    <h5 class="card-title mb-0" id="modal-current-percentage">--</h5>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                    <button type="button" class="btn btn-primary" id="export-type-csv">
+                        <i class="fas fa-file-csv me-1"></i>导出CSV
+                    </button>
+                    <button type="button" class="btn btn-success" id="show-in-timeline">
+                        <i class="fas fa-search me-1"></i>在时间轴查看
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript依赖 -->
+    <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.49.1/dist/apexcharts.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/datatables.net@1.13.9/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/datatables.net-bs5@1.13.9/js/dataTables.bootstrap5.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/countup.js@2.8.0/dist/countUp.min.js"></script>
+    
+    <!-- 核心应用逻辑 -->
+    <script>
+        // 全局变量
+        let memoryData = [];  // 所有时间点数据
+        let typeData = {};    // 按类型汇总数据
+        let mainChart = null; // 主时间轴图表
+        let typesTable = null; // 类型表格
+        let currentTheme = 'auto'; // 当前主题
+        let selectedType = null;   // 当前选中的类型
+        let typeDetailsCharts = {}; // 类型详情图表
+        
+        // DOM就绪后初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            // 设置主题
+            setInitialTheme();
+            
+            // 加载数据
+            loadData();
+            
+            // 设置自动刷新
+            setInterval(refreshData, 30000);
+            
+            // 设置事件处理
+            setupEventHandlers();
+        });
+        
+        // 设置初始主题
+        function setInitialTheme() {
+            // 检测系统主题
+            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                document.body.setAttribute('data-bs-theme', 'dark');
+                currentTheme = 'dark';
+            } else {
+                document.body.setAttribute('data-bs-theme', 'light');
+                currentTheme = 'light';
+            }
+            
+            // 监听系统主题变化
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+                if (currentTheme === 'auto') {
+                    document.body.setAttribute('data-bs-theme', e.matches ? 'dark' : 'light');
+                }
+            });
+        }
+        
+        // 设置事件处理器
+        function setupEventHandlers() {
+            // 主题切换按钮
+            document.getElementById('toggle-theme').addEventListener('click', toggleTheme);
+            
+            // 缩放按钮
+            document.getElementById('zoom-1h').addEventListener('click', () => zoomTimeline(1));
+            document.getElementById('zoom-3h').addEventListener('click', () => zoomTimeline(3));
+            document.getElementById('zoom-all').addEventListener('click', () => zoomTimeline(0));
+            
+            // 数据下载按钮
+            document.getElementById('download-json').addEventListener('click', downloadData);
+            
+            // 类型详情模态框CSV导出按钮
+            document.getElementById('export-type-csv').addEventListener('click', exportTypeCSV);
+            
+            // 类型详情模态框在时间轴查看按钮
+            document.getElementById('show-in-timeline').addEventListener('click', showTypeInTimeline);
+        }
+        
+        // 切换主题
+        function toggleTheme() {
+            const btn = document.getElementById('toggle-theme');
+            const icon = btn.querySelector('i');
+            
+            if (currentTheme === 'light' || (currentTheme === 'auto' && !window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                document.body.setAttribute('data-bs-theme', 'dark');
+                currentTheme = 'dark';
+                icon.className = 'fas fa-sun me-1';
+            } else {
+                document.body.setAttribute('data-bs-theme', 'light');
+                currentTheme = 'light';
+                icon.className = 'fas fa-moon me-1';
+            }
+            
+            // 重新绘制所有图表以适应新主题
+            if (mainChart) {
+                updateChartsTheme();
+            }
+        }
+        
+        // 更新图表主题
+        function updateChartsTheme() {
+            const isDark = document.body.getAttribute('data-bs-theme') === 'dark';
+            const textColor = isDark ? '#e0e0e0' : '#373d3f';
+            const gridColor = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
+            
+            // 更新主图表
+            if (mainChart) {
+                mainChart.updateOptions({
+                    theme: {
+                        mode: isDark ? 'dark' : 'light'
+                    },
+                    grid: {
+                        borderColor: gridColor
+                    },
+                    xaxis: {
+                        labels: {
+                            style: {
+                                colors: textColor
+                            }
+                        }
+                    },
+                    yaxis: {
+                        labels: {
+                            style: {
+                                colors: textColor
+                            }
+                        }
+                    }
+                });
+            }
+            
+            // 更新类型详情图表
+            if (typeDetailsCharts.timeline) {
+                typeDetailsCharts.timeline.updateOptions({
+                    theme: {
+                        mode: isDark ? 'dark' : 'light'
+                    },
+                    grid: {
+                        borderColor: gridColor
+                    },
+                    xaxis: {
+                        labels: {
+                            style: {
+                                colors: textColor
+                            }
+                        }
+                    },
+                    yaxis: {
+                        labels: {
+                            style: {
+                                colors: textColor
+                            }
+                        }
+                    }
+                });
+            }
+            
+            if (typeDetailsCharts.distribution) {
+                typeDetailsCharts.distribution.updateOptions({
+                    theme: {
+                        mode: isDark ? 'dark' : 'light'
+                    },
+                    labels: {
+                        style: {
+                            colors: textColor
+                        }
+                    }
+                });
+            }
+        }
+        
+        // 缩放时间轴
+        function zoomTimeline(hours) {
+            if (!mainChart || memoryData.length === 0) return;
+            
+            if (hours === 0) {
+                // 显示全部
+                mainChart.zoomX(
+                    new Date(memoryData[0].ts).getTime(),
+                    new Date(memoryData[memoryData.length - 1].ts).getTime()
+                );
+            } else {
+                // 显示最近N小时
+                const now = new Date(memoryData[memoryData.length - 1].ts);
+                const past = new Date(now);
+                past.setHours(now.getHours() - hours);
+                
+                mainChart.zoomX(
+                    past.getTime(),
+                    now.getTime()
+                );
+            }
+        }
+        
+        // 加载数据
+        function loadData() {
+            // 显示加载状态
+            document.getElementById('update-status').innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 加载中...';
+            
+            // 发起请求
+            fetch('data.json')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    memoryData = data;
+                    
+                    // 处理数据
+                    processData();
+                    
+                    // 渲染UI
+                    renderUI();
+                    
+                    // 标记加载完成
+                    document.getElementById('update-status').textContent = '加载完成';
+                    document.body.classList.add('loaded');
+                    
+                    // 2秒后清除状态
+                    setTimeout(() => {
+                        document.getElementById('update-status').textContent = '';
+                    }, 2000);
+                })
+                .catch(error => {
+                    console.error('数据加载失败:', error);
+                    document.getElementById('update-status').innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-circle"></i> 加载失败</span>';
+                    
+                    // 创建示例数据（仅用于演示）
+                    createDemoData();
+                    
+                    // 处理数据
+                    processData();
+                    
+                    // 渲染UI
+                    renderUI();
+                    
+                    // 标记加载完成
+                    document.body.classList.add('loaded');
+                });
+        }
+        
+        // 刷新数据
+        function refreshData() {
+            // 显示更新状态
+            document.getElementById('update-status').innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 更新中...';
+            
+            // 发起请求
+            fetch('data.json')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    // 检查是否有新数据
+                    if (data.length <= memoryData.length) {
+                        document.getElementById('update-status').textContent = '已是最新';
+                        setTimeout(() => {
+                            document.getElementById('update-status').textContent = '';
+                        }, 2000);
+                        return;
+                    }
+                    
+                    // 更新数据
+                    memoryData = data;
+                    
+                    // 处理数据
+                    processData();
+                    
+                    // 更新UI
+                    updateUI();
+                    
+                    // 更新状态
+                    document.getElementById('update-status').textContent = '更新完成';
+                    
+                    // 触发更新动画
+                    document.querySelectorAll('.stats-card').forEach(card => {
+                        card.classList.add('update-pulse');
+                        setTimeout(() => {
+                            card.classList.remove('update-pulse');
+                        }, 2000);
+                    });
+                    
+                    // 2秒后清除状态
+                    setTimeout(() => {
+                        document.getElementById('update-status').textContent = '';
+                    }, 2000);
+                })
+                .catch(error => {
+                    console.error('数据刷新失败:', error);
+                    document.getElementById('update-status').innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-circle"></i> 更新失败</span>';
+                    
+                    // 5秒后清除状态
+                    setTimeout(() => {
+                        document.getElementById('update-status').textContent = '';
+                    }, 5000);
+                });
+        }
+        
+        // 处理数据
+        function processData() {
+            // 没有数据时退出
+            if (!memoryData || memoryData.length === 0) return;
+            
+            // 提取会话ID（从第一个数据点）
+            const sessionId = memoryData[0].sessionId || 'unknown';
+            document.getElementById('session-id').textContent = sessionId;
+            
+            // 汇总类型数据
+            typeData = {};
+            
+            memoryData.forEach(dataPoint => {
+                // 处理每个类型
+                Object.entries(dataPoint.categories || {}).forEach(([typeName, typeStats]) => {
+                    if (!typeData[typeName]) {
+                        typeData[typeName] = {
+                            allocCnt: 0,
+                            allocMB: 0,
+                            freeCnt: 0,
+                            freeMB: 0,
+                            timeline: []
+                        };
+                    }
+                    
+                    // 累加统计
+                    typeData[typeName].allocCnt = typeStats.allocCnt;
+                    typeData[typeName].allocMB = typeStats.allocMB;
+                    typeData[typeName].freeCnt = typeStats.freeCnt;
+                    typeData[typeName].freeMB = typeStats.freeMB;
+                    
+                    // 添加时间线数据点
+                    typeData[typeName].timeline.push({
+                        ts: dataPoint.ts,
+                        allocCnt: typeStats.allocCnt,
+                        allocMB: typeStats.allocMB,
+                        freeCnt: typeStats.freeCnt,
+                        freeMB: typeStats.freeMB
+                    });
+                });
+            });
+        }
+        
+        // 渲染UI
+        function renderUI() {
+            // 渲染核心指标
+            renderCoreMetrics();
+            
+            // 初始化主图表
+            initMainChart();
+            
+            // 初始化类型表格
+            initTypesTable();
+            
+            // 更新最后更新时间
+            updateLastUpdateTime();
+        }
+        
+        // 更新UI
+        function updateUI() {
+            // 更新核心指标
+            updateCoreMetrics();
+            
+            // 更新主图表
+            updateMainChart();
+            
+            // 更新类型表格
+            updateTypesTable();
+            
+            // 更新最后更新时间
+            updateLastUpdateTime();
+            
+            // 如果有模态框打开，更新模态框
+            if (selectedType && $('#type-details-modal').hasClass('show')) {
+                openTypeDetails(selectedType);
+            }
+        }
+        
+        // 渲染核心指标
+        function renderCoreMetrics() {
+            if (memoryData.length === 0) return;
+            
+            const latest = memoryData[memoryData.length - 1];
+            
+            // 计算汇总指标
+            let totalAllocMB = 0;
+            let totalFreedMB = 0;
+            
+            Object.values(typeData).forEach(type => {
+                totalAllocMB += type.allocMB;
+                totalFreedMB += type.freeMB;
+            });
+            
+            const memoryLeak = totalAllocMB - totalFreedMB;
+            const recoveryRate = totalAllocMB > 0 ? (totalFreedMB / totalAllocMB * 100).toFixed(1) : '0.0';
+            
+            // 计算峰值虚拟内存
+            const peakVM = Math.max(...memoryData.map(d => d.vmMB));
+            
+            // 使用CountUp创建动画数字
+            new CountUp('current-vm', latest.vmMB, { suffix: ' MB', decimal: 1 }).start();
+            new CountUp('peak-vm', peakVM, { suffix: ' MB', decimal: 1 }).start();
+            new CountUp('total-alloc', totalAllocMB, { suffix: ' MB', decimal: 1 }).start();
+            new CountUp('total-freed', totalFreedMB, { suffix: ' MB', decimal: 1 }).start();
+            new CountUp('memory-leak', memoryLeak, { suffix: ' MB', decimal: 1 }).start();
+            new CountUp('recovery-rate', parseFloat(recoveryRate), { suffix: ' %', decimal: 1 }).start();
+            
+            // 设置内存泄漏颜色
+            const leakElement = document.getElementById('memory-leak');
+            leakElement.classList.remove('text-danger', 'text-success');
+            if (memoryLeak > 0) {
+                leakElement.classList.add('text-danger');
+            } else {
+                leakElement.classList.add('text-success');
+            }
+            
+            // 更新趋势指示器
+            if (memoryData.length > 1) {
+                const prevVM = memoryData[memoryData.length - 2].vmMB;
+                const currentVM = latest.vmMB;
+                const trendElement = document.getElementById('current-vm-trend');
+                
+                trendElement.className = '';
+                if (currentVM > prevVM) {
+                    trendElement.classList.add('trend-up');
+                    trendElement.innerHTML = `<i class="fas fa-arrow-up"></i> +${(currentVM - prevVM).toFixed(1)} MB`;
+                } else if (currentVM < prevVM) {
+                    trendElement.classList.add('trend-down');
+                    trendElement.innerHTML = `<i class="fas fa-arrow-down"></i> ${(currentVM - prevVM).toFixed(1)} MB`;
+                } else {
+                    trendElement.classList.add('trend-neutral');
+                    trendElement.innerHTML = `<i class="fas fa-equals"></i> 无变化`;
+                }
+            }
+        }
+        
+        // 更新核心指标
+        function updateCoreMetrics() {
+            // 复用相同的逻辑，但使用update而非start
+            if (memoryData.length === 0) return;
+            
+            const latest = memoryData[memoryData.length - 1];
+            
+            // 计算汇总指标
+            let totalAllocMB = 0;
+            let totalFreedMB = 0;
+            
+            Object.values(typeData).forEach(type => {
+                totalAllocMB += type.allocMB;
+                totalFreedMB += type.freeMB;
+            });
+            
+            const memoryLeak = totalAllocMB - totalFreedMB;
+            const recoveryRate = totalAllocMB > 0 ? (totalFreedMB / totalAllocMB * 100).toFixed(1) : '0.0';
+            
+            // 计算峰值虚拟内存
+            const peakVM = Math.max(...memoryData.map(d => d.vmMB));
+            
+            // 使用CountUp更新数字
+            new CountUp('current-vm', latest.vmMB, { suffix: ' MB', decimal: 1 }).update(latest.vmMB);
+            new CountUp('peak-vm', peakVM, { suffix: ' MB', decimal: 1 }).update(peakVM);
+            new CountUp('total-alloc', totalAllocMB, { suffix: ' MB', decimal: 1 }).update(totalAllocMB);
+            new CountUp('total-freed', totalFreedMB, { suffix: ' MB', decimal: 1 }).update(totalFreedMB);
+            new CountUp('memory-leak', memoryLeak, { suffix: ' MB', decimal: 1 }).update(memoryLeak);
+            new CountUp('recovery-rate', parseFloat(recoveryRate), { suffix: ' %', decimal: 1 }).update(parseFloat(recoveryRate));
+            
+            // 设置内存泄漏颜色
+            const leakElement = document.getElementById('memory-leak');
+            leakElement.classList.remove('text-danger', 'text-success');
+            if (memoryLeak > 0) {
+                leakElement.classList.add('text-danger');
+            } else {
+                leakElement.classList.add('text-success');
+            }
+            
+            // 更新趋势指示器
+            if (memoryData.length > 1) {
+                const prevVM = memoryData[memoryData.length - 2].vmMB;
+                const currentVM = latest.vmMB;
+                const trendElement = document.getElementById('current-vm-trend');
+                
+                trendElement.className = '';
+                if (currentVM > prevVM) {
+                    trendElement.classList.add('trend-up');
+                    trendElement.innerHTML = `<i class="fas fa-arrow-up"></i> +${(currentVM - prevVM).toFixed(1)} MB`;
+                } else if (currentVM < prevVM) {
+                    trendElement.classList.add('trend-down');
+                    trendElement.innerHTML = `<i class="fas fa-arrow-down"></i> ${(currentVM - prevVM).toFixed(1)} MB`;
+                } else {
+                    trendElement.classList.add('trend-neutral');
+                    trendElement.innerHTML = `<i class="fas fa-equals"></i> 无变化`;
+                }
+            }
+        }
+        
+        // 初始化主图表
+        function initMainChart() {
+            if (memoryData.length === 0) return;
+            
+            // 准备虚拟内存时间序列数据
+            const vmSeries = {
+                name: '虚拟内存',
+                type: 'line',
+                data: memoryData.map(d => ({
+                    x: new Date(d.ts).getTime(),
+                    y: d.vmMB
+                }))
+            };
+            
+            // 准备类型分配内存堆叠面积数据
+            const typeSeries = [];
+            const topTypes = Object.entries(typeData)
+                .sort((a, b) => b[1].allocMB - a[1].allocMB)
+                .slice(0, 5)  // 仅显示前5个主要类型
+                .map(([typeName]) => typeName);
+                
+            topTypes.forEach(typeName => {
+                const typeTimeline = [];
+                
+                // 构建完整时间线，确保每个时间点都有数据
+                memoryData.forEach(dataPoint => {
+                    const timestamp = new Date(dataPoint.ts).getTime();
+                    const typeStats = dataPoint.categories[typeName];
+                    
+                    if (typeStats) {
+                        const netUsage = typeStats.allocMB - typeStats.freeMB;
+                        typeTimeline.push({
+                            x: timestamp,
+                            y: netUsage > 0 ? netUsage : 0  // 不显示负值
+                        });
+                    } else {
+                        // 如果此时间点没有该类型的数据，使用0
+                        typeTimeline.push({
+                            x: timestamp,
+                            y: 0
+                        });
+                    }
+                });
+                
+                typeSeries.push({
+                    name: typeName,
+                    type: 'area',
+                    data: typeTimeline
+                });
+            });
+            
+            // 合并所有系列
+            const allSeries = [vmSeries, ...typeSeries];
+            
+            // 创建主图表
+            const options = {
+                series: allSeries,
+                chart: {
+                    height: 350,
+                    type: 'line',
+                    stacked: false,
+                    animations: {
+                        enabled: true,
+                        easing: 'easeinout',
+                        speed: 800
+                    },
+                    toolbar: {
+                        show: true,
+                        tools: {
+                            download: true,
+                            selection: true,
+                            zoom: true,
+                            zoomin: true,
+                            zoomout: true,
+                            pan: true,
+                            reset: true
+                        }
+                    },
+                    zoom: {
+                        enabled: true,
+                        type: 'x'
+                    }
+                },
+                stroke: {
+                    curve: 'smooth',
+                    width: [4, 2, 2, 2, 2, 2],
+                    dashArray: [0, 0, 0, 0, 0, 0]
+                },
+                fill: {
+                    type: ['solid', 'gradient', 'gradient', 'gradient', 'gradient', 'gradient'],
+                    opacity: [1, 0.7, 0.7, 0.7, 0.7, 0.7]
+                },
+                colors: ['#2E93fA', '#FF9800', '#66DA26', '#546E7A', '#E91E63', '#9C27B0'],
+                title: {
+                    text: '内存使用趋势',
+                    align: 'left'
+                },
+                xaxis: {
+                    type: 'datetime',
+                    labels: {
+                        datetimeUTC: false,
+                        format: 'HH:mm:ss'
+                    },
+                    title: {
+                        text: '时间'
+                    }
+                },
+                yaxis: [
+                    {
+                        title: {
+                            text: '内存用量 (MB)'
+                        },
+                        min: 0
+                    }
+                ],
+                legend: {
+                    position: 'top',
+                    horizontalAlign: 'right'
+                },
+                tooltip: {
+                    shared: true,
+                    intersect: false,
+                    x: {
+                        format: 'yyyy-MM-dd HH:mm:ss'
+                    }
+                },
+                theme: {
+                    mode: document.body.getAttribute('data-bs-theme') === 'dark' ? 'dark' : 'light'
+                }
+            };
+            
+            mainChart = new ApexCharts(document.getElementById('timeline-chart'), options);
+            mainChart.render();
+        }
+        
+        // 更新主图表
+        function updateMainChart() {
+            if (!mainChart || memoryData.length === 0) return;
+            
+            // 准备虚拟内存时间序列数据
+            const vmSeries = {
+                name: '虚拟内存',
+                type: 'line',
+                data: memoryData.map(d => ({
+                    x: new Date(d.ts).getTime(),
+                    y: d.vmMB
+                }))
+            };
+            
+            // 准备类型分配内存堆叠面积数据
+            const typeSeries = [];
+            const topTypes = Object.entries(typeData)
+                .sort((a, b) => b[1].allocMB - a[1].allocMB)
+                .slice(0, 5)  // 仅显示前5个主要类型
+                .map(([typeName]) => typeName);
+                
+            topTypes.forEach(typeName => {
+                const typeTimeline = [];
+                
+                // 构建完整时间线，确保每个时间点都有数据
+                memoryData.forEach(dataPoint => {
+                    const timestamp = new Date(dataPoint.ts).getTime();
+                    const typeStats = dataPoint.categories[typeName];
+                    
+                    if (typeStats) {
+                        const netUsage = typeStats.allocMB - typeStats.freeMB;
+                        typeTimeline.push({
+                            x: timestamp,
+                            y: netUsage > 0 ? netUsage : 0  // 不显示负值
+                        });
+                    } else {
+                        // 如果此时间点没有该类型的数据，使用0
+                        typeTimeline.push({
+                            x: timestamp,
+                            y: 0
+                        });
+                    }
+                });
+                
+                typeSeries.push({
+                    name: typeName,
+                    type: 'area',
+                    data: typeTimeline
+                });
+            });
+            
+            // 合并所有系列
+            const allSeries = [vmSeries, ...typeSeries];
+            
+            // 更新图表数据
+            mainChart.updateSeries(allSeries);
+        }
+        
+        // 初始化类型表格
+        function initTypesTable() {
+            if (Object.keys(typeData).length === 0) return;
+            
+            // 准备表格数据
+            const tableData = [];
+            Object.entries(typeData).forEach(([typeName, stats]) => {
+                const recoveryRate = stats.allocMB > 0 ? (stats.freeMB / stats.allocMB * 100).toFixed(1) : '0.0';
+                const leakMB = Math.max(0, stats.allocMB - stats.freeMB).toFixed(1);
+                
+                tableData.push([
+                    typeName,
+                    stats.allocCnt.toLocaleString(),
+                    stats.allocMB.toFixed(1),
+                    stats.freeMB.toFixed(1),
+                    recoveryRate,
+                    leakMB,
+                    '<button class="btn btn-sm btn-primary view-details"><i class="fas fa-chart-line"></i></button>'
+                ]);
+            });
+            
+            // 初始化DataTables
+            typesTable = $('#types-table').DataTable({
+                data: tableData,
+                columns: [
+                    { title: '类型/文件' },
+                    { title: '分配次数' },
+                    { title: '分配内存(MB)' },
+                    { title: '释放内存(MB)' },
+                    { title: '回收率(%)' },
+                    { title: '泄漏内存(MB)' },
+                    { title: '操作', orderable: false }
+                ],
+                order: [[2, 'desc']],  // 默认按分配内存倒序
+                pageLength: 10,
+                lengthMenu: [10, 25, 50, 100],
+                language: {
+                    search: "搜索:",
+                    lengthMenu: "显示 _MENU_ 条记录",
+                    info: "显示 _START_ 到 _END_ 共 _TOTAL_ 条记录",
+                    infoEmpty: "没有记录",
+                    infoFiltered: "(从 _MAX_ 条记录过滤)",
+                    paginate: {
+                        first: "首页",
+                        last: "末页",
+                        next: "下一页",
+                        previous: "上一页"
+                    }
+                },
+                createdRow: function(row, data, index) {
+                    // 添加行点击事件
+                    $(row).addClass('type-row');
+                    $(row).on('click', function() {
+                        openTypeDetails(data[0]);
+                    });
+                    
+                    // 为泄漏行添加警告色
+                    if (parseFloat(data[5]) > 0) {
+                        $(row).addClass('leak-warning');
+                    }
+                    
+                    // 为操作按钮添加点击事件
+                    $(row).find('.view-details').on('click', function(e) {
+                        e.stopPropagation();  // 阻止冒泡，避免触发行点击
+                        openTypeDetails(data[0]);
+                    });
+                }
+            });
+        }
+        
+        // 更新类型表格
+        function updateTypesTable() {
+            if (!typesTable || Object.keys(typeData).length === 0) return;
+            
+            // 清空表格
+            typesTable.clear();
+            
+            // 准备新数据
+            Object.entries(typeData).forEach(([typeName, stats]) => {
+                const recoveryRate = stats.allocMB > 0 ? (stats.freeMB / stats.allocMB * 100).toFixed(1) : '0.0';
+                const leakMB = Math.max(0, stats.allocMB - stats.freeMB).toFixed(1);
+                
+                typesTable.row.add([
+                    typeName,
+                    stats.allocCnt.toLocaleString(),
+                    stats.allocMB.toFixed(1),
+                    stats.freeMB.toFixed(1),
+                    recoveryRate,
+                    leakMB,
+                    '<button class="btn btn-sm btn-primary view-details"><i class="fas fa-chart-line"></i></button>'
+                ]);
+            });
+            
+            // 重绘表格
+            typesTable.draw(false);
+            
+            // 重新绑定事件
+            $('#types-table tbody tr').each(function() {
+                const typeName = $(this).find('td:first').text();
+                
+                // 添加行点击事件
+                $(this).addClass('type-row');
+                $(this).on('click', function() {
+                    openTypeDetails(typeName);
+                });
+                
+                // 为操作按钮添加点击事件
+                $(this).find('.view-details').on('click', function(e) {
+                    e.stopPropagation();  // 阻止冒泡，避免触发行点击
+                    openTypeDetails(typeName);
+                });
+            });
+        }
+        
+        // 更新最后更新时间
+        function updateLastUpdateTime() {
+            if (memoryData.length === 0) return;
+            
+            const latest = memoryData[memoryData.length - 1];
+            const latestTime = new Date(latest.ts);
+            
+            document.getElementById('last-update').textContent = `最后更新: ${latestTime.toLocaleString()}`;
+        }
+        
+        // 打开类型详情
+        function openTypeDetails(typeName) {
+            if (!typeData[typeName]) return;
+            
+            selectedType = typeName;
+            const typeInfo = typeData[typeName];
+            
+            // 设置模态框标题
+            document.getElementById('modal-type-name').textContent = typeName;
+            
+            // 计算类型的最大和当前状态指标
+            const maxAlloc = Math.max(...typeInfo.timeline.map(t => t.allocMB));
+            const maxFreed = Math.max(...typeInfo.timeline.map(t => t.freeMB));
+            const peakUsage = Math.max(...typeInfo.timeline.map(t => t.allocMB - t.freeMB));
+            
+            // 计算当前在总内存中的占比
+            let totalAllocMB = 0;
+            Object.values(typeData).forEach(type => {
+                totalAllocMB += type.allocMB;
+            });
+            
+            const currentPercentage = totalAllocMB > 0 ? 
+                ((typeInfo.allocMB / totalAllocMB) * 100).toFixed(1) : '0.0';
+            
+            // 更新详情指标
+            document.getElementById('modal-max-alloc').textContent = `${maxAlloc.toFixed(1)} MB`;
+            document.getElementById('modal-max-freed').textContent = `${maxFreed.toFixed(1)} MB`;
+            document.getElementById('modal-peak-usage').textContent = `${peakUsage.toFixed(1)} MB`;
+            document.getElementById('modal-current-percentage').textContent = `${currentPercentage}%`;
+            
+            // 初始化类型时间线图表
+            initTypeTimelineChart(typeName);
+            
+            // 初始化类型分布图表
+            initTypeDistributionChart(typeName);
+            
+            // 显示模态框
+            const modal = new bootstrap.Modal(document.getElementById('type-details-modal'));
+            modal.show();
+        }
+        
+        // 初始化类型时间线图表
+        function initTypeTimelineChart(typeName) {
+            if (!typeData[typeName]) return;
+            
+            const typeInfo = typeData[typeName];
+            
+            // 准备数据
+            const allocSeries = {
+                name: '分配内存',
+                type: 'line',
+                data: typeInfo.timeline.map(t => ({
+                    x: new Date(t.ts).getTime(),
+                    y: t.allocMB
+                }))
+            };
+            
+            const freeSeries = {
+                name: '释放内存',
+                type: 'line',
+                data: typeInfo.timeline.map(t => ({
+                    x: new Date(t.ts).getTime(),
+                    y: t.freeMB
+                }))
+            };
+            
+            const netSeries = {
+                name: '净占用',
+                type: 'area',
+                data: typeInfo.timeline.map(t => ({
+                    x: new Date(t.ts).getTime(),
+                    y: Math.max(0, t.allocMB - t.freeMB)
+                }))
+            };
+            
+            // 图表选项
+            const options = {
+                series: [allocSeries, freeSeries, netSeries],
+                chart: {
+                    height: 300,
+                    type: 'line',
+                    animations: {
+                        enabled: true,
+                        easing: 'easeinout',
+                        speed: 800
+                    },
+                    toolbar: {
+                        show: true
+                    },
+                    zoom: {
+                        enabled: true
+                    }
+                },
+                stroke: {
+                    curve: 'smooth',
+                    width: [3, 3, 1]
+                },
+                colors: ['#2E93fA', '#FF9800', '#66DA26'],
+                fill: {
+                    type: ['solid', 'solid', 'gradient'],
+                    opacity: [1, 1, 0.3]
+                },
+                title: {
+                    text: `${typeName} 内存使用趋势`,
+                    align: 'left'
+                },
+                xaxis: {
+                    type: 'datetime',
+                    labels: {
+                        datetimeUTC: false,
+                        format: 'HH:mm:ss'
+                    }
+                },
+                yaxis: {
+                    title: {
+                        text: '内存 (MB)'
+                    },
+                    min: 0
+                },
+                tooltip: {
+                    shared: true,
+                    intersect: false,
+                    x: {
+                        format: 'yyyy-MM-dd HH:mm:ss'
+                    }
+                },
+                theme: {
+                    mode: document.body.getAttribute('data-bs-theme') === 'dark' ? 'dark' : 'light'
+                }
+            };
+            
+            // 销毁旧图表（如果存在）
+            if (typeDetailsCharts.timeline) {
+                typeDetailsCharts.timeline.destroy();
+            }
+            
+            // 创建新图表
+            typeDetailsCharts.timeline = new ApexCharts(document.getElementById('type-timeline-chart'), options);
+            typeDetailsCharts.timeline.render();
+        }
+        
+        // 初始化类型分布图表
+        function initTypeDistributionChart(typeName) {
+            if (!typeData[typeName]) return;
+            
+            const typeInfo = typeData[typeName];
+            
+            // 计算当前类型和其他类型的内存占用
+            let totalAllocMB = 0;
+            Object.values(typeData).forEach(type => {
+                totalAllocMB += type.allocMB;
+            });
+            
+            const typeAllocMB = typeInfo.allocMB;
+            const otherAllocMB = totalAllocMB - typeAllocMB;
+            
+            // 图表选项
+            const options = {
+                series: [typeAllocMB, otherAllocMB],
+                chart: {
+                    type: 'donut',
+                    height: 300
+                },
+                labels: [typeName, '其他类型'],
+                colors: ['#00E396', '#CED4DC'],
+                title: {
+                    text: '内存占比分布',
+                    align: 'left'
+                },
+                dataLabels: {
+                    enabled: true,
+                    formatter: function(val, opts) {
+                        return opts.w.config.series[opts.seriesIndex].toFixed(1) + ' MB';
+                    }
+                },
+                legend: {
+                    show: true,
+                    position: 'bottom'
+                },
+                tooltip: {
+                    y: {
+                        formatter: function(value) {
+                            return value.toFixed(1) + ' MB';
+                        }
+                    }
+                },
+                theme: {
+                    mode: document.body.getAttribute('data-bs-theme') === 'dark' ? 'dark' : 'light'
+                }
+            };
+            
+            // 销毁旧图表（如果存在）
+            if (typeDetailsCharts.distribution) {
+                typeDetailsCharts.distribution.destroy();
+            }
+            
+            // 创建新图表
+            typeDetailsCharts.distribution = new ApexCharts(document.getElementById('type-distribution-chart'), options);
+            typeDetailsCharts.distribution.render();
+        }
+        
+        // 导出类型CSV
+        function exportTypeCSV() {
+            if (!selectedType || !typeData[selectedType]) return;
+            
+            const typeInfo = typeData[selectedType];
+            
+            // 构建CSV头
+            let csv = 'Timestamp,AllocCount,AllocMB,FreeCount,FreeMB,NetUsageMB\n';
+            
+            // 添加数据行
+            typeInfo.timeline.forEach(t => {
+                const timestamp = new Date(t.ts).toISOString();
+                const netUsage = (t.allocMB - t.freeMB).toFixed(2);
+                csv += `${timestamp},${t.allocCnt},${t.allocMB.toFixed(2)},${t.freeCnt},${t.freeMB.toFixed(2)},${netUsage}\n`;
+            });
+            
+            // 创建下载链接
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.setAttribute('hidden', '');
+            a.setAttribute('href', url);
+            a.setAttribute('download', `${selectedType.replace(/[^a-z0-9]/gi, '_')}_memory_data.csv`);
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+        
+        // 在时间轴中查看类型
+        function showTypeInTimeline() {
+            if (!selectedType || !typeData[selectedType] || !mainChart) return;
+            
+            // 关闭模态框
+            bootstrap.Modal.getInstance(document.getElementById('type-details-modal')).hide();
+            
+            // 聚焦到主图表相应区域
+            // 这里简单实现为将该类型名高亮，未做具体时间段选择
+            
+            // 滚动到主图表
+            document.getElementById('timeline-chart').scrollIntoView({ behavior: 'smooth' });
+            
+            // 给用户提示
+            alert(`类型 "${selectedType}" 已在主时间轴图表中高亮显示。`);
+        }
+        
+        // 下载原始数据
+        function downloadData() {
+            if (!memoryData || memoryData.length === 0) return;
+            
+            // 将数据转为格式化的JSON
+            const jsonStr = JSON.stringify(memoryData, null, 2);
+            
+            // 创建下载链接
+            const blob = new Blob([jsonStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.setAttribute('hidden', '');
+            a.setAttribute('href', url);
+            a.setAttribute('download', 'memory_data.json');
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+        
+        // 创建示例数据（仅用于演示）
+        function createDemoData() {
+            const demoData = [];
+            
+            // 创建一个会话ID
+            const sessionId = 'demo-' + Math.random().toString(36).substring(2, 10);
+            
+            // 创建示例类型
+            const demoTypes = [
+                'W32_OsSnd.cpp',
+                'BinaryData.cpp',
+                'MemoryManager.cpp',
+                'Game/World.cpp',
+                'Rendering/Shader.cpp',
+                'AI/Pathfinding.cpp'
+            ];
+            
+            // 为每个类型创建初始状态
+            const typeInitialState = {};
+            demoTypes.forEach(type => {
+                typeInitialState[type] = {
+                    allocCnt: Math.floor(Math.random() * 1000),
+                    allocMB: Math.random() * 20,
+                    freeCnt: 0,
+                    freeMB: 0
+                };
+            });
+            
+            // 生成30个时间点
+            const now = new Date();
+            for (let i = 0; i < 30; i++) {
+                const timestamp = new Date(now);
+                timestamp.setSeconds(timestamp.getSeconds() - (30 - i) * 30);
+                
+                // 随机虚拟内存
+                const vmMB = 100 + Math.random() * 100 + i * 2;
+                
+                // 更新每个类型
+                const categories = {};
+                demoTypes.forEach(type => {
+                    const prevState = i > 0 ? demoData[i-1].categories[type] : typeInitialState[type];
+                    
+                    // 随机增加分配
+                    const newAllocCnt = prevState.allocCnt + Math.floor(Math.random() * 100);
+                    const newAllocMB = prevState.allocMB + Math.random() * 5;
+                    
+                    // 随机增加释放（但始终保持小于分配）
+                    const newFreeCnt = prevState.freeCnt + Math.floor(Math.random() * (newAllocCnt - prevState.freeCnt) * 0.2);
+                    const newFreeMB = prevState.freeMB + Math.random() * Math.min(5, (newAllocMB - prevState.freeMB) * 0.3);
+                    
+                    categories[type] = {
+                        allocCnt: newAllocCnt,
+                        allocMB: newAllocMB,
+                        freeCnt: newFreeCnt,
+                        freeMB: newFreeMB
+                    };
+                });
+                
+                // 添加数据点
+                demoData.push({
+                    ts: timestamp.toISOString(),
+                    vmMB: vmMB,
+                    sessionId: sessionId,
+                    categories: categories
+                });
+            }
+            
+            memoryData = demoData;
+        }
+    </script>
+</body>
+</html>
