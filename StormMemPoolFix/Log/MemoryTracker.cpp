@@ -16,6 +16,7 @@
 #include <ctime>
 #include <Storm/StormHook.h>
 #include <direct.h> // For _mkdir
+#include <Utils/Resource/WebResourceExtractor.h>
 
 // 全局实例定义
 MemoryTracker g_memoryTracker;
@@ -80,20 +81,24 @@ bool MemoryTracker::Initialize(const char* reportsDir) {
     m_reportsDirectory = currentDir + "\\MemoryReports";
 
     // 确保目录存在
-    BOOL dirCreated = CreateDirectoryA(m_reportsDirectory.c_str(), NULL);
-    if (!dirCreated && GetLastError() != ERROR_ALREADY_EXISTS) {
-        DWORD err = GetLastError();
-        LogMessage("[MemoryTracker] 无法创建报告目录: %s (错误码: %d)",
-            m_reportsDirectory.c_str(), err);
-
-        // 如果无法创建，回退到当前目录
-        m_reportsDirectory = currentDir;
+    std::string dirPath = m_reportsDirectory;
+    if (!std::filesystem::exists(dirPath)) {
+        if (!std::filesystem::create_directories(dirPath)) {
+            LogMessage("[MemoryTracker] 无法创建报告目录: %s", dirPath.c_str());
+            // 继续执行，但后续可能会失败
+        }
     }
 
-    LogMessage("[MemoryTracker] 报告目录设置为: %s", m_reportsDirectory.c_str());
+    // 提取HTML资源到报告目录
+    std::string htmlPath = dirPath + "\\index.html";
+    if (!WebResourceExtractor::ExtractHtmlResource(htmlPath)) {
+        LogMessage("[MemoryTracker] 警告: 无法提取HTML资源，可能无法使用可视化界面");
+        // 继续执行，因为数据生成仍然可以工作
+    }
+    else {
+        LogMessage("[MemoryTracker] 已准备可视化界面: %s", htmlPath.c_str());
+    }
 
-    // 加载现有报告
-    LoadReports();
 
     LogMessage("[MemoryTracker] 初始化完成，会话ID: %s", m_sessionId.c_str());
     return true;
@@ -138,6 +143,7 @@ void MemoryTracker::StopPeriodicReporting() {
 }
 
 // 定时报告线程函数
+// 在 MemoryTracker::PeriodicReportThreadFunc 函数中修改
 void MemoryTracker::PeriodicReportThreadFunc(unsigned int period_ms) {
     while (!m_stopReporting.load()) {
         // 等待指定时间或直到停止标志被设置
@@ -149,43 +155,44 @@ void MemoryTracker::PeriodicReportThreadFunc(unsigned int period_ms) {
 
         // 生成并存储报告
         try {
-            // 获取当前工作目录，确保我们知道在哪里
+            // 获取当前工作目录
             char currentDirBuffer[MAX_PATH];
             GetCurrentDirectoryA(MAX_PATH, currentDirBuffer);
             std::string currentDir = currentDirBuffer;
-
-            // 获取时间戳（无空格）
-            std::string timeStr = GetTimeString();
-            std::string fileName = "MemoryReport_" + timeStr + ".html";
 
             // 确保MemoryReports目录存在
             std::string reportsDir = currentDir + "\\MemoryReports";
             CreateDirectoryA(reportsDir.c_str(), NULL); // 创建目录，忽略已存在的情况
 
-            // 构建完整路径 - 包含目录
-            std::string fullPath = reportsDir + "\\" + fileName;
+            // 构建JSON数据文件路径
+            std::string jsonPath = reportsDir + "\\data.json";
 
-            LogMessage("[MemoryTracker] 当前目录: %s", currentDir.c_str());
-            LogMessage("[MemoryTracker] 开始生成定时报告: %s", fullPath.c_str());
+            LogMessage("[MemoryTracker] 开始生成时间序列数据: %s", jsonPath.c_str());
 
-            // 生成报告 - 使用完整路径
-            MemoryReportData reportData = GenerateAndStoreReport(fullPath.c_str());
+            // 生成累积的JSON数据
+            bool success = GenerateTimeSeriesData(jsonPath.c_str());
 
-            // 验证文件是否创建成功
-            FILE* testFile = NULL;
-            if (fopen_s(&testFile, fullPath.c_str(), "r") == 0 && testFile) {
-                fclose(testFile);
-                LogMessage("[MemoryTracker] 定时报告已成功生成: %s", fullPath.c_str());
+            if (success) {
+                LogMessage("[MemoryTracker] 时间序列数据已成功更新: %s", jsonPath.c_str());
             }
             else {
-                LogMessage("[MemoryTracker] 定时报告生成失败, 将尝试下一次");
+                LogMessage("[MemoryTracker] 时间序列数据更新失败");
             }
+
+            // 可选：仍然生成传统的HTML报告作为备份或兼容旧版本
+            // 获取时间戳（无空格）
+            //std::string timeStr = GetTimeString();
+            //std::string fileName = "MemoryReport_" + timeStr + ".html";
+            //std::string fullPath = reportsDir + "\\" + fileName;
+
+            //// 生成HTML报告
+            //MemoryReportData reportData = GenerateAndStoreReport(fullPath.c_str());
         }
         catch (const std::exception& e) {
-            LogMessage("[MemoryTracker] 生成定时报告时出错: %s", e.what());
+            LogMessage("[MemoryTracker] 生成报告时出错: %s", e.what());
         }
         catch (...) {
-            LogMessage("[MemoryTracker] 生成定时报告时出现未知错误");
+            LogMessage("[MemoryTracker] 生成报告时出现未知错误");
         }
     }
 }
@@ -2084,6 +2091,164 @@ bool MemoryTracker::GenerateBootstrapHtmlReport(
     report.close();
     LogMessage("[MemoryTracker] 生成精美报告: %s", filename);
     return true;
+}
+
+// 生成时间序列数据到JSON文件
+bool MemoryTracker::GenerateTimeSeriesData(const char* jsonFilePath) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    try {
+        // 读取现有的JSON数据（如果有）
+        std::vector<json> existingData = ReadExistingJsonData(jsonFilePath);
+
+        // 生成当前数据点
+        json currentDataPoint = GenerateCurrentDataPoint();
+
+        // 追加当前数据点
+        existingData.push_back(currentDataPoint);
+
+        // 将整个数据数组写入临时文件
+        std::string tempFilePath = std::string(jsonFilePath) + ".tmp";
+        std::ofstream outFile(tempFilePath);
+        if (!outFile.is_open()) {
+            LogMessage("[MemoryTracker] 无法创建临时JSON文件: %s", tempFilePath.c_str());
+            return false;
+        }
+
+        // 写入格式化的JSON数组
+        outFile << json(existingData).dump(2);
+        outFile.close();
+
+        // 原子替换文件（重命名）
+        if (std::rename(tempFilePath.c_str(), jsonFilePath) != 0) {
+            LogMessage("[MemoryTracker] 无法重命名临时文件: %s -> %s",
+                tempFilePath.c_str(), jsonFilePath);
+            return false;
+        }
+
+        LogMessage("[MemoryTracker] 已成功更新时间序列数据，总采样点: %zu", existingData.size());
+        return true;
+    }
+    catch (const std::exception& e) {
+        LogMessage("[MemoryTracker] 生成JSON数据时出错: %s", e.what());
+        return false;
+    }
+}
+
+// 读取现有的JSON数据文件
+std::vector<json> MemoryTracker::ReadExistingJsonData(const char* jsonFilePath) {
+    std::vector<json> data;
+
+    // 尝试打开并读取现有文件
+    std::ifstream inFile(jsonFilePath);
+    if (inFile.is_open()) {
+        try {
+            json existingData = json::parse(inFile);
+
+            // 确保它是一个数组
+            if (existingData.is_array()) {
+                // 将每个元素添加到返回的向量中
+                for (const auto& item : existingData) {
+                    data.push_back(item);
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[MemoryTracker] 解析现有JSON文件时出错: %s", e.what());
+            // 如果解析失败，返回空数组，从头开始
+        }
+        inFile.close();
+    }
+
+    return data;
+}
+
+bool MemoryTracker::OpenInBrowser() const {
+    // 构建HTML文件的完整路径
+    char currentDir[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, currentDir);
+
+    std::string htmlPath = std::string(currentDir) + "\\" + m_reportsDirectory + "\\index.html";
+
+    // 使用Windows API打开默认浏览器
+    HINSTANCE result = ShellExecuteA(NULL, "open", htmlPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+
+    // 如果返回值大于32，则表示成功启动
+    bool success = (reinterpret_cast<INT_PTR>(result) > 32);
+
+    if (success) {
+        LogMessage("[MemoryTracker] 已在浏览器中打开内存监控界面");
+    }
+    else {
+        LogMessage("[MemoryTracker] 无法打开浏览器，错误码: %d", GetLastError());
+    }
+
+    return success;
+}
+
+// 生成当前时间点的数据快照
+json MemoryTracker::GenerateCurrentDataPoint() {
+    json dataPoint;
+
+    // 设置时间戳（ISO 8601格式）
+    auto now = std::chrono::system_clock::now();
+    auto now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm now_tm;
+    localtime_s(&now_tm, &now_c);
+    char timeBuffer[40];
+    std::strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%dT%H:%M:%S%z", &now_tm);
+
+    // 包装时区格式为标准ISO 8601格式（在+0800变为+08:00）
+    std::string timeStr = timeBuffer;
+    if (timeStr.length() > 5) {
+        // 插入冒号到时区部分
+        size_t len = timeStr.length();
+        timeStr.insert(len - 2, ":");
+    }
+
+    // 设置基本字段
+    dataPoint["ts"] = timeStr;
+    dataPoint["sessionId"] = m_sessionId;
+
+    // 设置当前内存使用量
+    // 从GetProcessMemoryInfo获取数据（添加相应代码或从其他部分获取）
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PPROCESS_MEMORY_COUNTERS)&pmc, sizeof(pmc))) {
+        dataPoint["vmMB"] = pmc.PrivateUsage / (1024.0 * 1024.0);
+    }
+    else {
+        dataPoint["vmMB"] = 0.0;
+    }
+
+    // 设置各类型内存分配情况
+    json categories = json::object();
+
+    for (const auto& pair : m_records) {
+        std::string key = pair.first;
+        const auto& record = pair.second;
+
+        // 从键中提取类型名称
+        std::string typeName = key;
+        size_t delimPos = key.find('_');
+        if (delimPos != std::string::npos) {
+            typeName = key.substr(delimPos + 1);
+        }
+
+        // 创建此类型的数据
+        json typeData;
+        typeData["allocCnt"] = record.GetAllocCount();
+        typeData["allocMB"] = record.GetTotalAllocSize() / (1024.0 * 1024.0);
+        typeData["freeCnt"] = record.GetFreeCount();
+        typeData["freeMB"] = record.GetTotalFreeSize() / (1024.0 * 1024.0);
+
+        // 添加到分类中
+        categories[typeName] = typeData;
+    }
+
+    dataPoint["categories"] = categories;
+
+    return dataPoint;
 }
 
 // Async HTML chart report generation - 简化实现，移除std::filesystem相关依赖

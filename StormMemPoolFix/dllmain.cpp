@@ -16,6 +16,7 @@
 #include <mimalloc.h>
 #include <Storm/StormHeap.h>
 #include "Game/GameHook.h"
+#include <Utils/Resource/WebResourceExtractor.h>
 
 void CreateConsole()
 {
@@ -29,7 +30,6 @@ void CreateConsole()
     SetConsoleCP(CP_UTF8);
 
 }
-
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     int featureActivationCount = 0;
@@ -58,6 +58,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         else {
             std::cout << "StormHeapHook 初始化失败！" << std::endl;
         }
+
+        TestHtmlExtraction();
 
         //if (InitializeGameHook()) {
         //    std::cout << "GameHook 初始化成功！" << std::endl;

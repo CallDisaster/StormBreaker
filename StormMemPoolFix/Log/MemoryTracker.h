@@ -9,6 +9,9 @@
 #include <thread>
 #include "LogSystem.h"
 
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
 // 报告数据结构 - 用于存储历史报告
 struct MemoryReportData {
     std::string sessionId;        // 会话ID
@@ -129,6 +132,12 @@ public:
     // 创建报告目录
     bool EnsureDirectoryExists(const std::string& dirPath);
 
+    // 生成累积时间序列数据到JSON文件
+    bool GenerateTimeSeriesData(const char* jsonFilePath = "data.json");
+
+    // 在浏览器中打开内存监控界面
+    bool OpenInBrowser() const;
+
 private:
     std::mutex m_mutex; // Protects the map structure and peak updates
     std::unordered_map<std::string, MemoryTrackRecord> m_records;
@@ -150,6 +159,12 @@ private:
         std::string html_filename,
         std::string data_dir
     );
+
+    // 读取现有的JSON数据文件
+    std::vector<nlohmann::json> ReadExistingJsonData(const char* jsonFilePath);
+
+    // 生成当前时间点的数据快照
+    nlohmann::json GenerateCurrentDataPoint();
 
     // Helper to get a standardized key
     std::string GetKey(size_t size, const char* name);
