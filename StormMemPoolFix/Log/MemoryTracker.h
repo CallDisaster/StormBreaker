@@ -126,6 +126,9 @@ public:
     // 生成唯一ID字符串
     static std::string GenerateUniqueId();
 
+    // 创建报告目录
+    bool EnsureDirectoryExists(const std::string& dirPath);
+
 private:
     std::mutex m_mutex; // Protects the map structure and peak updates
     std::unordered_map<std::string, MemoryTrackRecord> m_records;
@@ -155,7 +158,7 @@ private:
     void UpdatePeak(MemoryTrackRecord& record, size_t current_allocs);
 
     // 生成基于Bootstrap的现代HTML报告
-    void GenerateBootstrapHtmlReport(
+    bool GenerateBootstrapHtmlReport(
         const char* filename,
         const std::unordered_map<std::string, MemoryTrackRecord>& records,
         bool compareWithPrevious = true
@@ -163,9 +166,6 @@ private:
 
     // 解析HTML报告中的数据
     bool ParseReportData(const std::string& filePath, MemoryReportData& reportData);
-
-    // 创建报告目录
-    bool EnsureDirectoryExists(const std::string& dirPath);
 
     // 获取目录下的所有HTML报告文件
     std::vector<std::string> GetReportFiles(const std::string& directory);
