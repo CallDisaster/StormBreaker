@@ -172,12 +172,12 @@ private:
     // Helper to safely update peak count (might need locking)
     void UpdatePeak(MemoryTrackRecord& record, size_t current_allocs);
 
-    // 生成基于Bootstrap的现代HTML报告
-    bool GenerateBootstrapHtmlReport(
-        const char* filename,
-        const std::unordered_map<std::string, MemoryTrackRecord>& records,
-        bool compareWithPrevious = true
-    );
+    //// 生成基于Bootstrap的现代HTML报告
+    //bool GenerateBootstrapHtmlReport(
+    //    const char* filename,
+    //    const std::unordered_map<std::string, MemoryTrackRecord>& records,
+    //    bool compareWithPrevious = true
+    //);
 
     // 解析HTML报告中的数据
     bool ParseReportData(const std::string& filePath, MemoryReportData& reportData);
