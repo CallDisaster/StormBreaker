@@ -15,7 +15,7 @@
 #include <Storm/StormOffsets.h>
 #include <mimalloc.h>
 #include <Storm/StormHeap.h>
-#include <Game/GameHook.h>
+#include "Game/GameHook.h"
 
 void CreateConsole()
 {
@@ -59,17 +59,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             std::cout << "StormHeapHook 初始化失败！" << std::endl;
         }
 
-        if (InitializeGameHook()) {
-            std::cout << "GameHook 初始化成功！" << std::endl;
-            featureActivationCount++;
-        }
-        else {
-            std::cout << "GameHook 初始化失败！" << std::endl;
-        }
+        //if (InitializeGameHook()) {
+        //    std::cout << "GameHook 初始化成功！" << std::endl;
+        //    featureActivationCount++;
+        //}
+        //else {
+        //    std::cout << "GameHook 初始化失败！" << std::endl;
+        //}
         
 
         // 根据 featureActivationCount 输出最终状态
-        if (featureActivationCount == 3) {
+        if (featureActivationCount == 2) {
             std::cout << "所有系统启动成功！" << std::endl;
             std::cout << "Hello StormBreaker!" << std::endl;
         }

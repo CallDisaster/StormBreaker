@@ -2794,6 +2794,10 @@ bool InitializeStormMemoryHooks() {
         g_statsThreadHandle = hThread;
     }
 
+    // 启动定期HTML报告生成（为测试设置为30秒）
+    g_memoryTracker.StartPeriodicReporting(30000);
+    LogMessage("[Init] 已启动定期内存报告生成 (测试模式: 30秒一次)");
+
     void* stabilizer = MemPool::CreateStabilizingBlock(32, "初始稳定块");
     if (stabilizer) {
         LogMessage("[Init] 稳定块分配成功: %p", stabilizer);
@@ -2809,6 +2813,7 @@ bool InitializeStormMemoryHooks() {
     LogMessage("[Init] Storm内存钩子安装成功！");
     return true;
 }
+
 
 // 优化内存所有权转移
 void TransferMemoryOwnership() {
@@ -2948,6 +2953,10 @@ void SafelyDetachHooks() {
 // 优化关闭函数
 void ShutdownStormMemoryHooks() {
     LogMessage("[关闭] 退出程序...");
+
+    // 停止定期报告线程
+    LogMessage("[关闭] 停止定期报告生成...");
+    g_memoryTracker.StopPeriodicReporting();
 
     // 生成内存分配报告
     LogMessage("[关闭] 正在生成内存分配报告...");

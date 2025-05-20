@@ -1,4 +1,4 @@
-#include "pch.h"
+ï»¿#include "pch.h"
 #include "ReportViewer.h"
 #include <Windows.h>
 #include <shellapi.h>
@@ -9,17 +9,18 @@
 #include <algorithm>
 #include <vector>
 #include "Log/MemoryTracker.h"
-#include "Base/Logger.h"
+#include "Log/LogSystem.h"
+#include <chrono>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Shell32.lib")
 
-// Ä¬ÈÏ±¨¸æÄ¿Â¼
+// é»˜è®¤æŠ¥å‘Šç›®å½•
 static const char* DEFAULT_REPORT_DIR = "MemoryReports";
 
 
-// Éú³ÉHTMLË÷ÒıÒ³Ãæ
-static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& reports) {
+// ç”ŸæˆHTMLç´¢å¼•é¡µé¢
+std::string ReportViewer::GenerateIndexHtml(const std::vector<MemoryReportData>& reports) {
     std::stringstream html;
 
     html << "<!DOCTYPE html>\n"
@@ -27,7 +28,7 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
         << "<head>\n"
         << "  <meta charset=\"UTF-8\">\n"
         << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-        << "  <title>ÄÚ´æ±¨¸æ²é¿´Æ÷</title>\n"
+        << "  <title>å†…å­˜æŠ¥å‘ŠæŸ¥çœ‹å™¨</title>\n"
         << "  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n"
         << "  <link href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\" rel=\"stylesheet\">\n"
         << "  <style>\n"
@@ -41,29 +42,29 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
         << "</head>\n"
         << "<body>\n"
         << "  <div class=\"container\">\n"
-        << "    <h1 class=\"mb-4\">ÄÚ´æ±¨¸æ²é¿´Æ÷</h1>\n"
+        << "    <h1 class=\"mb-4\">å†…å­˜æŠ¥å‘ŠæŸ¥çœ‹å™¨</h1>\n"
         << "    <div class=\"alert alert-info\">\n"
         << "      <i class=\"fas fa-info-circle\"></i> "
-        << "      »á»°ID: " << (reports.empty() ? "ÎŞ" : reports[0].sessionId) << "\n"
-        << "      <br>±¨¸æ×ÜÊı: " << reports.size() << "\n"
+        << "      ä¼šè¯ID: " << (reports.empty() ? "æ— " : reports[0].sessionId) << "\n"
+        << "      <br>æŠ¥å‘Šæ€»æ•°: " << reports.size() << "\n"
         << "    </div>\n"
         << "    <div class=\"row\">\n";
 
-    // ×îĞÂ±¨¸æµÄÕªÒª¿¨Æ¬
+    // æœ€æ–°æŠ¥å‘Šçš„æ‘˜è¦å¡ç‰‡
     if (!reports.empty()) {
         const auto& latestReport = reports.back();
 
         html << "      <div class=\"col-md-12 mb-4\">\n"
             << "        <div class=\"card bg-light\">\n"
             << "          <div class=\"card-header bg-primary text-white\">\n"
-            << "            <h4 class=\"mb-0\">×îĞÂÄÚ´æ×´Ì¬ÕªÒª</h4>\n"
+            << "            <h4 class=\"mb-0\">æœ€æ–°å†…å­˜çŠ¶æ€æ‘˜è¦</h4>\n"
             << "          </div>\n"
             << "          <div class=\"card-body\">\n"
             << "            <div class=\"row\">\n"
             << "              <div class=\"col-md-3\">\n"
             << "                <div class=\"card h-100\">\n"
             << "                  <div class=\"card-body text-center\">\n"
-            << "                    <h5>×Ü·ÖÅäÄÚ´æ</h5>\n"
+            << "                    <h5>æ€»åˆ†é…å†…å­˜</h5>\n"
             << "                    <h2>" << std::fixed << std::setprecision(2) << latestReport.totalAllocatedMB << " MB</h2>\n"
             << "                  </div>\n"
             << "                </div>\n"
@@ -71,7 +72,7 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
             << "              <div class=\"col-md-3\">\n"
             << "                <div class=\"card h-100\">\n"
             << "                  <div class=\"card-body text-center\">\n"
-            << "                    <h5>×ÜÊÍ·ÅÄÚ´æ</h5>\n"
+            << "                    <h5>æ€»é‡Šæ”¾å†…å­˜</h5>\n"
             << "                    <h2>" << std::fixed << std::setprecision(2) << latestReport.totalFreedMB << " MB</h2>\n"
             << "                  </div>\n"
             << "                </div>\n"
@@ -79,7 +80,7 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
             << "              <div class=\"col-md-3\">\n"
             << "                <div class=\"card h-100\">\n"
             << "                  <div class=\"card-body text-center\">\n"
-            << "                    <h5>ÄÚ´æĞ¹Â©</h5>\n"
+            << "                    <h5>å†…å­˜æ³„æ¼</h5>\n"
             << "                    <h2 class=\"" << (latestReport.leakedMemoryMB > 0 ? "text-danger" : "text-success") << "\">"
             << std::fixed << std::setprecision(2) << latestReport.leakedMemoryMB << " MB</h2>\n"
             << "                  </div>\n"
@@ -88,7 +89,7 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
             << "              <div class=\"col-md-3\">\n"
             << "                <div class=\"card h-100\">\n"
             << "                  <div class=\"card-body text-center\">\n"
-            << "                    <h5>Î´ÊÍ·Å¿éÊı</h5>\n"
+            << "                    <h5>æœªé‡Šæ”¾å—æ•°</h5>\n"
             << "                    <h2 class=\"" << (latestReport.unreleased > 0 ? "text-warning" : "text-success") << "\">"
             << latestReport.unreleased << "</h2>\n"
             << "                  </div>\n"
@@ -100,11 +101,11 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
             << "      </div>\n";
     }
 
-    // ËùÓĞ±¨¸æÁĞ±í
+    // æ‰€æœ‰æŠ¥å‘Šåˆ—è¡¨
     for (int i = reports.size() - 1; i >= 0; i--) {
         const auto& report = reports[i];
 
-        // ¼ÆËãÓëÇ°Ò»·İ±¨¸æµÄ²îÒì£¨Èç¹ûÓĞ£©
+        // è®¡ç®—ä¸å‰ä¸€ä»½æŠ¥å‘Šçš„å·®å¼‚ï¼ˆå¦‚æœæœ‰ï¼‰
         std::string allocDiffClass = "trend-neutral";
         std::string allocDiffText = "";
         std::string leakDiffClass = "trend-neutral";
@@ -141,25 +142,25 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
         html << "      <div class=\"col-md-4\">\n"
             << "        <div class=\"card\">\n"
             << "          <div class=\"card-header " << (i == reports.size() - 1 ? "bg-success text-white" : "bg-light") << "\">\n"
-            << "            <h5 class=\"mb-0\">" << (i == reports.size() - 1 ? "×îĞÂ±¨¸æ" : "±¨¸æ #" + std::to_string(i + 1)) << "</h5>\n"
+            << "            <h5 class=\"mb-0\">" << (i == reports.size() - 1 ? "æœ€æ–°æŠ¥å‘Š" : "æŠ¥å‘Š #" + std::to_string(i + 1)) << "</h5>\n"
             << "          </div>\n"
             << "          <div class=\"card-body\">\n"
-            << "            <p><strong>Ê±¼ä:</strong> " << report.timestamp << "</p>\n"
-            << "            <p><strong>×Ü·ÖÅä:</strong> " << std::fixed << std::setprecision(2) << report.totalAllocatedMB
+            << "            <p><strong>æ—¶é—´:</strong> " << report.timestamp << "</p>\n"
+            << "            <p><strong>æ€»åˆ†é…:</strong> " << std::fixed << std::setprecision(2) << report.totalAllocatedMB
             << " MB <span class=\"" << allocDiffClass << "\">" << allocDiffText << "</span></p>\n"
-            << "            <p><strong>×ÜÊÍ·Å:</strong> " << std::fixed << std::setprecision(2) << report.totalFreedMB << " MB</p>\n"
-            << "            <p><strong>Ğ¹Â©:</strong> " << std::fixed << std::setprecision(2) << report.leakedMemoryMB
+            << "            <p><strong>æ€»é‡Šæ”¾:</strong> " << std::fixed << std::setprecision(2) << report.totalFreedMB << " MB</p>\n"
+            << "            <p><strong>æ³„æ¼:</strong> " << std::fixed << std::setprecision(2) << report.leakedMemoryMB
             << " MB <span class=\"" << leakDiffClass << "\">" << leakDiffText << "</span></p>\n"
-            << "            <p><strong>Î´ÊÍ·Å¿é:</strong> " << report.unreleased << "</p>\n"
+            << "            <p><strong>æœªé‡Šæ”¾å—:</strong> " << report.unreleased << "</p>\n"
             << "            <div class=\"d-flex justify-content-between\">\n"
             << "              <a href=\"" << report.reportPath << "\" class=\"btn btn-primary\" target=\"_blank\">\n"
-            << "                <i class=\"fas fa-eye\"></i> ²é¿´\n"
+            << "                <i class=\"fas fa-eye\"></i> æŸ¥çœ‹\n"
             << "              </a>\n";
 
         if (i < reports.size() - 1) {
             html << "              <a href=\"compare.html?old=" << i << "&new=" << i + 1
                 << "\" class=\"btn btn-info\" target=\"_blank\">\n"
-                << "                <i class=\"fas fa-exchange-alt\"></i> ÓëÏÂÒ»·İ±È½Ï\n"
+                << "                <i class=\"fas fa-exchange-alt\"></i> ä¸ä¸‹ä¸€ä»½æ¯”è¾ƒ\n"
                 << "              </a>\n";
         }
 
@@ -178,8 +179,8 @@ static std::string GenerateIndexHtml(const std::vector<MemoryReportData>& report
     return html.str();
 }
 
-// Éú³É±È½ÏÒ³ÃæHTML
-static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const MemoryReportData& newReport) {
+// ç”Ÿæˆæ¯”è¾ƒé¡µé¢HTML
+std::string ReportViewer::GenerateCompareHtml(const MemoryReportData& oldReport, const MemoryReportData& newReport) {
     std::stringstream html;
 
     html << "<!DOCTYPE html>\n"
@@ -187,7 +188,7 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
         << "<head>\n"
         << "  <meta charset=\"UTF-8\">\n"
         << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-        << "  <title>ÄÚ´æ±¨¸æ±È½Ï</title>\n"
+        << "  <title>å†…å­˜æŠ¥å‘Šæ¯”è¾ƒ</title>\n"
         << "  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n"
         << "  <link href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\" rel=\"stylesheet\">\n"
         << "  <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n"
@@ -201,17 +202,17 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
         << "</head>\n"
         << "<body>\n"
         << "  <div class=\"container\">\n"
-        << "    <h1 class=\"mb-4\">ÄÚ´æ±¨¸æ±È½Ï</h1>\n"
+        << "    <h1 class=\"mb-4\">å†…å­˜æŠ¥å‘Šæ¯”è¾ƒ</h1>\n"
         << "    <div class=\"alert alert-info\">\n"
         << "      <i class=\"fas fa-info-circle\"></i> "
-        << "      ±È½ÏÊ±¼ä·¶Î§: " << oldReport.timestamp << " ÖÁ " << newReport.timestamp << "\n"
+        << "      æ¯”è¾ƒæ—¶é—´èŒƒå›´: " << oldReport.timestamp << " è‡³ " << newReport.timestamp << "\n"
         << "    </div>\n"
         << "    \n"
         << "    <div class=\"row mb-4\">\n"
         << "      <div class=\"col-md-12\">\n"
         << "        <div class=\"card\">\n"
         << "          <div class=\"card-header bg-primary text-white\">\n"
-        << "            <h4 class=\"mb-0\">ÄÚ´æÊ¹ÓÃÇ÷ÊÆ</h4>\n"
+        << "            <h4 class=\"mb-0\">å†…å­˜ä½¿ç”¨è¶‹åŠ¿</h4>\n"
         << "          </div>\n"
         << "          <div class=\"card-body\">\n"
         << "            <div class=\"chart-container\">\n"
@@ -224,7 +225,7 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
         << "    \n"
         << "    <div class=\"row mb-4\">\n";
 
-    // ¼ÆËã²îÒì
+    // è®¡ç®—å·®å¼‚
     double allocDiff = newReport.totalAllocatedMB - oldReport.totalAllocatedMB;
     double allocPercent = oldReport.totalAllocatedMB > 0 ?
         (allocDiff / oldReport.totalAllocatedMB * 100) : 0;
@@ -241,20 +242,20 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
     double unreleasedPercent = oldReport.unreleased > 0 ?
         ((double)unreleasedDiff / oldReport.unreleased * 100) : 0;
 
-    // ×Ü·ÖÅäÄÚ´æ¶Ô±È
+    // æ€»åˆ†é…å†…å­˜å¯¹æ¯”
     html << "      <div class=\"col-md-6\">\n"
         << "        <div class=\"card\">\n"
         << "          <div class=\"card-header bg-info text-white\">\n"
-        << "            <h5 class=\"mb-0\">×Ü·ÖÅäÄÚ´æ</h5>\n"
+        << "            <h5 class=\"mb-0\">æ€»åˆ†é…å†…å­˜</h5>\n"
         << "          </div>\n"
         << "          <div class=\"card-body\">\n"
         << "            <div class=\"row\">\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>¾É±¨¸æ</h6>\n"
+        << "                <h6>æ—§æŠ¥å‘Š</h6>\n"
         << "                <h2>" << std::fixed << std::setprecision(2) << oldReport.totalAllocatedMB << " MB</h2>\n"
         << "              </div>\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>ĞÂ±¨¸æ</h6>\n"
+        << "                <h6>æ–°æŠ¥å‘Š</h6>\n"
         << "                <h2>" << std::fixed << std::setprecision(2) << newReport.totalAllocatedMB << " MB</h2>\n"
         << "                <p class=\"" << (allocDiff > 0 ? "trend-up" : (allocDiff < 0 ? "trend-down" : "trend-neutral")) << "\">\n"
         << "                  " << (allocDiff > 0 ? "<i class=\"fas fa-arrow-up\"></i>" :
@@ -268,20 +269,20 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
         << "        </div>\n"
         << "      </div>\n";
 
-    // ×ÜÊÍ·ÅÄÚ´æ¶Ô±È
+    // æ€»é‡Šæ”¾å†…å­˜å¯¹æ¯”
     html << "      <div class=\"col-md-6\">\n"
         << "        <div class=\"card\">\n"
         << "          <div class=\"card-header bg-info text-white\">\n"
-        << "            <h5 class=\"mb-0\">×ÜÊÍ·ÅÄÚ´æ</h5>\n"
+        << "            <h5 class=\"mb-0\">æ€»é‡Šæ”¾å†…å­˜</h5>\n"
         << "          </div>\n"
         << "          <div class=\"card-body\">\n"
         << "            <div class=\"row\">\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>¾É±¨¸æ</h6>\n"
+        << "                <h6>æ—§æŠ¥å‘Š</h6>\n"
         << "                <h2>" << std::fixed << std::setprecision(2) << oldReport.totalFreedMB << " MB</h2>\n"
         << "              </div>\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>ĞÂ±¨¸æ</h6>\n"
+        << "                <h6>æ–°æŠ¥å‘Š</h6>\n"
         << "                <h2>" << std::fixed << std::setprecision(2) << newReport.totalFreedMB << " MB</h2>\n"
         << "                <p class=\"" << (freeDiff > 0 ? "trend-up" : (freeDiff < 0 ? "trend-down" : "trend-neutral")) << "\">\n"
         << "                  " << (freeDiff > 0 ? "<i class=\"fas fa-arrow-up\"></i>" :
@@ -299,20 +300,20 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
         << "    \n"
         << "    <div class=\"row mb-4\">\n";
 
-    // ÄÚ´æĞ¹Â©¶Ô±È
+    // å†…å­˜æ³„æ¼å¯¹æ¯”
     html << "      <div class=\"col-md-6\">\n"
         << "        <div class=\"card\">\n"
         << "          <div class=\"card-header bg-danger text-white\">\n"
-        << "            <h5 class=\"mb-0\">ÄÚ´æĞ¹Â©</h5>\n"
+        << "            <h5 class=\"mb-0\">å†…å­˜æ³„æ¼</h5>\n"
         << "          </div>\n"
         << "          <div class=\"card-body\">\n"
         << "            <div class=\"row\">\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>¾É±¨¸æ</h6>\n"
+        << "                <h6>æ—§æŠ¥å‘Š</h6>\n"
         << "                <h2>" << std::fixed << std::setprecision(2) << oldReport.leakedMemoryMB << " MB</h2>\n"
         << "              </div>\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>ĞÂ±¨¸æ</h6>\n"
+        << "                <h6>æ–°æŠ¥å‘Š</h6>\n"
         << "                <h2>" << std::fixed << std::setprecision(2) << newReport.leakedMemoryMB << " MB</h2>\n"
         << "                <p class=\"" << (leakDiff > 0 ? "trend-up" : (leakDiff < 0 ? "trend-down" : "trend-neutral")) << "\">\n"
         << "                  " << (leakDiff > 0 ? "<i class=\"fas fa-arrow-up\"></i>" :
@@ -326,20 +327,20 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
         << "        </div>\n"
         << "      </div>\n";
 
-    // Î´ÊÍ·ÅÄÚ´æ¿é¶Ô±È
+    // æœªé‡Šæ”¾å†…å­˜å—å¯¹æ¯”
     html << "      <div class=\"col-md-6\">\n"
         << "        <div class=\"card\">\n"
         << "          <div class=\"card-header bg-warning text-dark\">\n"
-        << "            <h5 class=\"mb-0\">Î´ÊÍ·ÅÄÚ´æ¿é</h5>\n"
+        << "            <h5 class=\"mb-0\">æœªé‡Šæ”¾å†…å­˜å—</h5>\n"
         << "          </div>\n"
         << "          <div class=\"card-body\">\n"
         << "            <div class=\"row\">\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>¾É±¨¸æ</h6>\n"
+        << "                <h6>æ—§æŠ¥å‘Š</h6>\n"
         << "                <h2>" << oldReport.unreleased << "</h2>\n"
         << "              </div>\n"
         << "              <div class=\"col-md-6 text-center\">\n"
-        << "                <h6>ĞÂ±¨¸æ</h6>\n"
+        << "                <h6>æ–°æŠ¥å‘Š</h6>\n"
         << "                <h2>" << newReport.unreleased << "</h2>\n"
         << "                <p class=\"" << (unreleasedDiff > 0 ? "trend-up" : (unreleasedDiff < 0 ? "trend-down" : "trend-neutral")) << "\">\n"
         << "                  " << (unreleasedDiff > 0 ? "<i class=\"fas fa-arrow-up\"></i>" :
@@ -358,49 +359,49 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
         << "    <div class=\"row mb-4\">\n"
         << "      <div class=\"col-md-6\">\n"
         << "        <a href=\"" << oldReport.reportPath << "\" class=\"btn btn-primary w-100\" target=\"_blank\">\n"
-        << "          <i class=\"fas fa-eye\"></i> ²é¿´¾É±¨¸æ\n"
+        << "          <i class=\"fas fa-eye\"></i> æŸ¥çœ‹æ—§æŠ¥å‘Š\n"
         << "        </a>\n"
         << "      </div>\n"
         << "      <div class=\"col-md-6\">\n"
         << "        <a href=\"" << newReport.reportPath << "\" class=\"btn btn-success w-100\" target=\"_blank\">\n"
-        << "          <i class=\"fas fa-eye\"></i> ²é¿´ĞÂ±¨¸æ\n"
+        << "          <i class=\"fas fa-eye\"></i> æŸ¥çœ‹æ–°æŠ¥å‘Š\n"
         << "        </a>\n"
         << "      </div>\n"
         << "    </div>\n"
         << "    \n"
         << "    <div class=\"text-center\">\n"
         << "      <a href=\"index.html\" class=\"btn btn-secondary\">\n"
-        << "        <i class=\"fas fa-arrow-left\"></i> ·µ»Ø±¨¸æÁĞ±í\n"
+        << "        <i class=\"fas fa-arrow-left\"></i> è¿”å›æŠ¥å‘Šåˆ—è¡¨\n"
         << "      </a>\n"
         << "    </div>\n"
         << "  </div>\n"
         << "  \n"
         << "  <script>\n"
-        << "    // »æÖÆÇ÷ÊÆÍ¼\n"
+        << "    // ç»˜åˆ¶è¶‹åŠ¿å›¾\n"
         << "    document.addEventListener('DOMContentLoaded', function() {\n"
         << "      const trendCtx = document.getElementById('trendChart').getContext('2d');\n"
         << "      \n"
         << "      new Chart(trendCtx, {\n"
         << "        type: 'line',\n"
         << "        data: {\n"
-        << "          labels: ['¾É±¨¸æ', 'ĞÂ±¨¸æ'],\n"
+        << "          labels: ['æ—§æŠ¥å‘Š', 'æ–°æŠ¥å‘Š'],\n"
         << "          datasets: [\n"
         << "            {\n"
-        << "              label: '×Ü·ÖÅäÄÚ´æ(MB)',\n"
+        << "              label: 'æ€»åˆ†é…å†…å­˜(MB)',\n"
         << "              data: [" << oldReport.totalAllocatedMB << ", " << newReport.totalAllocatedMB << "],\n"
         << "              backgroundColor: 'rgba(54, 162, 235, 0.5)',\n"
         << "              borderColor: 'rgba(54, 162, 235, 1)',\n"
         << "              borderWidth: 2\n"
         << "            },\n"
         << "            {\n"
-        << "              label: '×ÜÊÍ·ÅÄÚ´æ(MB)',\n"
+        << "              label: 'æ€»é‡Šæ”¾å†…å­˜(MB)',\n"
         << "              data: [" << oldReport.totalFreedMB << ", " << newReport.totalFreedMB << "],\n"
         << "              backgroundColor: 'rgba(75, 192, 192, 0.5)',\n"
         << "              borderColor: 'rgba(75, 192, 192, 1)',\n"
         << "              borderWidth: 2\n"
         << "            },\n"
         << "            {\n"
-        << "              label: 'ÄÚ´æĞ¹Â©(MB)',\n"
+        << "              label: 'å†…å­˜æ³„æ¼(MB)',\n"
         << "              data: [" << oldReport.leakedMemoryMB << ", " << newReport.leakedMemoryMB << "],\n"
         << "              backgroundColor: 'rgba(255, 99, 132, 0.5)',\n"
         << "              borderColor: 'rgba(255, 99, 132, 1)',\n"
@@ -430,35 +431,35 @@ static std::string GenerateCompareHtml(const MemoryReportData& oldReport, const 
     return html.str();
 }
 
-// ´ò¿ª±¨¸æ²é¿´Æ÷
+// æ‰“å¼€æŠ¥å‘ŠæŸ¥çœ‹å™¨
 void ReportViewer::OpenReportViewer(const char* reportsDir) {
-    // Ê¹ÓÃÄ¬ÈÏÄ¿Â¼»òÖ¸¶¨Ä¿Â¼
+    // ä½¿ç”¨é»˜è®¤ç›®å½•æˆ–æŒ‡å®šç›®å½•
     std::string reportsDirStr = reportsDir ? reportsDir : DEFAULT_REPORT_DIR;
 
-    // È·±£Ä¿Â¼´æÔÚ
+    // ç¡®ä¿ç›®å½•å­˜åœ¨
     if (!g_memoryTracker.EnsureDirectoryExists(reportsDirStr)) {
-        LogMessage("[ReportViewer] ÎŞ·¨´´½¨±¨¸æÄ¿Â¼: %s", reportsDirStr.c_str());
+        LogMessage("[ReportViewer] æ— æ³•åˆ›å»ºæŠ¥å‘Šç›®å½•: %s", reportsDirStr.c_str());
         return;
     }
 
-    // »ñÈ¡±¨¸æÁĞ±í
+    // è·å–æŠ¥å‘Šåˆ—è¡¨
     g_memoryTracker.LoadReports(reportsDirStr.c_str());
     const auto& reports = g_memoryTracker.GetReportHistory();
 
-    // Éú³ÉË÷ÒıÒ³Ãæ
+    // ç”Ÿæˆç´¢å¼•é¡µé¢
     std::string indexHtml = GenerateIndexHtml(reports);
     std::string indexPath = reportsDirStr + "/index.html";
 
     std::ofstream indexFile(indexPath);
     if (!indexFile.is_open()) {
-        LogMessage("[ReportViewer] ÎŞ·¨´´½¨Ë÷ÒıÎÄ¼ş: %s", indexPath.c_str());
+        LogMessage("[ReportViewer] æ— æ³•åˆ›å»ºç´¢å¼•æ–‡ä»¶: %s", indexPath.c_str());
         return;
     }
 
     indexFile << indexHtml;
     indexFile.close();
 
-    // Éú³É±È½ÏÒ³Ãæ¿ò¼Ü
+    // ç”Ÿæˆæ¯”è¾ƒé¡µé¢æ¡†æ¶
     std::string comparePath = reportsDirStr + "/compare.html";
     std::string compareHtml;
 
@@ -466,33 +467,33 @@ void ReportViewer::OpenReportViewer(const char* reportsDir) {
         compareHtml = GenerateCompareHtml(reports[0], reports[1]);
     }
     else {
-        // ¼òµ¥µÄÕ¼Î»Ò³Ãæ
+        // ç®€å•çš„å ä½é¡µé¢
         compareHtml = "<!DOCTYPE html>\n"
-            "<html><head><title>±È½Ï</title></head>\n"
-            "<body><h1>ĞèÒªÖÁÉÙÁ½·İ±¨¸æ²ÅÄÜ±È½Ï</h1></body></html>";
+            "<html><head><title>æ¯”è¾ƒ</title></head>\n"
+            "<body><h1>éœ€è¦è‡³å°‘ä¸¤ä»½æŠ¥å‘Šæ‰èƒ½æ¯”è¾ƒ</h1></body></html>";
     }
 
     std::ofstream compareFile(comparePath);
     if (!compareFile.is_open()) {
-        LogMessage("[ReportViewer] ÎŞ·¨´´½¨±È½ÏÎÄ¼ş: %s", comparePath.c_str());
+        LogMessage("[ReportViewer] æ— æ³•åˆ›å»ºæ¯”è¾ƒæ–‡ä»¶: %s", comparePath.c_str());
     }
     else {
         compareFile << compareHtml;
         compareFile.close();
     }
 
-    // ´ò¿ªÄ¬ÈÏä¯ÀÀÆ÷ä¯ÀÀË÷ÒıÒ³Ãæ
+    // æ‰“å¼€é»˜è®¤æµè§ˆå™¨æµè§ˆç´¢å¼•é¡µé¢
     ShellExecuteA(NULL, "open", indexPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
 
-    LogMessage("[ReportViewer] ÒÑÔÚä¯ÀÀÆ÷ÖĞ´ò¿ª±¨¸æ²é¿´Æ÷");
+    LogMessage("[ReportViewer] å·²åœ¨æµè§ˆå™¨ä¸­æ‰“å¼€æŠ¥å‘ŠæŸ¥çœ‹å™¨");
 }
 
-// ÊÖ¶¯Éú³ÉĞÂ±¨¸æ²¢´ò¿ª
+// æ‰‹åŠ¨ç”Ÿæˆæ–°æŠ¥å‘Šå¹¶æ‰“å¼€
 void ReportViewer::GenerateAndOpenReport() {
-    // Éú³ÉĞÂ±¨¸æ
+    // ç”Ÿæˆæ–°æŠ¥å‘Š
     MemoryReportData report = g_memoryTracker.GenerateAndStoreReport();
 
-    // ´ò¿ª±¨¸æ²é¿´Æ÷
+    // æ‰“å¼€æŠ¥å‘ŠæŸ¥çœ‹å™¨
     OpenReportViewer();
 
 }

@@ -1,4 +1,4 @@
-﻿#include "pc#include "pch.h"
+﻿#include "pch.h"
 #include "MemoryTracker.h"
 #include <cstdio>
 #include <cstdarg>
@@ -71,23 +71,31 @@ bool MemoryTracker::Initialize(const char* reportsDir) {
     // 生成新的会话ID
     m_sessionId = GenerateUniqueId();
 
+    // 设置报告目录为硬编码的当前目录下的MemoryReports
+    char currentDirBuffer[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, currentDirBuffer);
+    std::string currentDir = currentDirBuffer;
+
     // 设置报告目录
-    m_reportsDirectory = reportsDir ? reportsDir : "MemoryReports";
+    m_reportsDirectory = currentDir + "\\MemoryReports";
 
     // 确保目录存在
-    if (!EnsureDirectoryExists(m_reportsDirectory)) {
-        LogMessage("[MemoryTracker] 无法创建报告目录: %s", m_reportsDirectory.c_str());
-        return false;
+    BOOL dirCreated = CreateDirectoryA(m_reportsDirectory.c_str(), NULL);
+    if (!dirCreated && GetLastError() != ERROR_ALREADY_EXISTS) {
+        DWORD err = GetLastError();
+        LogMessage("[MemoryTracker] 无法创建报告目录: %s (错误码: %d)",
+            m_reportsDirectory.c_str(), err);
+
+        // 如果无法创建，回退到当前目录
+        m_reportsDirectory = currentDir;
     }
 
+    LogMessage("[MemoryTracker] 报告目录设置为: %s", m_reportsDirectory.c_str());
+
     // 加载现有报告
-    LoadReports(m_reportsDirectory.c_str());
+    LoadReports();
 
-    // 清理旧会话的报告
-    CleanupOldReports();
-
-    LogMessage("[MemoryTracker] 初始化完成，会话ID: %s, 报告目录: %s",
-        m_sessionId.c_str(), m_reportsDirectory.c_str());
+    LogMessage("[MemoryTracker] 初始化完成，会话ID: %s", m_sessionId.c_str());
     return true;
 }
 
@@ -141,12 +149,37 @@ void MemoryTracker::PeriodicReportThreadFunc(unsigned int period_ms) {
 
         // 生成并存储报告
         try {
-            std::string reportName = m_reportsDirectory + "/MemoryReport_" +
-                GetTimeString() + ".html";
+            // 获取当前工作目录，确保我们知道在哪里
+            char currentDirBuffer[MAX_PATH];
+            GetCurrentDirectoryA(MAX_PATH, currentDirBuffer);
+            std::string currentDir = currentDirBuffer;
 
-            MemoryReportData reportData = GenerateAndStoreReport(reportName.c_str());
+            // 获取时间戳（无空格）
+            std::string timeStr = GetTimeString();
+            std::string fileName = "MemoryReport_" + timeStr + ".html";
 
-            LogMessage("[MemoryTracker] 定时报告已生成: %s", reportName.c_str());
+            // 确保MemoryReports目录存在
+            std::string reportsDir = currentDir + "\\MemoryReports";
+            CreateDirectoryA(reportsDir.c_str(), NULL); // 创建目录，忽略已存在的情况
+
+            // 构建完整路径 - 包含目录
+            std::string fullPath = reportsDir + "\\" + fileName;
+
+            LogMessage("[MemoryTracker] 当前目录: %s", currentDir.c_str());
+            LogMessage("[MemoryTracker] 开始生成定时报告: %s", fullPath.c_str());
+
+            // 生成报告 - 使用完整路径
+            MemoryReportData reportData = GenerateAndStoreReport(fullPath.c_str());
+
+            // 验证文件是否创建成功
+            FILE* testFile = NULL;
+            if (fopen_s(&testFile, fullPath.c_str(), "r") == 0 && testFile) {
+                fclose(testFile);
+                LogMessage("[MemoryTracker] 定时报告已成功生成: %s", fullPath.c_str());
+            }
+            else {
+                LogMessage("[MemoryTracker] 定时报告生成失败, 将尝试下一次");
+            }
         }
         catch (const std::exception& e) {
             LogMessage("[MemoryTracker] 生成定时报告时出错: %s", e.what());
@@ -159,9 +192,46 @@ void MemoryTracker::PeriodicReportThreadFunc(unsigned int period_ms) {
 
 // 创建目录
 bool MemoryTracker::EnsureDirectoryExists(const std::string& dirPath) {
-    // 使用_mkdir创建目录
-    int result = _mkdir(dirPath.c_str());
-    return (result == 0 || errno == EEXIST);
+    if (dirPath.empty()) {
+        return false;
+    }
+
+    // 检查目录是否已存在
+    DWORD fileAttributes = GetFileAttributesA(dirPath.c_str());
+    if (fileAttributes != INVALID_FILE_ATTRIBUTES &&
+        (fileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return true; // 目录已存在
+    }
+
+    // 创建父目录
+    std::string parentDir;
+    size_t lastSlash = dirPath.find_last_of("/\\");
+    if (lastSlash != std::string::npos) {
+        parentDir = dirPath.substr(0, lastSlash);
+        if (!parentDir.empty() && !EnsureDirectoryExists(parentDir)) {
+            LogMessage("[MemoryTracker] 无法创建父目录: %s", parentDir.c_str());
+            return false;
+        }
+    }
+
+    // 创建当前目录
+    if (CreateDirectoryA(dirPath.c_str(), NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+        LogMessage("[MemoryTracker] 成功创建目录: %s", dirPath.c_str());
+        return true;
+    }
+    else {
+        DWORD lastError = GetLastError();
+        LogMessage("[MemoryTracker] 无法创建目录: %s (错误码: %d)", dirPath.c_str(), lastError);
+
+        // 尝试使用_mkdir作为备选方法
+        int result = _mkdir(dirPath.c_str());
+        if (result == 0 || errno == EEXIST) {
+            LogMessage("[MemoryTracker] 使用_mkdir成功创建目录: %s", dirPath.c_str());
+            return true;
+        }
+
+        return false;
+    }
 }
 
 // 获取目录下的所有HTML报告文件
@@ -196,19 +266,32 @@ void MemoryTracker::CleanupOldReports() {
     // 获取当前目录下的所有HTML文件
     std::vector<std::string> files = GetReportFiles(m_reportsDirectory);
 
-    // 遍历所有文件，删除非当前会话的报告
+    // 收集所有报告数据
+    std::vector<std::pair<std::string, MemoryReportData>> allReports;
+
     for (const auto& file : files) {
         MemoryReportData reportData;
         if (ParseReportData(file, reportData)) {
-            if (reportData.sessionId != m_sessionId) {
-                // 删除文件
-                if (DeleteFileA(file.c_str())) {
-                    LogMessage("[MemoryTracker] 已删除旧会话报告: %s", file.c_str());
-                }
-                else {
-                    LogMessage("[MemoryTracker] 无法删除旧会话报告: %s, 错误码: %d",
-                        file.c_str(), GetLastError());
-                }
+            allReports.push_back({ file, reportData });
+        }
+    }
+
+    // 按时间戳排序（最新的在前）
+    std::sort(allReports.begin(), allReports.end(),
+        [](const auto& a, const auto& b) {
+            return a.second.timestamp > b.second.timestamp;
+        });
+
+    // 保留最近10个报告，删除其余的
+    const size_t reportsToKeep = 10;
+    if (allReports.size() > reportsToKeep) {
+        for (size_t i = reportsToKeep; i < allReports.size(); i++) {
+            if (DeleteFileA(allReports[i].first.c_str())) {
+                LogMessage("[MemoryTracker] 已删除旧报告: %s", allReports[i].first.c_str());
+            }
+            else {
+                LogMessage("[MemoryTracker] 无法删除旧报告: %s, 错误码: %d",
+                    allReports[i].first.c_str(), GetLastError());
             }
         }
     }
@@ -234,10 +317,8 @@ bool MemoryTracker::LoadReports(const char* directory) {
     for (const auto& file : files) {
         MemoryReportData reportData;
         if (ParseReportData(file, reportData)) {
-            // 只存储当前会话的报告
-            if (reportData.sessionId == m_sessionId) {
-                m_reportHistory.push_back(reportData);
-            }
+            // 加载所有报告，不仅限于当前会话
+            m_reportHistory.push_back(reportData);
         }
     }
 
@@ -247,7 +328,7 @@ bool MemoryTracker::LoadReports(const char* directory) {
             return a.timestamp < b.timestamp;
         });
 
-    LogMessage("[MemoryTracker] 已加载 %zu 个当前会话的报告", m_reportHistory.size());
+    LogMessage("[MemoryTracker] 已加载 %zu 个报告", m_reportHistory.size());
     return true;
 }
 
@@ -406,19 +487,36 @@ MemoryReportData MemoryTracker::GenerateAndStoreReport(const char* filename) {
     reportData.totalFreedMB = (double)totalFreeBytes / (1024 * 1024);
     reportData.leakedMemoryMB = (double)totalLeakBytes / (1024 * 1024);
 
-    // 生成报告文件
+    // 生成报告文件路径
     std::string reportPath;
-    if (filename) {
-        reportPath = filename;
+
+    if (filename && *filename) {
+        // 检查是否路径包含目录分隔符，如果不包含，则加上目录前缀
+        std::string inputPath = filename;
+        if (inputPath.find('/') == std::string::npos && inputPath.find('\\') == std::string::npos) {
+            // 纯文件名，添加目录前缀
+            reportPath = m_reportsDirectory + "\\" + inputPath;
+        }
+        else {
+            // 已包含路径，直接使用
+            reportPath = inputPath;
+        }
     }
     else {
-        // 默认文件名
-        reportPath = m_reportsDirectory + "/MemoryReport_" + reportData.timestamp + ".html";
+        // 构建默认文件名
+        reportPath = m_reportsDirectory + "\\MemoryReport_" + reportData.timestamp + ".html";
+    }
+
+    // 确保报告目录存在
+    std::string dirPath = reportPath.substr(0, reportPath.find_last_of("\\/"));
+    if (!dirPath.empty()) {
+        CreateDirectoryA(dirPath.c_str(), NULL);
     }
 
     reportData.reportPath = reportPath;
+    LogMessage("[MemoryTracker] 报告文件路径: %s", reportPath.c_str());
 
-    // 存储到历史记录
+    // 保存到历史记录
     m_reportHistory.push_back(reportData);
 
     // 按时间排序
@@ -475,7 +573,8 @@ std::string MemoryTracker::GetTimeString() {
     localtime_r(&now_c, &now_tm);
 #endif
     char buffer[80];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &now_tm);
+    // 使用下划线替换空格
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d_%H-%M-%S", &now_tm);
     return std::string(buffer);
 }
 
@@ -729,16 +828,39 @@ void MemoryTracker::GenerateMemoryChartReport(const char* filename, bool compare
 }
 
 // ======== Bootstrap HTML Report Generation ========
-void MemoryTracker::GenerateBootstrapHtmlReport(
+bool MemoryTracker::GenerateBootstrapHtmlReport(
     const char* filename,
     const std::unordered_map<std::string, MemoryTrackRecord>& records,
     bool compareWithPrevious) {
 
-    // Open HTML file
-    std::ofstream report(filename);
+    // 检查并提取目录路径
+    std::string fullPath = filename;
+    std::string dirPath;
+
+    size_t lastSlash = fullPath.find_last_of("/\\");
+    if (lastSlash != std::string::npos) {
+        dirPath = fullPath.substr(0, lastSlash);
+        // 确保目录存在
+        CreateDirectoryA(dirPath.c_str(), NULL);
+    }
+    else {
+        // 没有路径分隔符，可能是纯文件名
+        char currentDir[MAX_PATH];
+        GetCurrentDirectoryA(MAX_PATH, currentDir);
+        dirPath = currentDir;
+
+        // 更新完整路径为当前目录+文件名
+        fullPath = dirPath + "\\" + filename;
+    }
+
+    LogMessage("[MemoryTracker] 尝试创建报告文件: %s", fullPath.c_str());
+
+    // 打开文件流
+    std::ofstream report(fullPath.c_str());
     if (!report.is_open()) {
-        LogMessage("[MemoryTracker] 无法创建内存报告: %s", filename);
-        return;
+        LogMessage("[MemoryTracker] 无法创建内存报告: %s (错误码: %d)",
+            fullPath.c_str(), GetLastError());
+        return false;
     }
 
     // ==== 数据预处理 ====
@@ -1961,6 +2083,7 @@ void MemoryTracker::GenerateBootstrapHtmlReport(
 
     report.close();
     LogMessage("[MemoryTracker] 生成精美报告: %s", filename);
+    return true;
 }
 
 // Async HTML chart report generation - 简化实现，移除std::filesystem相关依赖

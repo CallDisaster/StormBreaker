@@ -31,6 +31,18 @@
     <Filter Include="源文件\Log">
       <UniqueIdentifier>{2593c254-ec8c-4a54-99ab-f58979e86182}</UniqueIdentifier>
     </Filter>
+    <Filter Include="源文件\Game">
+      <UniqueIdentifier>{d139edc1-0b36-4a0e-9d87-8a1ef4f6993f}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Game\GameDllReverse">
+      <UniqueIdentifier>{ea393575-be4b-4861-a09b-2d9ea9c14059}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\Game">
+      <UniqueIdentifier>{55162994-24da-499b-85d1-7f127f9081d5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\Game\GameDllReverse">
+      <UniqueIdentifier>{bb82f8b6-a176-41de-9fcf-7f01095637b5}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framework.h">
@@ -69,6 +81,12 @@
     <ClInclude Include="Log\LogSystem.h">
       <Filter>头文件\Log</Filter>
     </ClInclude>
+    <ClInclude Include="Game\GameDllReverse\AIL.h">
+      <Filter>头文件\Game\GameDllReverse</Filter>
+    </ClInclude>
+    <ClInclude Include="Game\GameHook.h">
+      <Filter>头文件\Game</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -103,6 +121,12 @@
     </ClCompile>
     <ClCompile Include="Log\ReportViewer.cpp">
       <Filter>源文件\Log</Filter>
+    </ClCompile>
+    <ClCompile Include="Game\GameHook.cpp">
+      <Filter>源文件\Game</Filter>
+    </ClCompile>
+    <ClCompile Include="Game\GameDllReverse\AIL.cpp">
+      <Filter>源文件\Game\GameDllReverse</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
