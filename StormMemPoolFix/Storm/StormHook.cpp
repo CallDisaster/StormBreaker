@@ -255,89 +255,135 @@ static FILE* g_logFile = nullptr;
 // 优化实现
 ///////////////////////////////////////////////////////////////////////////////
 
+// 安全标记块状态的辅助函数
+static bool SafeMarkBlockAsAllocated(void* ptr) {
+    if (!ptr) return false;
+
+    __try {
+        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
+            static_cast<char*>(ptr) + sizeof(StormAllocHeader) - sizeof(StormAllocHeader));
+        header->Flags &= ~0x2;  // 清除释放标志
+        header->Flags |= 0x8;   // 设置特殊块标志
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 安全标记块为释放状态的辅助函数
+static bool SafeMarkBlockAsFreed(void* ptr) {
+    if (!ptr) return false;
+
+    __try {
+        void* userPtr = static_cast<char*>(ptr) + sizeof(StormAllocHeader);
+        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
+            static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
+
+        // 设置为释放状态，但保留特殊标志
+        header->Flags |= 0x2;   // 设置释放标志
+        header->Flags |= 0x8;   // 保留特殊块标志
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // 优化大块缓存 - 使用分片锁和更高效的查找
 class LargeBlockCache {
 private:
-    // 缓存块结构
     struct CachedBlock {
         void* ptr;
         size_t size;
         DWORD timestamp;
+        bool isMarkedFree;
     };
 
-    // 分片结构
     struct CacheShard {
         std::mutex mutex;
         std::vector<CachedBlock> blocks;
     };
 
-    // 分片数组
-    CacheShard m_shards[16]; // 16个分片
-    std::atomic<size_t> m_totalBlocks{ 0 }; // 总块数计数器
-    const size_t MAX_CACHE_SIZE = MAX_CACHE_BLOCKS; // 每个分片的最大缓存大小
+    CacheShard m_shards[16];
+    std::atomic<size_t> m_totalBlocks{ 0 };
+    const size_t MAX_CACHE_SIZE = MAX_CACHE_BLOCKS;
 
-    // 获取分片索引
     size_t getShardIndex(size_t size) const {
-        return (size / 1024) % 16; // 基于大小分片
+        return (size / 1024) % 16;
     }
 
 public:
     void* GetBlock(size_t size) {
         size_t idx = getShardIndex(size);
-        std::lock_guard<std::mutex> lock(m_shards[idx].mutex);
 
-        // 查找适合大小的块
-        auto& blocks = m_shards[idx].blocks;
-        for (auto it = blocks.begin(); it != blocks.end(); ++it) {
-            if (it->size >= size) {
-                void* ptr = it->ptr;
-                blocks.erase(it);
-                m_totalBlocks.fetch_sub(1, std::memory_order_relaxed);
-                return ptr;
-            }
-        }
+        // 使用作用域限制lock_guard的生命周期
+        {
+            std::lock_guard<std::mutex> lock(m_shards[idx].mutex);
+            auto& blocks = m_shards[idx].blocks;
 
-        // 如果当前分片没有找到，尝试其他分片
-        if (idx != 0) { // 避免重复检查第0分片
-            std::lock_guard<std::mutex> lock(m_shards[0].mutex);
-            auto& blocks = m_shards[0].blocks;
             for (auto it = blocks.begin(); it != blocks.end(); ++it) {
                 if (it->size >= size) {
                     void* ptr = it->ptr;
+
+                    // 先从缓存中移除
                     blocks.erase(it);
                     m_totalBlocks.fetch_sub(1, std::memory_order_relaxed);
+
+                    // 在没有lock_guard的情况下执行SEH操作
+                    bool markSuccess = SafeMarkBlockAsAllocated(ptr);
+                    if (!markSuccess) {
+                        LogMessage("[Cache] 重新标记缓存块失败: %p", ptr);
+                    }
+
+                    LogMessage("[Cache] 从缓存获取块: %p, 大小: %zu", ptr, size);
                     return ptr;
                 }
             }
-        }
+        } // lock_guard在这里析构
 
         return nullptr;
     }
 
     void ReleaseBlock(void* ptr, size_t size) {
+        if (!ptr) return;
+
         size_t idx = getShardIndex(size);
-        std::lock_guard<std::mutex> lock(m_shards[idx].mutex);
 
-        auto& blocks = m_shards[idx].blocks;
+        // 先在没有锁的情况下执行SEH操作
+        bool markSuccess = SafeMarkBlockAsFreed(ptr);
 
-        // 如果缓存已满，释放最老的块
-        if (blocks.size() >= MAX_CACHE_SIZE) {
-            auto oldest = std::min_element(blocks.begin(), blocks.end(),
-                [](const CachedBlock& a, const CachedBlock& b) {
-                    return a.timestamp < b.timestamp;
-                });
+        // 然后在锁保护下操作缓存
+        {
+            std::lock_guard<std::mutex> lock(m_shards[idx].mutex);
+            auto& blocks = m_shards[idx].blocks;
 
-            if (oldest != blocks.end()) {
-                VirtualFree(oldest->ptr, 0, MEM_RELEASE);
-                blocks.erase(oldest);
-                m_totalBlocks.fetch_sub(1, std::memory_order_relaxed);
+            // 如果缓存已满，释放最老的块
+            if (blocks.size() >= MAX_CACHE_SIZE) {
+                auto oldest = std::min_element(blocks.begin(), blocks.end(),
+                    [](const CachedBlock& a, const CachedBlock& b) {
+                        return a.timestamp < b.timestamp;
+                    });
+
+                if (oldest != blocks.end()) {
+                    LogMessage("[Cache] 缓存已满，释放最老块: %p", oldest->ptr);
+                    VirtualFree(oldest->ptr, 0, MEM_RELEASE);
+                    blocks.erase(oldest);
+                    m_totalBlocks.fetch_sub(1, std::memory_order_relaxed);
+                }
             }
+
+            // 添加到缓存
+            CachedBlock block{ ptr, size, GetTickCount(), markSuccess };
+            blocks.push_back(block);
+            m_totalBlocks.fetch_add(1, std::memory_order_relaxed);
+        } // lock_guard在这里析构
+
+        if (!markSuccess) {
+            LogMessage("[Cache] 标记块为释放状态失败: %p", ptr);
         }
 
-        // 添加新块到缓存
-        CachedBlock block{ ptr, size, GetTickCount() };
-        blocks.push_back(block);
-        m_totalBlocks.fetch_add(1, std::memory_order_relaxed);
+        LogMessage("[Cache] 块已放入缓存: %p, 大小: %zu", ptr, size);
     }
 
     size_t GetCacheSize() const {
@@ -831,37 +877,62 @@ void SetupCompatibleHeader(void* userPtr, size_t size) {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
 
-        header->HeapPtr = SPECIAL_MARKER;  // 特殊标记
+        // 修复: 使用NULL而不是SPECIAL_MARKER，避免调试版Storm解引用崩溃
+        header->HeapPtr = 0;  // 使用NULL，安全且兼容
         header->Size = static_cast<DWORD>(size);
-        header->AlignPadding = 0;
-        header->Flags = 0x4;  // 标记为大块VirtualAlloc
+
+        // 修复: 正确计算对齐填充
+        uintptr_t userAddr = reinterpret_cast<uintptr_t>(userPtr);
+        uintptr_t alignedAddr = (userAddr + 15) & ~15;  // 16字节对齐
+        header->AlignPadding = static_cast<BYTE>(alignedAddr - userAddr);
+
+        // 修复: 使用特殊标志组合标识我们的块，而不是依赖HeapPtr
+        header->Flags = 0x8;  // 0x8 = 特殊块标志，不与Storm冲突
         header->Magic = STORM_MAGIC;
+
+        //LogMessage("[SetupHeader] 设置兼容头: ptr=%p, size=%zu, align=%d",
+        //    userPtr, size, header->AlignPadding);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         LogMessage("[ERROR] 设置兼容头失败: %p, 错误=0x%x", userPtr, GetExceptionCode());
     }
 }
 
+
 // 优化块识别函数
 bool IsOurBlock(void* ptr) {
     if (!ptr) return false;
 
-    __try {
-        // 快速检查指针有效性
-        if (IsBadReadPtr(ptr, sizeof(void*))) {
-            return false;
-        }
+    // 第一步: 快速指针有效性检查，避免SEH
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) {
+        return false;
+    }
 
+    // 检查内存是否可读
+    if (!(mbi.State & MEM_COMMIT) ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        return false;
+    }
+
+    __try {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(StormAllocHeader));
 
-        // 检查头部指针有效性
-        if (IsBadReadPtr(header, sizeof(StormAllocHeader))) {
+        // 检查头部内存是否可读
+        if (!VirtualQuery(header, &mbi, sizeof(mbi))) {
             return false;
         }
 
+        if (!(mbi.State & MEM_COMMIT) ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            return false;
+        }
+
+        // 使用新的识别机制：检查特殊标志而不是HeapPtr
         return (header->Magic == STORM_MAGIC &&
-            header->HeapPtr == SPECIAL_MARKER);
+            header->HeapPtr == 0 &&           // NULL HeapPtr
+            (header->Flags & 0x8) != 0);      // 特殊块标志
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1558,7 +1629,7 @@ namespace MemPool {
             }
             catch (...) {}
 
-            LogMessage("[MemPool] 警告: 尝试释放非内存池指针: %p", ptr);
+            //LogMessage("[MemPool] 警告: 尝试释放非内存池指针: %p", ptr);
         }
     }
 
@@ -2200,47 +2271,44 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
     // 记录内存分配
     g_memoryTracker.RecordAlloc(size, name);
 
-    // 检查是否在 CleanAll 后的第一次分配
-    bool isAfterCleanAll = g_afterCleanAll.exchange(false, std::memory_order_acq_rel);
-    if (isAfterCleanAll) {
-        static std::atomic<int> cleanAllCounter{ 0 };
-        int newCounter = cleanAllCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-
-        // 使用异步方式创建稳定块，避免阻塞主线程
-        std::thread([newCounter] {
-            CreateStabilizingBlocks(newCounter);
-            }).detach();
-    }
-
-    // 检查是否为 JassVM 相关分配 - 使用严格的识别
+    // 检查是否为 JassVM 相关分配
     if (name && size == 10408 && strstr(name, "Instance.cpp")) {
-        // 先记录分配（仅计数，不累加大小，因为JassVM池会单独记录）
         g_memoryTracker.RecordAlloc(size, "Instance.cpp", true);
 
         void* jassPtr = JVM_MemPool::Allocate(size);
         if (jassPtr) {
             g_memStats.OnAlloc(size);
-
-            // 更新程序虚拟内存峰值
             UpdatePeakMemoryUsage();
-
             return reinterpret_cast<size_t>(jassPtr);
         }
-        // 分配失败回退到 Storm
         LogMessage("[JassVM] 分配失败，回退到 Storm: %zu 字节", size);
     }
 
-    // 分配策略：大块使用 TLSF，小块使用 Storm
+    // 检查CleanAll后的稳定化处理
+    bool isAfterCleanAll = g_afterCleanAll.exchange(false, std::memory_order_acq_rel);
+    if (isAfterCleanAll) {
+        static std::atomic<int> cleanAllCounter{ 0 };
+        int newCounter = cleanAllCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        // 异步创建稳定块
+        std::thread([newCounter] {
+            CreateStabilizingBlocks(newCounter);
+            }).detach();
+    }
+
+    // 决定分配策略
     bool useTLSF = (size >= g_bigThreshold.load(std::memory_order_relaxed));
 
     if (useTLSF) {
-        // 先尝试从缓存获取大块
+        // 大块分配：先尝试缓存
         void* cachedPtr = g_largeBlockCache.GetBlock(size + sizeof(StormAllocHeader));
         if (cachedPtr) {
             void* userPtr = static_cast<char*>(cachedPtr) + sizeof(StormAllocHeader);
+
+            // 重新设置头部信息
             SetupCompatibleHeader(userPtr, size);
 
-            // 记录此块信息
+            // 原子性记录块信息
             BigBlockInfo info;
             info.rawPtr = cachedPtr;
             info.size = size;
@@ -2249,45 +2317,37 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             info.srcLine = src_line;
             info.type = GetResourceType(name);
 
-            // 添加到分片哈希表
             g_bigBlocks.insert(userPtr, info);
-
             g_memStats.OnAlloc(size);
-
-            // 更新程序虚拟内存峰值
             UpdatePeakMemoryUsage();
 
+            LogMessage("[Alloc] 从缓存分配大块: %p, 大小: %zu", userPtr, size);
             return reinterpret_cast<size_t>(userPtr);
         }
 
-        // 缓存未命中，使用 TLSF 分配
+        // 缓存未命中，使用TLSF分配
         size_t totalSize = size + sizeof(StormAllocHeader);
         void* rawPtr = MemPool::AllocateSafe(totalSize);
 
         if (!rawPtr) {
             LogMessage("[Alloc] TLSF 分配失败: %zu 字节, 回退到 Storm", size);
             size_t ret = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
-
             if (ret) {
                 g_memStats.OnAlloc(size);
-
-                // 更新程序虚拟内存峰值
                 UpdatePeakMemoryUsage();
             }
-
             return ret;
         }
 
-        // 设置用户指针和兼容头
         void* userPtr = static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
         SetupCompatibleHeader(userPtr, size);
 
-        // 注册到内存安全系统 - 使用异步注册减少主线程开销
+        // 注册到内存安全系统
         if (!g_cleanAllInProgress && !g_insideUnsafePeriod.load(std::memory_order_acquire)) {
             g_MemSafety.RegisterMemoryBlock(rawPtr, userPtr, size, name, src_line);
         }
 
-        // 记录此块信息
+        // 原子性记录块信息
         BigBlockInfo info;
         info.rawPtr = rawPtr;
         info.size = size;
@@ -2296,23 +2356,15 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         info.srcLine = src_line;
         info.type = GetResourceType(name);
 
-        // 添加到分片哈希表
         g_bigBlocks.insert(userPtr, info);
-
         g_memStats.OnAlloc(size);
-
-        // 更新程序虚拟内存峰值
         UpdatePeakMemoryUsage();
-
-        return reinterpret_cast<size_t>(userPtr);
     }
     else {
-        // 小块使用 Storm 原始分配
+        // 小块使用Storm原始分配
         size_t ret = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         if (ret) {
             g_memStats.OnAlloc(size);
-
-            // 更新程序虚拟内存峰值
             UpdatePeakMemoryUsage();
         }
         return ret;
@@ -2328,100 +2380,392 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     size_t blockSize = 0;
     const char* blockSource = nullptr;
 
-    // 尝试从g_bigBlocks获取块信息
-    BigBlockInfo blockInfo;
-    bool blockFound = g_bigBlocks.find(ptr, blockInfo);
-    if (blockFound) {
-        blockSize = blockInfo.size;
-        blockSource = blockInfo.source;
-    }
-    else {
-        // 尝试使用GetBlockSize获取大小
-        blockSize = GetBlockSize(ptr);
-    }
-
-    // 记录内存释放，使用找到的源信息
+    // 记录内存释放
     g_memoryTracker.RecordFree(blockSize, blockSource ? blockSource : name);
 
-    // 先检查是否为 JVM_MemPool 指针
+    // 检查是否为 JVM_MemPool 指针
     if (JVM_MemPool::IsFromPool(ptr)) {
-        // 使用 JVM_MemPool 专用释放
         g_memoryTracker.RecordFree(10408, "Instance.cpp");
         JVM_MemPool::Free(ptr);
         return 1;
     }
 
-    bool ourBlock = false;
-    bool permanentBlock = false;
+    // 检查永久块
+    if (IsPermanentBlock(ptr)) {
+        return 1; // 永久块不释放
+    }
 
-    // 使用异常处理检查指针
+    // 关键修复: 原子性检查和移除我们管理的块
+    bool isOurBlock = false;
+    BigBlockInfo blockInfo;
+    bool blockInfoValid = false;
+
+    // 第一步: 检查是否是我们的块
     __try {
-        // 先执行最轻量级的检查 - 永久块检查
-        permanentBlock = IsPermanentBlock(ptr);
-        if (permanentBlock) {
-            return 1; // 假装成功，无需记录日志
-        }
-
-        // 检查是否为我们管理的块
-        ourBlock = IsOurBlock(ptr);
+        isOurBlock = IsOurBlock(ptr);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        // 如果检查过程中出现异常，认为不是我们的块
+        // 检查失败，认为不是我们的块
         return s_origStormFree(a1, name, argList, a4);
     }
 
-    // 常规释放流程
-    if (ourBlock) {
-        // 获取块信息
-        BigBlockInfo blockInfo;
-        bool blockFound = g_bigBlocks.find(ptr, blockInfo);
-
-        if (blockFound) {
-            // 从哈希表中移除块信息 - 在erase内部释放source指针
-            g_bigBlocks.erase(ptr);
+    if (isOurBlock) {
+        // 第二步: 原子性查找和移除块信息
+        blockInfoValid = g_bigBlocks.find(ptr, blockInfo);
+        if (blockInfoValid) {
+            // 成功找到块信息，立即从映射中移除防止重复释放
+            bool removed = g_bigBlocks.erase(ptr);
+            if (!removed) {
+                // 其他线程已经移除了，说明可能已经在释放过程中
+                LogMessage("[Free] 块已被其他线程处理: %p", ptr);
+                return 1; // 认为成功，避免double-free
+            }
 
             // 更新统计
             g_memStats.OnFree(blockInfo.size);
+            blockSize = blockInfo.size;
+            blockSource = blockInfo.source;
 
-            // 安全取消注册 - 只在安全期间执行
+            // 安全取消注册
             if (!g_cleanAllInProgress && !g_insideUnsafePeriod.load(std::memory_order_acquire)) {
                 g_MemSafety.TryUnregisterBlock(ptr);
             }
 
-            // 对于大块，考虑放入缓存或异步释放
+            // 根据块大小决定释放策略
             if (blockInfo.size >= g_bigThreshold.load(std::memory_order_relaxed)) {
-                // 如果在不安全期，使用异步释放
+                // 大块处理
                 if (g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire)) {
+                    // 不安全期间使用异步释放
                     g_asyncReleaser.QueueFree(blockInfo.rawPtr, blockInfo.size);
                 }
-                // 否则尝试放入缓存
                 else if (g_largeBlockCache.GetCacheSize() < MAX_CACHE_BLOCKS) {
+                    // 安全期间尝试缓存
                     g_largeBlockCache.ReleaseBlock(blockInfo.rawPtr, blockInfo.size);
                 }
-                // 缓存已满，直接释放
                 else {
+                    // 缓存已满，直接释放
                     MemPool::FreeSafe(blockInfo.rawPtr);
                 }
             }
-            // 小块直接释放
             else {
+                // 小块直接释放
                 MemPool::FreeSafe(blockInfo.rawPtr);
             }
 
             g_freedByFreeHook.fetch_add(1, std::memory_order_relaxed);
+            return 1; // 成功
         }
         else {
-            // 未找到注册的块，尝试释放原始内存
-            void* rawPtr = static_cast<char*>(ptr) - sizeof(StormAllocHeader);
-            MemPool::FreeSafe(rawPtr);
-            g_freedByFreeHook.fetch_add(1, std::memory_order_relaxed);
-        }
 
-        return 1;
+            // 尝试获取原始指针并释放
+            __try {
+                void* rawPtr = static_cast<char*>(ptr) - sizeof(StormAllocHeader);
+                MemPool::FreeSafe(rawPtr);
+                g_freedByFreeHook.fetch_add(1, std::memory_order_relaxed);
+                return 1;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                LogMessage("[Free] 无法释放损坏的块: %p", ptr);
+                return 0; // 失败
+            }
+        }
     }
     else {
-        // 不是我们的块，使用 Storm 释放
+        // 不是我们的块，使用Storm原始释放
         return s_origStormFree(a1, name, argList, a4);
+    }
+}
+
+void* HandleUnsafePeriodRealloc(void* oldPtr, size_t newSize, const char* name,
+    DWORD src_line, DWORD flag, int ecx, int edx) {
+    bool isOurOldBlock = false;
+    BigBlockInfo oldInfo = {};
+    bool oldInfoValid = false;
+
+    __try {
+        isOurOldBlock = IsOurBlock(oldPtr);
+        if (isOurOldBlock) {
+            oldInfoValid = g_bigBlocks.find(oldPtr, oldInfo);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogMessage("[Realloc] 不安全期间块检查异常: %p", oldPtr);
+        return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+    }
+
+    if (isOurOldBlock && oldInfoValid) {
+        // 我们的块：分配新块 + 复制 + 延迟释放旧块
+        void* newPtr = reinterpret_cast<void*>(
+            Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
+
+        if (!newPtr) {
+            LogMessage("[Realloc] 不安全期间新分配失败: %zu", newSize);
+            return nullptr;
+        }
+
+        // 安全复制数据
+        __try {
+            size_t copySize = min(oldInfo.size, newSize);
+            if (!SafeMemCopy(newPtr, oldPtr, copySize)) {
+                LogMessage("[Realloc] 不安全期间数据复制失败");
+                // 复制失败但新块已分配，继续处理
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogMessage("[Realloc] 不安全期间复制异常");
+        }
+
+        // 将旧块放入延迟释放队列，不立即释放
+        g_MemSafety.EnqueueDeferredFree(oldPtr, oldInfo.size);
+
+        LogMessage("[Realloc] 不安全期间处理: %p -> %p, 大小: %zu -> %zu",
+            oldPtr, newPtr, oldInfo.size, newSize);
+
+        return newPtr;
+    }
+    else {
+        // 不是我们的块，使用原始函数
+        return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+    }
+}
+
+void* HandleOurBlockToOurBlock(void* oldPtr, size_t newSize, const char* name,
+    DWORD src_line, const BigBlockInfo& oldInfo) {
+    // 先从映射中原子性移除旧块，防止并发释放
+    bool removed = g_bigBlocks.erase(oldPtr);
+    if (!removed) {
+        LogMessage("[Realloc] 旧块已被其他线程处理: %p", oldPtr);
+        // 旧块已被其他线程处理，分配新块
+        return reinterpret_cast<void*>(Hooked_Storm_MemAlloc(0, 0, newSize, name, src_line, 0));
+    }
+
+    void* newRawPtr = nullptr;
+    void* newPtr = nullptr;
+
+    __try {
+        // 尝试重新分配
+        newRawPtr = MemPool::ReallocSafe(oldInfo.rawPtr, newSize + sizeof(StormAllocHeader));
+        if (!newRawPtr) {
+            LogMessage("[Realloc] TLSF重分配失败: %zu", newSize);
+
+            // 重分配失败，需要重新插入旧块信息
+            g_bigBlocks.insert(oldPtr, oldInfo);
+            return nullptr;
+        }
+
+        newPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
+        SetupCompatibleHeader(newPtr, newSize);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogMessage("[Realloc] TLSF重分配异常: %p", oldPtr);
+
+        // 异常情况下重新插入旧块信息
+        g_bigBlocks.insert(oldPtr, oldInfo);
+        return nullptr;
+    }
+
+    // 更新内存安全系统
+    bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire);
+    if (!inUnsafePeriod) {
+        g_MemSafety.UnregisterMemoryBlock(oldPtr);
+        g_MemSafety.RegisterMemoryBlock(newRawPtr, newPtr, newSize, name, src_line);
+    }
+
+    // 创建新的块信息
+    BigBlockInfo newInfo;
+    newInfo.rawPtr = newRawPtr;
+    newInfo.size = newSize;
+    newInfo.timestamp = GetTickCount();
+    newInfo.source = name ? _strdup(name) :
+        (oldInfo.source ? _strdup(oldInfo.source) : nullptr);
+    newInfo.srcLine = src_line;
+    newInfo.type = oldInfo.type;
+
+    // 插入新块信息
+    g_bigBlocks.insert(newPtr, newInfo);
+
+    // 更新统计
+    g_memStats.OnFree(oldInfo.size);
+    g_memStats.OnAlloc(newSize);
+
+    return newPtr;
+}
+
+void* HandleOurBlockToStormBlock(void* oldPtr, size_t newSize, const char* name,
+    DWORD src_line, DWORD flag, const BigBlockInfo& oldInfo,
+    int ecx, int edx) {
+    // 原子性移除旧块
+    bool removed = g_bigBlocks.erase(oldPtr);
+    if (!removed) {
+        LogMessage("[Realloc] 转换时旧块已被处理: %p", oldPtr);
+        return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+    }
+
+    void* newPtr = nullptr;
+
+    __try {
+        // 使用Storm分配新块
+        newPtr = reinterpret_cast<void*>(s_origStormAlloc(ecx, edx, newSize, name, src_line, flag));
+        if (!newPtr) {
+            LogMessage("[Realloc] Storm分配失败，恢复旧块");
+            // 分配失败，恢复旧块信息
+            g_bigBlocks.insert(oldPtr, oldInfo);
+            return nullptr;
+        }
+
+        // 安全复制数据
+        size_t copySize = min(oldInfo.size, newSize);
+        if (!SafeMemCopy(newPtr, oldPtr, copySize)) {
+            LogMessage("[Realloc] 数据复制失败");
+            // 复制失败，清理并恢复
+            s_origStormFree(reinterpret_cast<int>(newPtr), const_cast<char*>(name), src_line, flag);
+            g_bigBlocks.insert(oldPtr, oldInfo);
+            return nullptr;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogMessage("[Realloc] 转换异常");
+        if (newPtr) {
+            s_origStormFree(reinterpret_cast<int>(newPtr), const_cast<char*>(name), src_line, flag);
+        }
+        g_bigBlocks.insert(oldPtr, oldInfo);
+        return nullptr;
+    }
+
+    // 成功转换，清理旧块
+    bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire);
+    if (!inUnsafePeriod) {
+        g_MemSafety.UnregisterMemoryBlock(oldPtr);
+    }
+
+    // 释放TLSF旧块
+    if (g_largeBlockCache.GetCacheSize() < MAX_CACHE_BLOCKS) {
+        g_largeBlockCache.ReleaseBlock(oldInfo.rawPtr, oldInfo.size);
+    }
+    else {
+        MemPool::FreeSafe(oldInfo.rawPtr);
+    }
+
+    // 更新统计
+    g_memStats.OnFree(oldInfo.size);
+    g_memStats.OnAlloc(newSize);
+
+    LogMessage("[Realloc] 我们的块转Storm块: %p -> %p, 大小: %zu -> %zu",
+        oldPtr, newPtr, oldInfo.size, newSize);
+
+    return newPtr;
+}
+
+void* HandleStormBlockToOurBlock(void* oldPtr, size_t newSize, const char* name,
+    DWORD src_line, DWORD flag, int ecx, int edx) {
+    void* newRawPtr = nullptr;
+    void* newUserPtr = nullptr;
+
+    __try {
+        // 分配新的TLSF块
+        size_t totalSize = newSize + sizeof(StormAllocHeader);
+        newRawPtr = MemPool::AllocateSafe(totalSize);
+        if (!newRawPtr) {
+            LogMessage("[Realloc] TLSF分配失败，回退到Storm");
+            return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+        }
+
+        newUserPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
+        SetupCompatibleHeader(newUserPtr, newSize);
+
+        // 尝试获取旧块大小进行安全复制
+        size_t oldSize = GetBlockSize(oldPtr);
+        if (oldSize == 0) {
+            oldSize = min(newSize, (size_t)128);  // 保守估计
+        }
+
+        size_t copySize = min(oldSize, newSize);
+        if (!SafeMemCopy(newUserPtr, oldPtr, copySize)) {
+            LogMessage("[Realloc] 转换复制失败");
+            MemPool::FreeSafe(newRawPtr);
+            return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+        }
+
+        // 释放Storm旧块
+        int freeResult = s_origStormFree(reinterpret_cast<int>(oldPtr),
+            const_cast<char*>(name), src_line, flag);
+        if (freeResult == 0) {
+            LogMessage("[Realloc] 警告: Storm块释放可能失败");
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogMessage("[Realloc] Storm到我们的块转换异常");
+        if (newRawPtr) {
+            MemPool::FreeSafe(newRawPtr);
+        }
+        return nullptr;
+    }
+
+    // 注册新块
+    bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire);
+    if (!inUnsafePeriod) {
+        g_MemSafety.RegisterMemoryBlock(newRawPtr, newUserPtr, newSize, name, src_line);
+    }
+
+    // 记录大块信息
+    BigBlockInfo info;
+    info.rawPtr = newRawPtr;
+    info.size = newSize;
+    info.timestamp = GetTickCount();
+    info.source = name ? _strdup(name) : nullptr;
+    info.srcLine = src_line;
+    info.type = GetResourceType(name);
+
+    g_bigBlocks.insert(newUserPtr, info);
+    g_memStats.OnAlloc(newSize);
+
+    LogMessage("[Realloc] Storm块转我们的块: %p -> %p, 大小: %zu",
+        oldPtr, newUserPtr, newSize);
+
+    return newUserPtr;
+}
+
+void* HandleNormalRealloc(void* oldPtr, size_t newSize, const char* name,
+    DWORD src_line, DWORD flag, int ecx, int edx) {
+    // 原子性检查旧块状态
+    bool isOurOldBlock = false;
+    BigBlockInfo oldInfo = {};
+    bool oldInfoValid = false;
+
+    __try {
+        isOurOldBlock = IsOurBlock(oldPtr);
+        if (isOurOldBlock) {
+            oldInfoValid = g_bigBlocks.find(oldPtr, oldInfo);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogMessage("[Realloc] 块检查异常: %p", oldPtr);
+        return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+    }
+
+    // 确定新块的分配策略
+    bool shouldUseTLSF = (newSize >= g_bigThreshold.load(std::memory_order_relaxed)) ||
+        IsSpecialBlockAllocation(newSize, name, src_line);
+
+    // 情况1: 我们的块 -> 我们的块
+    if (isOurOldBlock && shouldUseTLSF && oldInfoValid) {
+        return HandleOurBlockToOurBlock(oldPtr, newSize, name, src_line, oldInfo);
+    }
+    // 情况2: 我们的块 -> Storm块
+    else if (isOurOldBlock && !shouldUseTLSF && oldInfoValid) {
+        return HandleOurBlockToStormBlock(oldPtr, newSize, name, src_line, flag, oldInfo, ecx, edx);
+    }
+    // 情况3: Storm块 -> 我们的块
+    else if (!isOurOldBlock && shouldUseTLSF) {
+        return HandleStormBlockToOurBlock(oldPtr, newSize, name, src_line, flag, ecx, edx);
+    }
+    // 情况4: Storm块 -> Storm块
+    else {
+        void* result = s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+        if (result) {
+            g_memStats.OnAlloc(newSize);
+        }
+        return result;
     }
 }
 
@@ -2429,7 +2773,6 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
     const char* name, DWORD src_line, DWORD flag)
 {
-
     // 基本边界情况处理
     if (!oldPtr) {
         return reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
@@ -2442,7 +2785,6 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 
     // 检查是否是 JVM_MemPool 内存
     if (JVM_MemPool::IsFromPool(oldPtr)) {
-        // 使用 JVM_MemPool 专用重分配
         return JVM_MemPool::Realloc(oldPtr, newSize);
     }
 
@@ -2451,8 +2793,14 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         void* newPtr = reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
 
         if (newPtr) {
-            // 只复制最少必要数据
-            SafeMemCopy(newPtr, oldPtr, min(64, newSize));
+            // 只复制最少必要数据，避免访问无效内存
+            __try {
+                size_t copySize = min(64, newSize);  // 保守复制64字节
+                SafeMemCopy(newPtr, oldPtr, copySize);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                LogMessage("[Realloc] 永久块数据复制异常: %p", oldPtr);
+            }
         }
 
         return newPtr;
@@ -2461,232 +2809,11 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
     // 不安全期特殊处理
     bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire);
     if (inUnsafePeriod) {
-        if (IsOurBlock(oldPtr)) {
-            // 只分配，不释放
-            void* newPtr = reinterpret_cast<void*>(
-                Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
-
-            if (!newPtr) {
-                return nullptr;
-            }
-
-            // 尝试安全复制
-            size_t oldSize = GetBlockSize(oldPtr);
-            if (oldSize > 0) {
-                SafeMemCopy(newPtr, oldPtr, min(oldSize, newSize));
-            }
-            else {
-                // 如果无法获取大小，只复制少量数据
-                SafeMemCopy(newPtr, oldPtr, min(64, newSize));
-            }
-
-            // 将oldPtr放入延迟释放队列
-            g_MemSafety.EnqueueDeferredFree(oldPtr, oldSize);
-
-            return newPtr;
-        }
-
-        // 不是我们的块，使用原始函数
-        return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+        return HandleUnsafePeriodRealloc(oldPtr, newSize, name, src_line, flag, ecx, edx);
     }
 
-    // 确定重分配策略
-    bool isOurOldBlock = IsOurBlock(oldPtr);
-    bool shouldUseTLSF = (newSize >= g_bigThreshold.load(std::memory_order_relaxed)) ||
-        IsSpecialBlockAllocation(newSize, name, src_line);
-
-    // 情况1: 我们的块重分配为我们的块
-    if (isOurOldBlock && shouldUseTLSF) {
-        BigBlockInfo oldInfo;
-        bool blockFound = g_bigBlocks.find(oldPtr, oldInfo);
-
-        if (!blockFound) {
-            return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
-        }
-
-        // 尝试重新分配
-        void* newRawPtr = nullptr;
-        void* newPtr = nullptr;
-
-        __try {
-            newRawPtr = MemPool::ReallocSafe(oldInfo.rawPtr, newSize + sizeof(StormAllocHeader));
-            if (!newRawPtr) {
-                LogMessage("[Realloc] TLSF重分配失败, 大小=%zu", newSize);
-                return nullptr;
-            }
-
-            newPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
-            SetupCompatibleHeader(newPtr, newSize);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            LogMessage("[Realloc] TLSF重分配异常: %p", oldPtr);
-            return nullptr;
-        }
-
-        // 更新安全系统
-        if (!inUnsafePeriod) {
-            g_MemSafety.UnregisterMemoryBlock(oldPtr);
-            g_MemSafety.RegisterMemoryBlock(newRawPtr, newPtr, newSize, name, src_line);
-        }
-
-        // 更新大块跟踪
-        if (newPtr != oldPtr) {
-            // 指针变化，更新映射
-            g_bigBlocks.erase(oldPtr);
-
-            BigBlockInfo info;
-            info.rawPtr = newRawPtr;
-            info.size = newSize;
-            info.timestamp = GetTickCount();
-            info.source = name ? _strdup(name) : (oldInfo.source ? _strdup(oldInfo.source) : nullptr);
-            info.srcLine = src_line;
-            info.type = oldInfo.type;
-
-            g_bigBlocks.insert(newPtr, info);
-
-            // 注意：这里不需要释放 oldInfo.source，因为 erase 已经处理了
-        }
-        else {
-            // 指针未变，通过移除再插入更新信息
-            g_bigBlocks.erase(oldPtr);
-
-            BigBlockInfo info;
-            info.rawPtr = newRawPtr;
-            info.size = newSize;
-            info.timestamp = GetTickCount();
-            info.source = name ? _strdup(name) : (oldInfo.source ? _strdup(oldInfo.source) : nullptr);
-            info.srcLine = src_line;
-            info.type = oldInfo.type;
-
-            g_bigBlocks.insert(newPtr, info);
-        }
-
-        // 更新统计
-        g_memStats.OnFree(oldInfo.size);
-        g_memStats.OnAlloc(newSize);
-
-        return newPtr;
-    }
-
-    // 情况2: 我们的块重分配为Storm块（变小）
-    else if (isOurOldBlock && !shouldUseTLSF) {
-        BigBlockInfo oldInfo;
-        bool blockFound = g_bigBlocks.find(oldPtr, oldInfo);
-
-        if (!blockFound) {
-            return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
-        }
-
-        // 使用Storm分配新块
-        void* newPtr = nullptr;
-
-        __try {
-            newPtr = reinterpret_cast<void*>(s_origStormAlloc(ecx, edx, newSize, name, src_line, flag));
-            if (!newPtr) {
-                return nullptr;
-            }
-
-            // 安全复制数据
-            SafeMemCopy(newPtr, oldPtr, min(oldInfo.size, newSize));
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            if (newPtr) {
-                s_origStormFree(reinterpret_cast<int>(newPtr), const_cast<char*>(name), src_line, flag);
-            }
-            return nullptr;
-        }
-
-        // 取消注册
-        if (!inUnsafePeriod) {
-            g_MemSafety.UnregisterMemoryBlock(oldPtr);
-        }
-
-        // 移除块信息
-        g_bigBlocks.erase(oldPtr);
-
-        // 释放TLSF旧块
-        if (g_largeBlockCache.GetCacheSize() < MAX_CACHE_BLOCKS) {
-            g_largeBlockCache.ReleaseBlock(oldInfo.rawPtr, oldInfo.size);
-        }
-        else {
-            MemPool::FreeSafe(oldInfo.rawPtr);
-        }
-
-        // 更新统计
-        g_memStats.OnFree(oldInfo.size);
-        g_memStats.OnAlloc(newSize);
-
-        return newPtr;
-    }
-
-    // 情况3: Storm块重分配为我们的块（变大）
-    else if (!isOurOldBlock && shouldUseTLSF) {
-        void* newRawPtr = nullptr;
-        void* newUserPtr = nullptr;
-
-        __try {
-            // 分配新的TLSF块
-            size_t totalSize = newSize + sizeof(StormAllocHeader);
-            newRawPtr = MemPool::AllocateSafe(totalSize);
-            if (!newRawPtr) {
-                return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
-            }
-
-            newUserPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
-            SetupCompatibleHeader(newUserPtr, newSize);
-
-            // 尝试获取旧块大小
-            size_t oldSize = GetBlockSize(oldPtr);
-
-            // 安全复制数据
-            if (oldSize > 0) {
-                SafeMemCopy(newUserPtr, oldPtr, min(oldSize, newSize));
-            }
-            else {
-                // 保守估计复制大小
-                SafeMemCopy(newUserPtr, oldPtr, min(newSize, (size_t)128));
-            }
-
-            // 释放Storm旧块
-            s_origStormFree(reinterpret_cast<int>(oldPtr), const_cast<char*>(name), src_line, flag);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            LogMessage("[Realloc] Storm到TLSF转换异常");
-            if (newRawPtr) {
-                MemPool::FreeSafe(newRawPtr);
-            }
-            return nullptr;
-        }
-
-        // 注册新块
-        if (!inUnsafePeriod) {
-            g_MemSafety.RegisterMemoryBlock(newRawPtr, newUserPtr, newSize, name, src_line);
-        }
-
-        // 记录大块信息
-        BigBlockInfo info;
-        info.rawPtr = newRawPtr;
-        info.size = newSize;
-        info.timestamp = GetTickCount();
-        info.source = name ? _strdup(name) : nullptr;
-        info.srcLine = src_line;
-        info.type = GetResourceType(name);
-
-        g_bigBlocks.insert(newUserPtr, info);
-
-        g_memStats.OnAlloc(newSize);
-        return newUserPtr;
-    }
-
-    // 情况4: Storm块重分配为Storm块
-    else {
-        // 小块使用Storm重分配
-        void* result = s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
-        if (result) {
-            g_memStats.OnAlloc(newSize);
-        }
-        return result;
-    }
+    // 正常期间的重分配处理
+    return HandleNormalRealloc(oldPtr, newSize, name, src_line, flag, ecx, edx);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

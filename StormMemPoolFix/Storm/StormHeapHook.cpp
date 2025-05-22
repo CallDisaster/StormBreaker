@@ -13,6 +13,7 @@
 #include "StormOffsets.h"
 #include "StormHook.h" // Include after StormOffsets.h
 #include "MemoryPool.h"
+#include <shared_mutex>
 
 // 当块被 free 后, Storm 通常把头4字节改成 size(WORD) + AlignPadding(BYTE) + Flags(BYTE=2) + pNext
 #pragma pack(push,1)
@@ -25,6 +26,20 @@ struct StormFreeBlock
 };
 #pragma pack(pop)
 
+enum class BlockState {
+    Normal,      // 正常状态
+    Reset,       // 已MEM_RESET
+    Decommitted, // 已MEM_DECOMMIT (仅用于特殊情况)
+    Invalid      // 无效状态
+};
+
+struct BlockStateInfo {
+    BlockState state;
+    size_t size;
+    DWORD timestamp;
+    std::string operation;  // 记录操作类型
+};
+
 // ============== 全局数据 ==============
 static std::unordered_map<void*, size_t> g_DecommittedBlocks;
 static std::mutex g_DecommitLock;
@@ -33,6 +48,12 @@ static std::mutex g_DecommitLock;
 std::atomic<size_t> g_freedByAllocHook{ 0 };
 std::atomic<size_t> g_freedByFreeHook{ 0 };
 static size_t g_peakMemoryUsed = 0;
+
+static std::unordered_map<void*, size_t> g_ResetBlocks;
+static std::mutex g_ResetLock;  // 改名对应的锁
+
+static std::unordered_map<void*, BlockStateInfo> g_BlockStates;
+static std::shared_mutex g_BlockStatesLock;  // 读写分离锁
 
 // StormOffsets 里定义的全局:
 extern uintptr_t gStormDllBase;
@@ -87,11 +108,31 @@ static sub_15035850_t               s_origSub_15035850 = nullptr;
  *    -> interpret as StormAllocHeader
  *    -> block大小 = hdr->Size + sizeof(StormAllocHeader) + hdr->AlignPadding (+ boundary?若Flag=1再+2)
  */
+
+ // 安全的状态查询函数
+BlockState GetBlockState(void* ptr) {
+    std::shared_lock<std::shared_mutex> lock(g_BlockStatesLock);
+    auto it = g_BlockStates.find(ptr);
+    return (it != g_BlockStates.end()) ? it->second.state : BlockState::Normal;
+}
+
+
 static bool StormBlockIsFree(const void* pBlock)
 {
     const StormFreeBlock* fb = reinterpret_cast<const StormFreeBlock*>(pBlock);
     return (fb->Flags & 0x2) != 0; // 2 => free
 }
+
+void SetBlockState(void* ptr, BlockState state, size_t size, const std::string& operation) {
+    std::unique_lock<std::shared_mutex> lock(g_BlockStatesLock);
+    g_BlockStates[ptr] = { state, size, GetTickCount(), operation };
+
+    LogMessage("[BlockState] %s: ptr=%p, size=%zu, op=%s",
+        state == BlockState::Reset ? "RESET" :
+        state == BlockState::Decommitted ? "DECOMMIT" : "NORMAL",
+        ptr, size, operation.c_str());
+}
+
 
 static size_t StormBlockGetTotalSize(const void* pBlock)
 {
@@ -143,189 +184,217 @@ static void CheckAndTriggerHeapCompact(char* heapBase)
 }
 
 // ============== Hook: StormHeap_AllocPage ==============
-unsigned __int16* __fastcall StormHeap_AllocPageHook(char* heapBase, unsigned int requestedSize, LPVOID lpAddress)
-{
-    //printf("[AllocPage] Requesting size: %u\n", requestedSize);
-
+unsigned __int16* __fastcall StormHeap_AllocPageHook(char* heapBase, unsigned int requestedSize, LPVOID lpAddress) {
     CheckAndTriggerHeapCompact(heapBase);
 
     // 调用原函数
     unsigned __int16* pResult = s_origStormHeap_AllocPage(heapBase, requestedSize, lpAddress);
-    if (!pResult)
-    {
-        printf("[AllocPage] Allocation failed!\n");
+    if (!pResult) {
+        LogMessage("[AllocPage] 分配失败: 大小=%u", requestedSize);
         return nullptr;
     }
 
-    // pResult => "用户可用地址" or "blockHeader + offset"?
-    // 绝大多数Storm版本: pResult = blockHeader + (4 or 8?), 需自己测试
-    // 目前你原代码是 "blockPtr = pResult - 4" => 可能是 StormFreeBlock? 
-    // 更安全: 先 - (sizeof(StormAllocHeader)) 做检查:
+    // 检查是否需要恢复之前优化的内存
     char* blockBase = (char*)pResult - sizeof(StormAllocHeader);
-    // 但若 Storm 真的是 -(4) = Freed 结构, 那就得自己调试…
 
-    // 这里维持你之前 approach: 
-    char* guessBlock = (char*)pResult - 4;
+    // 查询块状态
+    BlockState state = GetBlockState(blockBase);
 
-    // 若它曾被我们 Decommit 过, 需要 Recommit
-    {
-        std::lock_guard<std::mutex> lock(g_DecommitLock);
-        auto it = g_DecommittedBlocks.find((void*)guessBlock);
-        if (it != g_DecommittedBlocks.end())
-        {
-            size_t blockSize = it->second;
-            //printf("[AllocPage] Recommitting decommitted block at %p, size=%zu\n", guessBlock, blockSize);
+    if (state == BlockState::Reset) {
+        // MEM_RESET的内存被重新使用，更新状态
+        LogMessage("[AllocPage] MEM_RESET块被重用: %p", blockBase);
+        SetBlockState(blockBase, BlockState::Normal, 0, "AllocPage_Reuse");
+    }
+    else if (state == BlockState::Decommitted) {
+        // 需要重新提交DECOMMIT的内存
+        std::shared_lock<std::shared_mutex> lock(g_BlockStatesLock);
+        auto it = g_BlockStates.find(blockBase);
+        if (it != g_BlockStates.end()) {
+            size_t blockSize = it->second.size;
+            lock.unlock();  // 释放读锁
 
-            LPVOID re = VirtualAlloc(guessBlock, blockSize, MEM_COMMIT, PAGE_READWRITE);
-            if (!re)
-            {
-                printf("[AllocPage] Recommit FAILED! ptr=%p, size=%zu, err=%d\n",
-                    guessBlock, blockSize, GetLastError());
+            LogMessage("[AllocPage] 重新提交DECOMMIT块: %p, 大小: %zu", blockBase, blockSize);
+
+            LPVOID re = VirtualAlloc(blockBase, blockSize, MEM_COMMIT, PAGE_READWRITE);
+            if (re) {
+                SetBlockState(blockBase, BlockState::Normal, 0, "AllocPage_Recommit");
+                LogMessage("[AllocPage] 重新提交成功: %p", blockBase);
             }
-            g_DecommittedBlocks.erase(it);
+            else {
+                DWORD error = GetLastError();
+                LogMessage("[AllocPage] 重新提交失败: ptr=%p, size=%zu, 错误=%d",
+                    blockBase, blockSize, error);
+
+                // 提交失败，返回NULL让Storm处理
+                return nullptr;
+            }
         }
     }
 
-    //printf("[AllocPage] Allocated at %p\n", pResult);
     return pResult;
 }
 
 // ============== Hook: StormHeap_InternalFree ==============
-char __fastcall StormHeap_InternalFreeHook(DWORD* heap, unsigned __int16* blockHeader)
-{
-
+char __fastcall StormHeap_InternalFreeHook(DWORD* heap, unsigned __int16* blockHeader) {
     // 获取原始用户指针和大小
     void* userPtr = (void*)((char*)blockHeader + sizeof(StormAllocHeader));
     size_t size = 0;
 
+    // 检查小块池拦截
     try {
-        // 尝试获取块大小
         StormAllocHeader* hdr = reinterpret_cast<StormAllocHeader*>(blockHeader);
         size = hdr->Size;
 
-        // 检查是否是我们管理的小块
         if (size > 0 && SmallBlockPool::ShouldIntercept(size)) {
             if (SmallBlockPool::Free(userPtr, size)) {
-                // 我们已处理，返回成功码
-                return 2;
+                LogMessage("[SmallBlock] 小块池释放成功: %p, 大小: %zu", userPtr, size);
+                return 2;  // 成功码
             }
         }
     }
     catch (...) {
-        // 异常处理
+        LogMessage("[InternalFree] 小块检查异常: %p", blockHeader);
     }
 
     size_t usageBefore = StormFix_GetCurrentUsage();
-    //printf("[InternalFree] Freeing block at %p\n", blockHeader);
 
-    // 先把它真正交给 Storm 做 free => 这会把 blockHeader 改成 StormFreeBlock 结构
+    // 调用原始Storm释放函数
     char ret = s_origStormHeap_InternalFree(heap, blockHeader);
 
     size_t usageMid = StormFix_GetCurrentUsage();
-    size_t freedByOrig = (usageBefore > usageMid ? usageBefore - usageMid : 0);
+    size_t freedByOrig = (usageBefore > usageMid) ? (usageBefore - usageMid) : 0;
 
-    // 紧凑
-    if (heap[5] == 0)
-    {
+    // Storm内部整理逻辑
+    if (heap[5] == 0) {
         size_t usageBeforeReset = StormFix_GetCurrentUsage();
         heap[8] = heap[7];
         for (int i = 0; i < FREE_LIST_SLOT_COUNT; i++)
             heap[FREE_LIST_SLOT_BASE + i] = 0;
         size_t usageAfterReset = StormFix_GetCurrentUsage();
-        g_freedByFreeHook += (usageBeforeReset > usageAfterReset ? usageBeforeReset - usageAfterReset : 0);
+        g_freedByFreeHook += (usageBeforeReset > usageAfterReset) ?
+            (usageBeforeReset - usageAfterReset) : 0;
     }
-    else
-    {
+    else {
         size_t usageBeforeRebuild = StormFix_GetCurrentUsage();
         s_origStormHeap_RebuildFreeList(heap);
         size_t usageAfterRebuild = StormFix_GetCurrentUsage();
-        g_freedByFreeHook += (usageBeforeRebuild > usageAfterRebuild ? usageBeforeRebuild - usageAfterRebuild : 0);
+        g_freedByFreeHook += (usageBeforeRebuild > usageAfterRebuild) ?
+            (usageBeforeRebuild - usageAfterRebuild) : 0;
     }
     g_freedByFreeHook += freedByOrig;
 
+    // 修复: 安全的内存优化处理
     bool isFree = StormBlockIsFree(blockHeader);
-    if (isFree)
-    {
+    if (isFree) {
         size_t blockSize = StormBlockGetTotalSize(blockHeader);
-        if (blockSize > 0)
-        {
-            // 检查：地址与大小都为系统页对齐？
+        if (blockSize > 0) {
             SYSTEM_INFO si;
             GetSystemInfo(&si);
             size_t pageSize = si.dwPageSize;
-
             uintptr_t addr = (uintptr_t)blockHeader;
 
-            // 如果恰好满足页对齐
-            if ((addr % pageSize) == 0 && (blockSize % pageSize) == 0)
-            {
-                printf("[InternalFree] Decommitting block at %p, size=%zu\n", blockHeader, blockSize);
-                BOOL bOK = VirtualFree(blockHeader, blockSize, MEM_DECOMMIT);
-                if (bOK)
-                {
-                    std::lock_guard<std::mutex> lock(g_DecommitLock);
-                    g_DecommittedBlocks[(void*)blockHeader] = blockSize;
+            // 检查页对齐和大小要求
+            bool isPageAligned = (addr % pageSize) == 0;
+            bool isSizeAligned = (blockSize % pageSize) == 0;
+            bool isLargeEnough = blockSize >= (pageSize * 4);  // 至少4页才考虑优化
+
+            if (isPageAligned && isSizeAligned && isLargeEnough) {
+                // 修复: 使用MEM_RESET而不是MEM_DECOMMIT
+                // MEM_RESET保持虚拟地址映射，只是告诉系统可以丢弃物理内存
+                LogMessage("[InternalFree] 使用MEM_RESET优化大块: %p, 大小: %zu",
+                    blockHeader, blockSize);
+
+                BOOL bOK = VirtualFree(blockHeader, blockSize, MEM_RESET);
+                if (bOK) {
+                    SetBlockState(blockHeader, BlockState::Reset, blockSize, "InternalFree");
+
+                    // 统计优化的内存
+                    static std::atomic<size_t> s_totalReset{ 0 };
+                    s_totalReset += blockSize;
+
+                    if (s_totalReset.load() % (16 * 1024 * 1024) == 0) {  // 每16MB记录一次
+                        LogMessage("[优化] 累计MEM_RESET: %zu MB",
+                            s_totalReset.load() / (1024 * 1024));
+                    }
                 }
-                else
-                {
-                    printf("[InternalFree] Decommit FAILED! ptr=%p, size=%zu, err=%d\n",
-                        blockHeader, blockSize, GetLastError());
+                else {
+                    DWORD error = GetLastError();
+                    LogMessage("[InternalFree] MEM_RESET失败: ptr=%p, size=%zu, 错误=%d",
+                        blockHeader, blockSize, error);
+
+                    // MEM_RESET失败，尝试保守的方法
+                    if (blockSize >= (pageSize * 16)) {  // 只对非常大的块使用DECOMMIT
+                        LogMessage("[InternalFree] 尝试保守DECOMMIT: %p", blockHeader);
+                        bOK = VirtualFree(blockHeader, blockSize, MEM_DECOMMIT);
+                        if (bOK) {
+                            SetBlockState(blockHeader, BlockState::Decommitted, blockSize,
+                                "InternalFree_Fallback");
+                        }
+                    }
                 }
             }
-            else
-            {
-                // 不满足对齐: 不做 MEM_DECOMMIT 以防崩
-                // 仅提示一下
-                // printf("[InternalFree] block not page-aligned => skip decommit\n");
+            else {
+                // 不满足对齐要求，记录原因
+                //LogMessage("[InternalFree] 跳过内存优化: ptr=%p, size=%zu, "
+                //    "页对齐=%s, 大小对齐=%s, 足够大=%s",
+                //    blockHeader, blockSize,
+                //    isPageAligned ? "是" : "否",
+                //    isSizeAligned ? "是" : "否",
+                //    isLargeEnough ? "是" : "否");
             }
         }
     }
 
-
-    //printf("[InternalFree] Free completed for %p\n", blockHeader);
     return ret;
 }
 
 // ============== Hook: StormHeap_Alloc (可选) ==============
-void* __fastcall StormHeap_AllocHook(DWORD* pHeap, int a2, int flags, size_t size)
-{
-    // 1) 检查是否是我们要拦截的小块大小
+void* __fastcall StormHeap_AllocHook(DWORD* pHeap, int a2, int flags, size_t size) {
+    // 检查小块池拦截
     if (SmallBlockPool::ShouldIntercept(size)) {
         void* ptr = SmallBlockPool::Allocate(size);
         if (ptr) {
-            // 统计和记录
+            LogMessage("[SmallBlock] 小块池分配: %p, 大小: %zu", ptr, size);
             return ptr;
         }
-        // 无可用块，继续Storm分配
+        // 小块池分配失败，继续Storm分配
     }
 
-    // 2) 调用原始
+    // 调用原始Storm分配
     void* pUserPtr = s_origStormHeap_Alloc(pHeap, a2, flags, size);
-    if (!pUserPtr)
+    if (!pUserPtr) {
         return nullptr;
+    }
 
-    // 3) 可能 Storm 又给你分配了某个“曾被 Decommit”的空闲块
-    //    估计 pUserPtr = blockHeader + 12? (含StormAllocHeader)
-    //    这里若你原先以 “blockPtr = pUserPtr - 4” 做记录，就保持一致:
-    char* guessBlock = (char*)pUserPtr - 4;
+    // 检查是否使用了优化过的内存
+    char* blockBase = (char*)pUserPtr - sizeof(StormAllocHeader);
+    BlockState state = GetBlockState(blockBase);
 
-    {
-        std::lock_guard<std::mutex> lock(g_DecommitLock);
-        auto it = g_DecommittedBlocks.find((void*)guessBlock);
-        if (it != g_DecommittedBlocks.end())
-        {
-            size_t blockSize = it->second;
-            //printf("[StormHeap_AllocHook] Recommit block at %p, size=%zu\n", guessBlock, blockSize);
-            if (!VirtualAlloc(guessBlock, blockSize, MEM_COMMIT, PAGE_READWRITE))
-            {
-                printf("[StormHeap_AllocHook] Recommit FAILED: ptr=%p size=%zu err=%d\n",
-                    guessBlock, blockSize, GetLastError());
+    if (state == BlockState::Reset) {
+        LogMessage("[StormAlloc] 重用MEM_RESET块: %p, 大小: %zu", pUserPtr, size);
+        SetBlockState(blockBase, BlockState::Normal, 0, "StormAlloc_Reuse");
+    }
+    else if (state == BlockState::Decommitted) {
+        // 这种情况不应该发生，因为AllocPage应该已经处理了
+        LogMessage("[StormAlloc] 警告: 使用了未恢复的DECOMMIT块: %p", pUserPtr);
+
+        std::shared_lock<std::shared_mutex> lock(g_BlockStatesLock);
+        auto it = g_BlockStates.find(blockBase);
+        if (it != g_BlockStates.end()) {
+            size_t blockSize = it->second.size;
+            lock.unlock();
+
+            // 尝试紧急恢复
+            LPVOID re = VirtualAlloc(blockBase, blockSize, MEM_COMMIT, PAGE_READWRITE);
+            if (re) {
+                SetBlockState(blockBase, BlockState::Normal, 0, "StormAlloc_Emergency");
+                LogMessage("[StormAlloc] 紧急恢复成功: %p", blockBase);
             }
-            else
-            {
-                //printf("[StormHeap_AllocHook] Recommit SUCCESS: ptr=%p, size=%zu\n", guessBlock, blockSize);
+            else {
+                LogMessage("[StormAlloc] 紧急恢复失败: %p", blockBase);
+                // 返回NULL，让调用者处理失败
+                return nullptr;
             }
-            g_DecommittedBlocks.erase(it);
         }
     }
 
@@ -421,4 +490,21 @@ bool HookAllStormHeapFunctions()
 
     printf("[HookAllStormHeapFunctions] success.\n");
     return true;
+}
+
+void CleanupBlockStates() {
+    std::unique_lock<std::shared_mutex> lock(g_BlockStatesLock);
+
+    size_t resetCount = 0;
+    size_t decommitCount = 0;
+
+    for (const auto& entry : g_BlockStates) {
+        if (entry.second.state == BlockState::Reset) resetCount++;
+        else if (entry.second.state == BlockState::Decommitted) decommitCount++;
+    }
+
+    LogMessage("[清理] 块状态统计: MEM_RESET=%zu, MEM_DECOMMIT=%zu, 总计=%zu",
+        resetCount, decommitCount, g_BlockStates.size());
+
+    g_BlockStates.clear();
 }
