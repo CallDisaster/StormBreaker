@@ -42,7 +42,7 @@ struct MemoryStats {
 
 // Storm函数类型定义
 typedef size_t(__fastcall* Storm_MemAlloc_t)(int ecx, int edx, size_t size, const char* name, DWORD src_line, DWORD flag);
-typedef int(__stdcall* Storm_MemFree_t)(int a1, char* name, int argList, int a4);
+typedef int(__stdcall* Storm_MemFree_t)(int a1, const char* name, int argList, int a4);
 typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, size_t newSize, const char* name, DWORD src_line, DWORD flag);
 typedef void(*StormHeap_CleanupAll_t)();
 
@@ -108,5 +108,117 @@ bool SafeWriteMemory(void* dest, const T& value) {
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
+    }
+}
+
+// 安全的内存验证函数
+inline bool SafeIsBadReadPtr(const void* lp, UINT_PTR ucb) {
+    if (!lp) return true;
+
+    __try {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(lp, &mbi, sizeof(mbi))) {
+            return true;
+        }
+
+        if (mbi.State != MEM_COMMIT) {
+            return true;
+        }
+
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+            return true;
+        }
+
+        // 检查是否可读
+        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+            return true;
+        }
+
+        // 检查范围
+        uintptr_t start = reinterpret_cast<uintptr_t>(lp);
+        uintptr_t end = start + ucb;
+        uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+        if (end > regionEnd) {
+            return true;
+        }
+
+        // 尝试读取第一个和最后一个字节
+        volatile char test1 = *static_cast<const char*>(lp);
+        if (ucb > 1) {
+            volatile char test2 = *static_cast<const char*>(static_cast<const char*>(lp) + ucb - 1);
+        }
+
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
+}
+
+inline bool SafeIsBadWritePtr(void* lp, UINT_PTR ucb) {
+    if (!lp) return true;
+
+    __try {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(lp, &mbi, sizeof(mbi))) {
+            return true;
+        }
+
+        if (mbi.State != MEM_COMMIT) {
+            return true;
+        }
+
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+            return true;
+        }
+
+        // 检查是否可写
+        if (!(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+            return true;
+        }
+
+        // 检查范围
+        uintptr_t start = reinterpret_cast<uintptr_t>(lp);
+        uintptr_t end = start + ucb;
+        uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+        if (end > regionEnd) {
+            return true;
+        }
+
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
+}
+
+inline bool SafeIsBadCodePtr(FARPROC lpfn) {
+    if (!lpfn) return true;
+
+    __try {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(lpfn, &mbi, sizeof(mbi))) {
+            return true;
+        }
+
+        if (mbi.State != MEM_COMMIT) {
+            return true;
+        }
+
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+            return true;
+        }
+
+        // 检查是否可执行
+        if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+            return true;
+        }
+
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
     }
 }

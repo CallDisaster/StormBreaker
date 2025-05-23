@@ -24,6 +24,197 @@ std::atomic<LogLevel> g_currentLogLevel{ LogLevel::Info };
 
 // Global log file pointer
 static FILE* g_logFile = nullptr;
+bool g_fastMode = false;
+
+//class SafeFileOperations {
+//private:
+//    static std::mutex fileMutex_;
+//    static std::atomic<bool> fileOperationInProgress_;
+//
+//public:
+//    static bool SafeRename_SEH(const char* oldPath, const char* newPath) {
+//        // 只做无对象/无RAII的裸C风格操作
+//        // 注意这里不能有std::string/lock_guard等C++对象
+//        // 检查源文件
+//        if (GetFileAttributesA(oldPath) == INVALID_FILE_ATTRIBUTES) {
+//            return false;
+//        }
+//        // 如果目标文件存在，先删除
+//        if (GetFileAttributesA(newPath) != INVALID_FILE_ATTRIBUTES) {
+//            DeleteFileA(newPath); // 失败直接跳过
+//        }
+//        // 重命名
+//        if (MoveFileA(oldPath, newPath)) {
+//            return true;
+//        }
+//        // 尝试复制+删除
+//        if (CopyFileA(oldPath, newPath, FALSE)) {
+//            if (DeleteFileA(oldPath)) {
+//                LogMessage("[FileOp] 通过复制+删除完成重命名: %s", newPath);
+//                return true;
+//            }
+//        }
+//        return false;
+//    }
+//
+//    static bool SafeRename(const std::string& oldPath, const std::string& newPath) {
+//        if (fileOperationInProgress_.exchange(true)) return false;
+//
+//        bool result = false;
+//        {
+//            std::lock_guard<std::mutex> lock(fileMutex_);
+//            __try {
+//                result = SafeRename_SEH(oldPath.c_str(), newPath.c_str());
+//            }
+//            __except (EXCEPTION_EXECUTE_HANDLER) {
+//                LogMessage("[FileOp] 文件操作异常: 0x%08X", GetExceptionCode());
+//                result = false;
+//            }
+//        }
+//        fileOperationInProgress_.store(false);
+//        return result;
+//    }
+//
+//    static bool SafeWrite_SEH(const char* filePath, const char* content, size_t contentLen) {
+//        HANDLE hFile = CreateFileA(
+//            filePath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr
+//        );
+//        if (hFile == INVALID_HANDLE_VALUE) {
+//            return false;
+//        }
+//        DWORD bytesWritten = 0;
+//        BOOL ok = WriteFile(hFile, content, static_cast<DWORD>(contentLen), &bytesWritten, nullptr);
+//        CloseHandle(hFile);
+//        return ok && bytesWritten == contentLen;
+//    }
+//
+//    static bool SafeWrite(const std::string& filePath, const std::string& content) {
+//        if (g_fastMode) return true;
+//        if (fileOperationInProgress_.exchange(true)) return false;
+//        bool result = false;
+//        {
+//            std::lock_guard<std::mutex> lock(fileMutex_);
+//            __try {
+//                result = SafeWrite_SEH(filePath.c_str(), content.c_str(), content.length());
+//            }
+//            __except (EXCEPTION_EXECUTE_HANDLER) {
+//                LogMessage("[FileOp] 写文件异常: 0x%08X", GetExceptionCode());
+//                result = false;
+//            }
+//        }
+//        fileOperationInProgress_.store(false);
+//        return result;
+//    }
+//
+//};
+//
+//std::mutex SafeFileOperations::fileMutex_;
+//std::atomic<bool> SafeFileOperations::fileOperationInProgress_{ false };
+
+class NonBlockingMemoryTracker {
+private:
+    std::atomic<bool> reportingEnabled_{ true };
+    std::atomic<DWORD> lastReportTime_{ 0 };
+    HANDLE reportThread_{ nullptr };
+    std::atomic<bool> shouldStop_{ false };
+
+    // 轻量级统计
+    std::atomic<size_t> allocCount_{ 0 };
+    std::atomic<size_t> freeCount_{ 0 };
+    std::atomic<size_t> totalAllocated_{ 0 };
+    std::atomic<size_t> totalFreed_{ 0 };
+
+public:
+    void StartPeriodicReporting(DWORD intervalMs) {
+        if (g_fastMode) {
+            LogMessage("[MemoryTracker] 快速模式：跳过定时报告");
+            return;
+        }
+
+        if (reportThread_) {
+            return; // 已经启动
+        }
+
+        shouldStop_.store(false);
+        reportThread_ = CreateThread(
+            nullptr, 0,
+            [](LPVOID param) -> DWORD {
+                NonBlockingMemoryTracker* tracker = static_cast<NonBlockingMemoryTracker*>(param);
+                return tracker->ReportThreadProc();
+            },
+            this, 0, nullptr
+        );
+
+        if (reportThread_) {
+            LogMessage("[MemoryTracker] 非阻塞报告线程启动成功");
+        }
+    }
+
+    void StopPeriodicReporting() {
+        shouldStop_.store(true);
+        if (reportThread_) {
+            WaitForSingleObject(reportThread_, 2000);
+            CloseHandle(reportThread_);
+            reportThread_ = nullptr;
+        }
+    }
+
+    void RecordAlloc(size_t size, const char* name) {
+        if (!g_fastMode) {
+            allocCount_.fetch_add(1, std::memory_order_relaxed);
+            totalAllocated_.fetch_add(size, std::memory_order_relaxed);
+        }
+        // 在快速模式下什么都不做
+    }
+
+    void RecordFree(size_t size, const char* name) {
+        if (!g_fastMode) {
+            freeCount_.fetch_add(1, std::memory_order_relaxed);
+            totalFreed_.fetch_add(size, std::memory_order_relaxed);
+        }
+    }
+
+private:
+    DWORD ReportThreadProc() {
+        LogMessage("[MemoryTracker] 报告线程开始运行");
+
+        while (!shouldStop_.load()) {
+            // 等待30秒或直到收到停止信号
+            if (WaitForSingleObject(GetCurrentThread(), 30000) == WAIT_OBJECT_0) {
+                break;
+            }
+
+            if (shouldStop_.load()) {
+                break;
+            }
+
+            // 生成轻量级报告
+            GenerateLightweightReport();
+        }
+
+        LogMessage("[MemoryTracker] 报告线程结束");
+        return 0;
+    }
+
+    void GenerateLightweightReport() {
+        __try {
+            DWORD currentTime = GetTickCount();
+
+            // 只生成基本统计，不写文件
+            size_t allocs = allocCount_.load();
+            size_t frees = freeCount_.load();
+            size_t allocated = totalAllocated_.load();
+            size_t freed = totalFreed_.load();
+
+            LogMessage("[MemoryTracker] 轻量级报告: 分配=%zu次, 释放=%zu次, 净使用=%zuMB",
+                allocs, frees, (allocated - freed) / (1024 * 1024));
+
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // 静默处理异常
+        }
+    }
+};
 
 // Helper function to open log file
 bool OpenLogFile(const char* filename = "MemoryTracker.log") {

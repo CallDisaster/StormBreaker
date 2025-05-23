@@ -84,9 +84,7 @@ namespace StormCompatible {
         ~SimulatedStormHeap();
 
         // 检查指针是否在堆范围内
-        bool ContainsPointer(void* ptr) const {
-            return ptr >= memoryStart && ptr < memoryEnd;
-        }
+        bool ContainsPointer(void* ptr) const;
 
         // 获取空闲链表索引
         int GetFreeListIndex(size_t size) const {
@@ -108,13 +106,13 @@ namespace StormCompatible {
         std::mutex heapTableMutex_;
         std::atomic<bool> initialized_{ false };
 
+    public:
         // 统计信息
         std::atomic<size_t> totalAllocated_{ 0 };
         std::atomic<size_t> totalFreed_{ 0 };
         std::atomic<size_t> allocCount_{ 0 };
         std::atomic<size_t> freeCount_{ 0 };
 
-    public:
         bool EnsureCommitted(SimulatedStormHeap* heap, size_t sizeNeeded);
         StormCompatibleAllocator();
         ~StormCompatibleAllocator();
@@ -126,13 +124,20 @@ namespace StormCompatible {
         bool Initialize();
         void Shutdown();
 
+
         // Storm兼容的分配接口
         void* AllocateCompatible(size_t size, const char* name, DWORD srcLine, DWORD flags);
+
         bool FreeCompatible(void* userPtr);
         void* ReallocateCompatible(void* oldPtr, size_t newSize, const char* name, DWORD srcLine, DWORD flags);
 
         // 检查指针是否由我们管理
         bool IsOurPointer(void* ptr);
+
+        // 内存操作
+        void* AllocateFromHeap(SimulatedStormHeap* heap, size_t size, DWORD flags);
+        bool FreeToHeap(SimulatedStormHeap* heap, StormBlockHeader* header);
+        bool ValidateBlockHeader(const StormBlockHeader* header);
 
         // 统计信息
         void GetStatistics(size_t& allocated, size_t& freed, size_t& allocCount, size_t& freeCount) const;
@@ -142,9 +147,7 @@ namespace StormCompatible {
         SimulatedStormHeap* GetOrCreateHeap(BYTE heapIndex, const char* name);
         BYTE ComputeHeapIndex(const char* name, DWORD srcLine);
 
-        // 内存操作
-        void* AllocateFromHeap(SimulatedStormHeap* heap, size_t size, DWORD flags);
-        bool FreeToHeap(SimulatedStormHeap* heap, StormBlockHeader* header);
+
 
         // 空闲链表管理
         StormFreeBlock* FindFreeBlock(SimulatedStormHeap* heap, size_t requiredSize);
@@ -153,11 +156,18 @@ namespace StormCompatible {
 
         // 块操作
         void SetupBlockHeader(StormBlockHeader* header, SimulatedStormHeap* heap, size_t userSize, DWORD flags);
-        bool ValidateBlockHeader(const StormBlockHeader* header);
+
         void CoalesceBlocks(SimulatedStormHeap* heap, StormFreeBlock* block);
 
         // 哈希计算（模拟Storm_502函数）
         uint32_t ComputeStormHash(const char* name, bool caseSensitive, DWORD seed);
+
+        void ValidateStatistics();
+
+        static bool IsOurPointer_SEH(
+            StormCompatibleAllocator* self, void* ptr);
+        static bool FreeCompatible_SEH(StormCompatibleAllocator* self, void* userPtr, size_t* pFreedSize);
+        static void* AllocateCompatible_SEH(StormCompatibleAllocator* self, size_t size, BYTE heapIndex, SimulatedStormHeap* heap, DWORD flags);
     };
 
 } // namespace StormCompatible

@@ -186,6 +186,33 @@ private:
     std::vector<std::string> GetReportFiles(const std::string& directory);
 };
 
+class LightweightMemoryTracker {
+private:
+    std::atomic<size_t> totalAllocs{ 0 };
+    std::atomic<size_t> totalFrees{ 0 };
+    std::atomic<size_t> currentBytes{ 0 };
+
+public:
+    void RecordAlloc(size_t size, const char* name) {
+        totalAllocs.fetch_add(1, std::memory_order_relaxed);
+        currentBytes.fetch_add(size, std::memory_order_relaxed);
+        // 不记录名称和详细信息，只维护基本统计
+    }
+
+    void RecordFree(size_t size, const char* name) {
+        totalFrees.fetch_add(1, std::memory_order_relaxed);
+        if (size > 0) {
+            currentBytes.fetch_sub(size, std::memory_order_relaxed);
+        }
+    }
+
+    void GetStats(size_t& allocs, size_t& frees, size_t& bytes) {
+        allocs = totalAllocs.load();
+        frees = totalFrees.load();
+        bytes = currentBytes.load();
+    }
+};
+
 // Interface functions for logging
 void LogMessage(const char* format, ...);
 
@@ -194,6 +221,9 @@ extern std::atomic<LogLevel> g_currentLogLevel;
 
 // 全局内存追踪器实例
 extern MemoryTracker g_memoryTracker;
+
+// 减少文件操作
+extern bool g_fastMode;
 
 // Logging macro
 #define LOG_MESSAGE(level, format, ...) \

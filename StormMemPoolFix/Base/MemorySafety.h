@@ -7,41 +7,100 @@
 #include <unordered_map>
 #include <string>
 #include <cstdint>
+#include <Log/LogSystem.h>
+#include <Storm/StormHook.h>
 
 // 安全临界区（避免RAII模式）
 class SafeCriticalSection {
 private:
-    CRITICAL_SECTION m_cs;
-    bool m_isLocked;
-
+    CRITICAL_SECTION* cs_;
+    bool entered_;
 public:
-#pragma warning(push)
-#pragma warning(disable: 26135) // 禁用RAII相关警告
-
-    SafeCriticalSection() noexcept {
-        InitializeCriticalSection(&m_cs);
-        m_isLocked = false;
+    SafeCriticalSection(CRITICAL_SECTION* cs) noexcept : cs_(cs), entered_(false) {
+        if (cs_) {
+            __try {
+                EnterCriticalSection(cs_);
+                entered_ = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                entered_ = false;
+                LogMessage("[SafeCS] 进入临界区异常: 0x%08X", GetExceptionCode());
+            }
+        }
     }
-
     ~SafeCriticalSection() noexcept {
-        if (m_isLocked) {
-            LeaveCriticalSection(&m_cs);
-        }
-        DeleteCriticalSection(&m_cs);
-    }
-
-    void Enter() noexcept {
-        EnterCriticalSection(&m_cs);
-        m_isLocked = true;
-    }
-
-    void Leave() noexcept {
-        if (m_isLocked) {
-            LeaveCriticalSection(&m_cs);
-            m_isLocked = false;
+        if (entered_ && cs_) {
+            __try {
+                LeaveCriticalSection(cs_);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                LogMessage("[SafeCS] 离开临界区异常: 0x%08X", GetExceptionCode());
+            }
         }
     }
-#pragma warning(pop)
+    bool IsEntered() const noexcept { return entered_; }
+};
+
+class SafeMemoryOperations {
+public:
+    static void* SafeVirtualAlloc(void* lpAddress, size_t dwSize, DWORD flAllocationType, DWORD flProtect) {
+        __try {
+            return VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogMessage("[SafeMem] VirtualAlloc异常: addr=%p, size=%zu, 异常代码: 0x%08X",
+                lpAddress, dwSize, GetExceptionCode());
+            return nullptr;
+        }
+    }
+
+    static BOOL SafeVirtualFree(void* lpAddress, size_t dwSize, DWORD dwFreeType) {
+        __try {
+            return VirtualFree(lpAddress, dwSize, dwFreeType);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogMessage("[SafeMem] VirtualFree异常: addr=%p, size=%zu, 异常代码: 0x%08X",
+                lpAddress, dwSize, GetExceptionCode());
+            return FALSE;
+        }
+    }
+
+    static void* SafeMemcpy(void* dest, const void* src, size_t count) {
+        if (!dest || !src || count == 0) return dest;
+
+        __try {
+            if (SafeIsBadWritePtr(dest, count) || SafeIsBadReadPtr(src, count)) {
+                LogMessage("[SafeMem] Memcpy参数验证失败: dest=%p, src=%p, count=%zu",
+                    dest, src, count);
+                return dest;
+            }
+
+            return memcpy(dest, src, count);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogMessage("[SafeMem] Memcpy异常: dest=%p, src=%p, count=%zu, 异常代码: 0x%08X",
+                dest, src, count, GetExceptionCode());
+            return dest;
+        }
+    }
+
+    static void* SafeMemset(void* dest, int value, size_t count) {
+        if (!dest || count == 0) return dest;
+
+        __try {
+            if (SafeIsBadWritePtr(dest, count)) {
+                LogMessage("[SafeMem] Memset参数验证失败: dest=%p, count=%zu", dest, count);
+                return dest;
+            }
+
+            return memset(dest, value, count);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogMessage("[SafeMem] Memset异常: dest=%p, value=%d, count=%zu, 异常代码: 0x%08X",
+                dest, value, count, GetExceptionCode());
+            return dest;
+        }
+    }
 };
 
 // 内存块跟踪信息

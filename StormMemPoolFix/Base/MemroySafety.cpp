@@ -312,36 +312,32 @@ bool MemorySafety::SafeMemoryCopy(void* dest, const void* src, size_t size) noex
     if (!dest || !src || size == 0) return false;
 
     __try {
-        // 验证源和目标内存
-        if (!ValidatePointerRange(const_cast<void*>(src), size) ||
-            !ValidatePointerRange(dest, size)) {
-            return false;
-        }
+        // 分批复制，减少一次性访问大量内存的风险
+        const size_t chunkSize = 64;
+        char* d = static_cast<char*>(dest);
+        const char* s = static_cast<const char*>(src);
 
-        // 分块复制，降低崩溃风险
-        const size_t CHUNK_SIZE = 4096;
-        const char* srcPtr = static_cast<const char*>(src);
-        char* destPtr = static_cast<char*>(dest);
-
-        for (size_t offset = 0; offset < size; offset += CHUNK_SIZE) {
-            size_t bytesToCopy = (offset + CHUNK_SIZE > size) ? (size - offset) : CHUNK_SIZE;
+        while (size > 0) {
+            size_t currentChunk = (size < chunkSize) ? size : chunkSize;
 
             __try {
-                memcpy(destPtr + offset, srcPtr + offset, bytesToCopy);
+                memcpy(d, s, currentChunk);
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                LogMessageImpl("[MemorySafety] 内存复制异常: offset=%zu, 错误=0x%x",
-                    offset, GetExceptionCode());
-                return false;
+                // 这个块复制失败，跳过
+                break;
             }
-        }
 
-        return true;
+            d += currentChunk;
+            s += currentChunk;
+            size -= currentChunk;
+        }
+		return true;
+
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogMessageImpl("[MemorySafety] 内存复制总异常: dest=%p, src=%p, size=%zu, 错误=0x%x",
-            dest, src, size, GetExceptionCode());
-        return false;
+        // 完全失败，不复制任何数据
+		return false;
     }
 }
 
@@ -710,3 +706,119 @@ void MemorySafety::ValidateAllBlocks() noexcept {
         LogMessageImpl("[MemorySafety] 全块验证异常: 错误=0x%x", GetExceptionCode());
     }
 }
+
+bool ValidateStormModule() {
+    __try {
+        if (!gStormDllBase) {
+            return false;
+        }
+
+        // 验证DOS头
+        IMAGE_DOS_HEADER* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(gStormDllBase);
+        if (SafeIsBadReadPtr(dosHeader, sizeof(IMAGE_DOS_HEADER))) {
+            return false;
+        }
+
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+            return false;
+        }
+
+        // 验证PE头
+        IMAGE_NT_HEADERS* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS*>(
+            gStormDllBase + dosHeader->e_lfanew);
+        if (SafeIsBadReadPtr(ntHeaders, sizeof(IMAGE_NT_HEADERS))) {
+            return false;
+        }
+
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+            return false;
+        }
+
+        // 验证一些关键偏移
+        if (OFFSET_g_MemorySystemInitialized >= ntHeaders->OptionalHeader.SizeOfImage) {
+            return false;
+        }
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogMessage("[Validate] Storm模块验证异常: 0x%08X", GetExceptionCode());
+        return false;
+    }
+}
+
+// 6. 线程安全的初始化检查
+class InitializationGuard {
+private:
+    static std::atomic<int> initState_;  // 0=未初始化, 1=初始化中, 2=已完成
+    static std::mutex initMutex_;
+
+public:
+    enum class InitState {
+        NotInitialized = 0,
+        Initializing = 1,
+        Completed = 2
+    };
+
+    static InitState GetState() {
+        return static_cast<InitState>(initState_.load());
+    }
+
+    static bool TryBeginInit() {
+        int expected = 0;
+        return initState_.compare_exchange_strong(expected, 1);
+    }
+
+    static void CompleteInit() {
+        initState_.store(2);
+    }
+
+    static void ResetInit() {
+        initState_.store(0);
+    }
+
+    static bool WaitForInit(DWORD timeoutMs = 5000) {
+        DWORD startTime = GetTickCount();
+        while (GetState() == InitState::Initializing) {
+            if (GetTickCount() - startTime > timeoutMs) {
+                return false;
+            }
+            Sleep(10);
+        }
+        return GetState() == InitState::Completed;
+    }
+};
+
+std::atomic<int> InitializationGuard::initState_{ 0 };
+std::mutex InitializationGuard::initMutex_;
+
+class ExceptionHandler {
+public:
+    static void SetUnhandledExceptionFilter() {
+        ::SetUnhandledExceptionFilter(UnhandledExceptionFilter);
+    }
+
+private:
+    static LONG WINAPI UnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionInfo) {
+        __try {
+            LogMessage("[Exception] 未处理异常: 0x%08X, 地址: 0x%08X",
+                exceptionInfo->ExceptionRecord->ExceptionCode,
+                reinterpret_cast<DWORD>(exceptionInfo->ExceptionRecord->ExceptionAddress));
+
+            // 如果是我们的模块范围内的异常，尝试恢复
+            DWORD exceptionAddr = reinterpret_cast<DWORD>(exceptionInfo->ExceptionRecord->ExceptionAddress);
+            if (gStormDllBase && exceptionAddr >= gStormDllBase && exceptionAddr < gStormDllBase + 0x100000) {
+                LogMessage("[Exception] 异常发生在Storm.dll范围内，可能是Hook相关");
+            }
+
+            // 生成紧急报告
+            g_memoryTracker.GenerateReport("EmergencyReport.log");
+
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // 连异常处理都失败了，直接退出
+        }
+
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+};
