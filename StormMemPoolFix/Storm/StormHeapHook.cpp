@@ -33,11 +33,29 @@ enum class BlockState {
     Invalid      // 无效状态
 };
 
-struct BlockStateInfo {
-    BlockState state;
-    size_t size;
-    DWORD timestamp;
-    std::string operation;  // 记录操作类型
+struct BlockStateInfoEx {
+    std::atomic<BlockState> state{ BlockState::Normal };
+    std::atomic<size_t> size{ 0 };
+    std::atomic<DWORD> timestamp{ 0 };
+    std::atomic<uint32_t> version{ 0 };  // 版本号，用于CAS操作
+    char operation[64];  // 固定大小避免动态分配
+    std::mutex opMutex;  // 保护operation字段
+
+    BlockStateInfoEx() {
+        operation[0] = '\0';
+    }
+
+    // 设置操作描述（线程安全）
+    void SetOperation(const char* op) {
+        std::lock_guard<std::mutex> lock(opMutex);
+        strncpy_s(operation, op, _countof(operation) - 1);
+    }
+
+    // 获取操作描述（线程安全）
+    std::string GetOperation() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(opMutex));
+        return std::string(operation);
+    }
 };
 
 // ============== 全局数据 ==============
@@ -52,8 +70,6 @@ static size_t g_peakMemoryUsed = 0;
 static std::unordered_map<void*, size_t> g_ResetBlocks;
 static std::mutex g_ResetLock;  // 改名对应的锁
 
-static std::unordered_map<void*, BlockStateInfo> g_BlockStates;
-static std::shared_mutex g_BlockStatesLock;  // 读写分离锁
 
 // StormOffsets 里定义的全局:
 extern uintptr_t gStormDllBase;
@@ -63,6 +79,258 @@ inline size_t StormFix_GetCurrentUsage()
         return Storm_g_TotalAllocatedMemory;
     return 0;
 }
+
+class BlockReferenceCounter {
+private:
+    struct RefCountInfo {
+        std::atomic<int> refCount{ 0 };
+        size_t blockSize{ 0 };
+        DWORD lastAccessTime{ 0 };
+        bool isHotBlock{ false };  // 热点块标记
+    };
+
+    mutable std::shared_mutex m_mutex;
+    std::unordered_map<void*, RefCountInfo> m_refCounts;
+
+    // 配置参数
+    static constexpr size_t MIN_RESET_SIZE = 1024 * 1024;      // 1MB - 只对大块使用RESET
+    static constexpr size_t MIN_DECOMMIT_SIZE = 16 * 1024 * 1024; // 16MB - 更大的块才考虑DECOMMIT
+    static constexpr DWORD HOT_BLOCK_THRESHOLD = 5000;         // 5秒内访问过的认为是热块
+
+public:
+    // 增加引用
+    void AddRef(void* block) {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        auto& info = m_refCounts[block];
+        info.refCount++;
+        info.lastAccessTime = GetTickCount();
+    }
+
+    // 减少引用
+    int Release(void* block) {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        auto it = m_refCounts.find(block);
+        if (it != m_refCounts.end()) {
+            int newCount = --it->second.refCount;
+            if (newCount <= 0) {
+                m_refCounts.erase(it);
+                return 0;
+            }
+            return newCount;
+        }
+        return 0;
+    }
+
+    // 获取引用计数
+    int GetRefCount(void* block) const {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        auto it = m_refCounts.find(block);
+        return (it != m_refCounts.end()) ? it->second.refCount.load() : 0;
+    }
+
+    // 设置块信息
+    void SetBlockInfo(void* block, size_t size) {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        auto& info = m_refCounts[block];
+        info.blockSize = size;
+        info.lastAccessTime = GetTickCount();
+    }
+
+    // 检查是否是热点块
+    bool IsHotBlock(void* block) const {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        auto it = m_refCounts.find(block);
+        if (it != m_refCounts.end()) {
+            DWORD currentTime = GetTickCount();
+            return (currentTime - it->second.lastAccessTime) < HOT_BLOCK_THRESHOLD;
+        }
+        return false;
+    }
+
+    // 获取内存优化策略
+    enum class OptimizationStrategy {
+        None,       // 不优化
+        Reset,      // 使用MEM_RESET
+        Decommit    // 使用MEM_DECOMMIT（极少使用）
+    };
+
+    OptimizationStrategy GetOptimizationStrategy(void* block, size_t blockSize) {
+        // 检查引用计数
+        if (GetRefCount(block) > 0) {
+            return OptimizationStrategy::None;
+        }
+
+        // 检查是否是热点块
+        if (IsHotBlock(block)) {
+            return OptimizationStrategy::None;
+        }
+
+        // 根据大小决定策略
+        if (blockSize >= MIN_DECOMMIT_SIZE) {
+            // 超大块且长时间未使用，可以考虑DECOMMIT
+            std::shared_lock<std::shared_mutex> lock(m_mutex);
+            auto it = m_refCounts.find(block);
+            if (it != m_refCounts.end()) {
+                DWORD idleTime = GetTickCount() - it->second.lastAccessTime;
+                if (idleTime > 60000) {  // 1分钟未使用
+                    return OptimizationStrategy::Decommit;
+                }
+            }
+        }
+
+        if (blockSize >= MIN_RESET_SIZE) {
+            return OptimizationStrategy::Reset;
+        }
+
+        return OptimizationStrategy::None;
+    }
+};
+
+// 全局引用计数器
+static BlockReferenceCounter g_blockRefCounter;
+
+class AtomicBlockStateManager {
+private:
+    mutable std::shared_mutex m_mapMutex;
+    std::unordered_map<void*, std::unique_ptr<BlockStateInfoEx>> m_states;
+
+public:
+    // 原子性状态转换
+    bool TransitionState(void* ptr, BlockState expectedState, BlockState newState,
+        size_t size, const char* operation) {
+        std::unique_lock<std::shared_mutex> lock(m_mapMutex);
+
+        // 获取或创建状态信息
+        auto& stateInfo = m_states[ptr];
+        if (!stateInfo) {
+            stateInfo = std::make_unique<BlockStateInfoEx>();
+        }
+
+        // 尝试原子性状态转换
+        BlockState currentState = stateInfo->state.load(std::memory_order_acquire);
+        if (currentState != expectedState) {
+            LogMessage("[StateTransition] 状态不匹配: ptr=%p, 期望=%d, 实际=%d",
+                ptr, expectedState, currentState);
+            return false;
+        }
+
+        // 执行状态转换
+        uint32_t oldVersion = stateInfo->version.load(std::memory_order_relaxed);
+
+        stateInfo->state.store(newState, std::memory_order_release);
+        stateInfo->size.store(size, std::memory_order_relaxed);
+        stateInfo->timestamp.store(GetTickCount(), std::memory_order_relaxed);
+        stateInfo->SetOperation(operation);
+        stateInfo->version.store(oldVersion + 1, std::memory_order_release);
+
+        LogMessage("[StateTransition] 成功: ptr=%p, %d -> %d, 版本=%u, 操作=%s",
+            ptr, expectedState, newState, oldVersion + 1, operation);
+
+        return true;
+    }
+
+    // 获取当前状态（带版本号）
+    struct StateSnapshot {
+        BlockState state;
+        size_t size;
+        DWORD timestamp;
+        uint32_t version;
+        std::string operation;
+        bool valid;
+    };
+
+    StateSnapshot GetState(void* ptr) const {
+        std::shared_lock<std::shared_mutex> lock(m_mapMutex);
+
+        auto it = m_states.find(ptr);
+        if (it == m_states.end() || !it->second) {
+            return { BlockState::Normal, 0, 0, 0, "", false };
+        }
+
+        const auto& info = *it->second;
+
+        // 原子性读取所有字段
+        uint32_t version1 = info.version.load(std::memory_order_acquire);
+        StateSnapshot snapshot;
+        snapshot.state = info.state.load(std::memory_order_relaxed);
+        snapshot.size = info.size.load(std::memory_order_relaxed);
+        snapshot.timestamp = info.timestamp.load(std::memory_order_relaxed);
+        snapshot.operation = info.GetOperation();
+        uint32_t version2 = info.version.load(std::memory_order_acquire);
+
+        // 确保读取期间没有发生修改
+        snapshot.valid = (version1 == version2);
+        snapshot.version = version1;
+
+        return snapshot;
+    }
+
+    // 条件更新（CAS操作）
+    bool ConditionalUpdate(void* ptr, uint32_t expectedVersion, BlockState newState,
+        size_t size, const char* operation) {
+        std::unique_lock<std::shared_mutex> lock(m_mapMutex);
+
+        auto it = m_states.find(ptr);
+        if (it == m_states.end() || !it->second) {
+            return false;
+        }
+
+        auto& info = *it->second;
+        uint32_t currentVersion = info.version.load(std::memory_order_acquire);
+
+        if (currentVersion != expectedVersion) {
+            return false;  // 版本不匹配，其他线程已修改
+        }
+
+        // 执行更新
+        info.state.store(newState, std::memory_order_release);
+        info.size.store(size, std::memory_order_relaxed);
+        info.timestamp.store(GetTickCount(), std::memory_order_relaxed);
+        info.SetOperation(operation);
+        info.version.store(currentVersion + 1, std::memory_order_release);
+
+        return true;
+    }
+
+    // 清理过期状态
+    void CleanupExpiredStates(DWORD expirationMs = 300000) {  // 默认5分钟
+        std::unique_lock<std::shared_mutex> lock(m_mapMutex);
+
+        DWORD currentTime = GetTickCount();
+        auto it = m_states.begin();
+
+        while (it != m_states.end()) {
+            if (it->second) {
+                DWORD timestamp = it->second->timestamp.load(std::memory_order_relaxed);
+                if (currentTime - timestamp > expirationMs) {
+                    it = m_states.erase(it);
+                    continue;
+                }
+            }
+            ++it;
+        }
+    }
+
+    // 获取统计信息
+    void GetStatistics(size_t& totalBlocks, size_t& resetBlocks, size_t& decommittedBlocks) const {
+        std::shared_lock<std::shared_mutex> lock(m_mapMutex);
+
+        totalBlocks = m_states.size();
+        resetBlocks = 0;
+        decommittedBlocks = 0;
+
+        for (const auto& pair : m_states) {
+            if (pair.second) {
+                BlockState state = pair.second->state.load(std::memory_order_relaxed);
+                if (state == BlockState::Reset) resetBlocks++;
+                else if (state == BlockState::Decommitted) decommittedBlocks++;
+            }
+        }
+    }
+};
+
+// 全局状态管理器
+static AtomicBlockStateManager g_atomicStateManager;
 
 // ============== StormFreeList / 触发合并等 ==============
 #define FREE_LIST_SLOT_BASE 17
@@ -98,41 +366,30 @@ static sub_1502B680_t               s_origSub_1502B680 = nullptr;
 static sub_1502B4F0_t               s_origSub_1502B4F0 = nullptr;
 static sub_15035850_t               s_origSub_15035850 = nullptr;
 
-// ============== 小工具: 判断空闲还是已分配, 获取块总大小 ==============
-/**
- * 判断 `pBlock` 是否是“已 free”状态 (Flags=2)
- * 如果空闲:
- *    -> interpret as StormFreeBlock
- *    -> *size 即包含了头部 + 用户区 + alignment + boundary
- * 如果已分配:
- *    -> interpret as StormAllocHeader
- *    -> block大小 = hdr->Size + sizeof(StormAllocHeader) + hdr->AlignPadding (+ boundary?若Flag=1再+2)
- */
-
- // 安全的状态查询函数
-BlockState GetBlockState(void* ptr) {
-    std::shared_lock<std::shared_mutex> lock(g_BlockStatesLock);
-    auto it = g_BlockStates.find(ptr);
-    return (it != g_BlockStates.end()) ? it->second.state : BlockState::Normal;
+ // 安全的状态查询
+BlockState SafeGetBlockState(void* ptr) {
+    auto snapshot = g_atomicStateManager.GetState(ptr);
+    return snapshot.valid ? snapshot.state : BlockState::Normal;
 }
 
+// 安全的状态设置（保持兼容性）
+void SetBlockState(void* ptr, BlockState state, size_t size, const std::string& operation) {
+    // 尝试从任意状态转换到新状态
+    auto currentSnapshot = g_atomicStateManager.GetState(ptr);
+    if (currentSnapshot.valid) {
+        g_atomicStateManager.TransitionState(ptr, currentSnapshot.state, state, size, operation.c_str());
+    }
+    else {
+        // 如果不存在，从Normal状态开始
+        g_atomicStateManager.TransitionState(ptr, BlockState::Normal, state, size, operation.c_str());
+    }
+}
 
 static bool StormBlockIsFree(const void* pBlock)
 {
     const StormFreeBlock* fb = reinterpret_cast<const StormFreeBlock*>(pBlock);
     return (fb->Flags & 0x2) != 0; // 2 => free
 }
-
-void SetBlockState(void* ptr, BlockState state, size_t size, const std::string& operation) {
-    std::unique_lock<std::shared_mutex> lock(g_BlockStatesLock);
-    g_BlockStates[ptr] = { state, size, GetTickCount(), operation };
-
-    LogMessage("[BlockState] %s: ptr=%p, size=%zu, op=%s",
-        state == BlockState::Reset ? "RESET" :
-        state == BlockState::Decommitted ? "DECOMMIT" : "NORMAL",
-        ptr, size, operation.c_str());
-}
-
 
 static size_t StormBlockGetTotalSize(const void* pBlock)
 {
@@ -183,56 +440,92 @@ static void CheckAndTriggerHeapCompact(char* heapBase)
     }
 }
 
-// ============== Hook: StormHeap_AllocPage ==============
+// 原始函数安全调用
+inline unsigned __int16* SafeStormHeap_AllocPage(char* heapBase, unsigned int requestedSize, LPVOID lpAddress) {
+    unsigned __int16* pResult = nullptr;
+    __try {
+        pResult = s_origStormHeap_AllocPage(heapBase, requestedSize, lpAddress);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        pResult = nullptr;
+    }
+    return pResult;
+}
+
+// 安全 VirtualAlloc
+inline LPVOID SafeVirtualAlloc(LPVOID addr, size_t size) {
+    LPVOID re = nullptr;
+    __try {
+        re = VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        re = nullptr;
+    }
+    return re;
+}
+
+
 unsigned __int16* __fastcall StormHeap_AllocPageHook(char* heapBase, unsigned int requestedSize, LPVOID lpAddress) {
+    // 参数验证
+    if (!SafeValidatePointer(heapBase, sizeof(DWORD) * 32)) {
+        LogMessage("[AllocPage] 无效的堆基址: %p", heapBase);
+        return nullptr;
+    }
+
     CheckAndTriggerHeapCompact(heapBase);
 
-    // 调用原函数
-    unsigned __int16* pResult = s_origStormHeap_AllocPage(heapBase, requestedSize, lpAddress);
+    // 【危险区1：原函数调用】（只允许C指针）
+    unsigned __int16* pResult = SafeStormHeap_AllocPage(heapBase, requestedSize, lpAddress);
     if (!pResult) {
         LogMessage("[AllocPage] 分配失败: 大小=%u", requestedSize);
         return nullptr;
     }
 
-    // 检查是否需要恢复之前优化的内存
-    char* blockBase = (char*)pResult - sizeof(StormAllocHeader);
-
-    // 查询块状态
-    BlockState state = GetBlockState(blockBase);
-
-    if (state == BlockState::Reset) {
-        // MEM_RESET的内存被重新使用，更新状态
-        LogMessage("[AllocPage] MEM_RESET块被重用: %p", blockBase);
-        SetBlockState(blockBase, BlockState::Normal, 0, "AllocPage_Reuse");
+    // 【危险区2：计算块基址】（也无C++对象）
+    if (!SafeValidatePointer(pResult, requestedSize)) {
+        LogMessage("[AllocPage] 返回的指针无效: %p", pResult);
+        return nullptr;
     }
-    else if (state == BlockState::Decommitted) {
-        // 需要重新提交DECOMMIT的内存
-        std::shared_lock<std::shared_mutex> lock(g_BlockStatesLock);
-        auto it = g_BlockStates.find(blockBase);
-        if (it != g_BlockStates.end()) {
-            size_t blockSize = it->second.size;
-            lock.unlock();  // 释放读锁
+    char* blockBase = (char*)pResult - sizeof(StormAllocHeader);
+    if (!SafeValidatePointer(blockBase, sizeof(StormAllocHeader))) {
+        LogMessage("[AllocPage] 计算的块基址无效: %p", blockBase);
+        return pResult;
+    }
 
-            LogMessage("[AllocPage] 重新提交DECOMMIT块: %p, 大小: %zu", blockBase, blockSize);
+    // 【安全区：所有C++对象和状态查询、日志等】
+    auto stateSnapshot = g_atomicStateManager.GetState(blockBase);
 
-            LPVOID re = VirtualAlloc(blockBase, blockSize, MEM_COMMIT, PAGE_READWRITE);
-            if (re) {
-                SetBlockState(blockBase, BlockState::Normal, 0, "AllocPage_Recommit");
+    if (stateSnapshot.valid && stateSnapshot.state == BlockState::Reset) {
+        if (g_atomicStateManager.TransitionState(blockBase, BlockState::Reset, BlockState::Normal, 0, "AllocPage_Reuse")) {
+            LogMessage("[AllocPage] MEM_RESET块被重用: %p", blockBase);
+        }
+        else {
+            LogMessage("[AllocPage] 状态转换失败（并发修改）: %p", blockBase);
+        }
+    }
+    else if (stateSnapshot.valid && stateSnapshot.state == BlockState::Decommitted) {
+        LogMessage("[AllocPage] 重新提交DECOMMIT块: %p, 大小: %zu", blockBase, stateSnapshot.size);
+
+        // 【危险区3：VirtualAlloc】（无C++对象）
+        LPVOID re = SafeVirtualAlloc(blockBase, stateSnapshot.size);
+        if (re) {
+            if (g_atomicStateManager.ConditionalUpdate(blockBase, stateSnapshot.version, BlockState::Normal, 0, "AllocPage_Recommit")) {
                 LogMessage("[AllocPage] 重新提交成功: %p", blockBase);
             }
             else {
-                DWORD error = GetLastError();
-                LogMessage("[AllocPage] 重新提交失败: ptr=%p, size=%zu, 错误=%d",
-                    blockBase, blockSize, error);
-
-                // 提交失败，返回NULL让Storm处理
-                return nullptr;
+                LogMessage("[AllocPage] 状态更新失败（版本不匹配）: %p", blockBase);
             }
+        }
+        else {
+            DWORD error = GetLastError();
+            LogMessage("[AllocPage] 重新提交失败: ptr=%p, size=%zu, 错误=%d", blockBase, stateSnapshot.size, error);
+            return nullptr;
         }
     }
 
     return pResult;
 }
+
 
 // ============== Hook: StormHeap_InternalFree ==============
 char __fastcall StormHeap_InternalFreeHook(DWORD* heap, unsigned __int16* blockHeader) {
@@ -296,51 +589,63 @@ char __fastcall StormHeap_InternalFreeHook(DWORD* heap, unsigned __int16* blockH
             // 检查页对齐和大小要求
             bool isPageAligned = (addr % pageSize) == 0;
             bool isSizeAligned = (blockSize % pageSize) == 0;
-            bool isLargeEnough = blockSize >= (pageSize * 4);  // 至少4页才考虑优化
 
-            if (isPageAligned && isSizeAligned && isLargeEnough) {
-                // 修复: 使用MEM_RESET而不是MEM_DECOMMIT
-                // MEM_RESET保持虚拟地址映射，只是告诉系统可以丢弃物理内存
-                LogMessage("[InternalFree] 使用MEM_RESET优化大块: %p, 大小: %zu",
-                    blockHeader, blockSize);
+            if (isPageAligned && isSizeAligned) {
+                // 获取优化策略
+                auto strategy = g_blockRefCounter.GetOptimizationStrategy(blockHeader, blockSize);
 
-                BOOL bOK = VirtualFree(blockHeader, blockSize, MEM_RESET);
-                if (bOK) {
-                    SetBlockState(blockHeader, BlockState::Reset, blockSize, "InternalFree");
+                switch (strategy) {
+                case BlockReferenceCounter::OptimizationStrategy::Reset: {
+                    LogMessage("[InternalFree] 使用MEM_RESET优化大块: %p, 大小: %zu KB",
+                        blockHeader, blockSize / 1024);
 
-                    // 统计优化的内存
-                    static std::atomic<size_t> s_totalReset{ 0 };
-                    s_totalReset += blockSize;
-
-                    if (s_totalReset.load() % (16 * 1024 * 1024) == 0) {  // 每16MB记录一次
-                        LogMessage("[优化] 累计MEM_RESET: %zu MB",
-                            s_totalReset.load() / (1024 * 1024));
-                    }
-                }
-                else {
-                    DWORD error = GetLastError();
-                    LogMessage("[InternalFree] MEM_RESET失败: ptr=%p, size=%zu, 错误=%d",
-                        blockHeader, blockSize, error);
-
-                    // MEM_RESET失败，尝试保守的方法
-                    if (blockSize >= (pageSize * 16)) {  // 只对非常大的块使用DECOMMIT
-                        LogMessage("[InternalFree] 尝试保守DECOMMIT: %p", blockHeader);
-                        bOK = VirtualFree(blockHeader, blockSize, MEM_DECOMMIT);
+                    // 保护性检查：确保块确实是空闲的
+                    if (StormBlockIsFree(blockHeader)) {
+                        BOOL bOK = VirtualFree(blockHeader, blockSize, MEM_RESET);
                         if (bOK) {
-                            SetBlockState(blockHeader, BlockState::Decommitted, blockSize,
-                                "InternalFree_Fallback");
+                            SetBlockState(blockHeader, BlockState::Reset, blockSize, "InternalFree_Reset");
+
+                            // 统计
+                            static std::atomic<size_t> s_totalReset{ 0 };
+                            static std::atomic<size_t> s_resetCount{ 0 };
+                            s_totalReset += blockSize;
+                            s_resetCount++;
+
+                            if (s_resetCount.load() % 100 == 0) {  // 每100次记录一次
+                                LogMessage("[优化统计] MEM_RESET: 次数=%zu, 累计=%zu MB",
+                                    s_resetCount.load(), s_totalReset.load() / (1024 * 1024));
+                            }
+                        }
+                        else {
+                            DWORD error = GetLastError();
+                            LogMessage("[InternalFree] MEM_RESET失败: ptr=%p, size=%zu, 错误=%d",
+                                blockHeader, blockSize, error);
                         }
                     }
+                    break;
                 }
-            }
-            else {
-                // 不满足对齐要求，记录原因
-                //LogMessage("[InternalFree] 跳过内存优化: ptr=%p, size=%zu, "
-                //    "页对齐=%s, 大小对齐=%s, 足够大=%s",
-                //    blockHeader, blockSize,
-                //    isPageAligned ? "是" : "否",
-                //    isSizeAligned ? "是" : "否",
-                //    isLargeEnough ? "是" : "否");
+
+                case BlockReferenceCounter::OptimizationStrategy::Decommit: {
+                    LogMessage("[InternalFree] 使用MEM_DECOMMIT优化超大块: %p, 大小: %zu MB",
+                        blockHeader, blockSize / (1024 * 1024));
+
+                    BOOL bOK = VirtualFree(blockHeader, blockSize, MEM_DECOMMIT);
+                    if (bOK) {
+                        SetBlockState(blockHeader, BlockState::Decommitted, blockSize, "InternalFree_Decommit");
+                    }
+                    else {
+                        DWORD error = GetLastError();
+                        LogMessage("[InternalFree] MEM_DECOMMIT失败: ptr=%p, size=%zu, 错误=%d",
+                            blockHeader, blockSize, error);
+                    }
+                    break;
+                }
+
+                case BlockReferenceCounter::OptimizationStrategy::None:
+                default:
+                    // 不进行内存优化
+                    break;
+                }
             }
         }
     }
@@ -368,33 +673,38 @@ void* __fastcall StormHeap_AllocHook(DWORD* pHeap, int a2, int flags, size_t siz
 
     // 检查是否使用了优化过的内存
     char* blockBase = (char*)pUserPtr - sizeof(StormAllocHeader);
-    BlockState state = GetBlockState(blockBase);
+    g_blockRefCounter.SetBlockInfo(blockBase, size);
+    g_blockRefCounter.AddRef(blockBase);
 
-    if (state == BlockState::Reset) {
+    // 使用新系统查询状态
+    auto stateSnapshot = g_atomicStateManager.GetState(blockBase);
+
+    if (stateSnapshot.valid && stateSnapshot.state == BlockState::Reset) {
         LogMessage("[StormAlloc] 重用MEM_RESET块: %p, 大小: %zu", pUserPtr, size);
-        SetBlockState(blockBase, BlockState::Normal, 0, "StormAlloc_Reuse");
+        // 原子性状态切换（兼容并发）
+        g_atomicStateManager.TransitionState(blockBase, BlockState::Reset, BlockState::Normal, 0, "StormAlloc_Reuse");
     }
-    else if (state == BlockState::Decommitted) {
-        // 这种情况不应该发生，因为AllocPage应该已经处理了
+    else if (stateSnapshot.valid && stateSnapshot.state == BlockState::Decommitted) {
+        // 理论上AllocPage已处理此状态，此处是容错
         LogMessage("[StormAlloc] 警告: 使用了未恢复的DECOMMIT块: %p", pUserPtr);
 
-        std::shared_lock<std::shared_mutex> lock(g_BlockStatesLock);
-        auto it = g_BlockStates.find(blockBase);
-        if (it != g_BlockStates.end()) {
-            size_t blockSize = it->second.size;
-            lock.unlock();
-
-            // 尝试紧急恢复
-            LPVOID re = VirtualAlloc(blockBase, blockSize, MEM_COMMIT, PAGE_READWRITE);
-            if (re) {
-                SetBlockState(blockBase, BlockState::Normal, 0, "StormAlloc_Emergency");
+        // 再次尝试提交
+        LPVOID re = VirtualAlloc(blockBase, stateSnapshot.size, MEM_COMMIT, PAGE_READWRITE);
+        if (re) {
+            // 条件更新，要求版本号一致防止竞态
+            bool ok = g_atomicStateManager.ConditionalUpdate(
+                blockBase, stateSnapshot.version, BlockState::Normal, 0, "StormAlloc_Emergency");
+            if (ok) {
                 LogMessage("[StormAlloc] 紧急恢复成功: %p", blockBase);
             }
             else {
-                LogMessage("[StormAlloc] 紧急恢复失败: %p", blockBase);
-                // 返回NULL，让调用者处理失败
+                LogMessage("[StormAlloc] 紧急恢复失败（版本不匹配）: %p", blockBase);
                 return nullptr;
             }
+        }
+        else {
+            LogMessage("[StormAlloc] 紧急恢复失败: %p", blockBase);
+            return nullptr;
         }
     }
 
@@ -493,18 +803,22 @@ bool HookAllStormHeapFunctions()
 }
 
 void CleanupBlockStates() {
-    std::unique_lock<std::shared_mutex> lock(g_BlockStatesLock);
-
-    size_t resetCount = 0;
-    size_t decommitCount = 0;
-
-    for (const auto& entry : g_BlockStates) {
-        if (entry.second.state == BlockState::Reset) resetCount++;
-        else if (entry.second.state == BlockState::Decommitted) decommitCount++;
-    }
+    // 统计状态
+    size_t totalBlocks = 0, resetBlocks = 0, decommittedBlocks = 0;
+    g_atomicStateManager.GetStatistics(totalBlocks, resetBlocks, decommittedBlocks);
 
     LogMessage("[清理] 块状态统计: MEM_RESET=%zu, MEM_DECOMMIT=%zu, 总计=%zu",
-        resetCount, decommitCount, g_BlockStates.size());
+        resetBlocks, decommittedBlocks, totalBlocks);
 
-    g_BlockStates.clear();
+    // 清理所有过期块（这里可自定义过期时间，默认5分钟）
+    g_atomicStateManager.CleanupExpiredStates();
+}
+
+void CleanupMemoryOptimization() {
+    LogMessage("[清理] 清理内存优化状态...");
+
+    // 清理块状态
+    CleanupBlockStates();
+
+    // 这里不需要清理引用计数，因为它会随着对象析构自动清理
 }

@@ -18,6 +18,9 @@
 #include <concurrent_queue.h>    // 新增并发队列支持
 #include <condition_variable>    // 新增条件变量支持
 
+#include <future>
+#include <list>
+
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -66,13 +69,17 @@ std::atomic<size_t> g_peakVirtualMemoryUsage{ 0 }; // 初始化为0
 std::atomic<size_t> g_bigThreshold{ 128 * 1024 };      // 默认128KB为大块阈值
 
 // 优化：使用分片读写锁代替单一互斥锁
-struct BlockInfoShardedMap {
+struct BlockInfoShardedMapSafe {
     struct Shard {
-        mutable std::shared_mutex rwMutex; // 修改：添加 mutable
-        std::unordered_map<void*, BigBlockInfo> blocks;
+        mutable std::shared_mutex rwMutex;
+        std::unordered_map<void*, std::unique_ptr<BigBlockInfoSafe>> blocks;
+        std::atomic<size_t> blockCount{ 0 };
+        std::atomic<size_t> totalSize{ 0 };
     };
 
     Shard shards[LOCK_SHARD_COUNT];
+    std::atomic<size_t> totalBlocks{ 0 };
+    std::atomic<size_t> totalMemory{ 0 };
 
     // 根据指针计算分片索引
     size_t getShardIndex(void* ptr) const {
@@ -80,48 +87,83 @@ struct BlockInfoShardedMap {
     }
 
     // 查找操作 - 使用共享锁(读锁)
-    bool find(void* ptr, BigBlockInfo& info) const { // 修改：添加 const
+    bool find(void* ptr, BigBlockInfoSafe& info) const {
         size_t idx = getShardIndex(ptr);
         std::shared_lock<std::shared_mutex> lock(shards[idx].rwMutex);
+
         auto it = shards[idx].blocks.find(ptr);
-        if (it != shards[idx].blocks.end()) {
-            info = it->second;
+        if (it != shards[idx].blocks.end() && it->second) {
+            info = *it->second;  // 现在可直接用！
             return true;
         }
         return false;
     }
 
+
+
+
     // 插入操作 - 使用独占锁(写锁)
-    void insert(void* ptr, const BigBlockInfo& info) {
+    void insert(void* ptr, const BigBlockInfoSafe& info) {
         size_t idx = getShardIndex(ptr);
         std::unique_lock<std::shared_mutex> lock(shards[idx].rwMutex);
-        shards[idx].blocks[ptr] = info;
+
+        // 使用unique_ptr管理内存
+        auto blockInfo = std::make_unique<BigBlockInfoSafe>(info);
+
+        // 检查是否已存在
+        auto it = shards[idx].blocks.find(ptr);
+        if (it != shards[idx].blocks.end()) {
+            // 更新统计（减去旧的）
+            if (it->second) {
+                shards[idx].totalSize -= it->second->size;
+                totalMemory.fetch_sub(it->second->size);
+            }
+        }
+        else {
+            // 新块
+            shards[idx].blockCount++;
+            totalBlocks.fetch_add(1);
+        }
+
+        // 更新统计（加上新的）
+        shards[idx].totalSize += info.size;
+        totalMemory.fetch_add(info.size);
+
+        // 存储
+        shards[idx].blocks[ptr] = std::move(blockInfo);
     }
 
     // 移除操作 - 使用独占锁(写锁)
     bool erase(void* ptr) {
         size_t idx = getShardIndex(ptr);
         std::unique_lock<std::shared_mutex> lock(shards[idx].rwMutex);
+
         auto it = shards[idx].blocks.find(ptr);
         if (it != shards[idx].blocks.end()) {
-            // 释放源信息字符串
-            if (it->second.source) {
-                free((void*)it->second.source);
+            // 更新统计
+            if (it->second) {
+                shards[idx].totalSize -= it->second->size;
+                totalMemory.fetch_sub(it->second->size);
             }
+
+            shards[idx].blockCount--;
+            totalBlocks.fetch_sub(1);
+
+            // 移除（unique_ptr自动释放内存）
             shards[idx].blocks.erase(it);
             return true;
         }
         return false;
     }
 
-    // 获取总块数 - 加读锁
+    // 获取总块数
     size_t size() const {
-        size_t total = 0;
-        for (size_t i = 0; i < LOCK_SHARD_COUNT; ++i) {
-            std::shared_lock<std::shared_mutex> lock(shards[i].rwMutex);
-            total += shards[i].blocks.size();
-        }
-        return total;
+        return totalBlocks.load();
+    }
+
+    // 获取总内存使用
+    size_t getTotalMemory() const {
+        return totalMemory.load();
     }
 
     // 类型统计 - 加读锁
@@ -129,9 +171,12 @@ struct BlockInfoShardedMap {
         std::map<ResourceType, size_t>& typeSize) const {
         for (size_t i = 0; i < LOCK_SHARD_COUNT; ++i) {
             std::shared_lock<std::shared_mutex> lock(shards[i].rwMutex);
+
             for (const auto& entry : shards[i].blocks) {
-                typeCount[entry.second.type]++;
-                typeSize[entry.second.type] += entry.second.size;
+                if (entry.second) {
+                    typeCount[entry.second->type]++;
+                    typeSize[entry.second->type] += entry.second->size;
+                }
             }
         }
     }
@@ -140,18 +185,76 @@ struct BlockInfoShardedMap {
     void clear() {
         for (size_t i = 0; i < LOCK_SHARD_COUNT; ++i) {
             std::unique_lock<std::shared_mutex> lock(shards[i].rwMutex);
-            for (auto& entry : shards[i].blocks) {
-                if (entry.second.source) {
-                    free((void*)entry.second.source);
-                }
-            }
+
+            // unique_ptr会自动释放所有BigBlockInfoSafe对象
             shards[i].blocks.clear();
+            shards[i].blockCount = 0;
+            shards[i].totalSize = 0;
         }
+
+        totalBlocks = 0;
+        totalMemory = 0;
+    }
+
+    // 垃圾回收 - 清理超时的块信息
+    size_t collectGarbage(DWORD timeoutMs = 300000) {  // 默认5分钟
+        size_t collected = 0;
+        DWORD currentTime = GetTickCount();
+
+        for (size_t i = 0; i < LOCK_SHARD_COUNT; ++i) {
+            std::unique_lock<std::shared_mutex> lock(shards[i].rwMutex);
+
+            auto it = shards[i].blocks.begin();
+            while (it != shards[i].blocks.end()) {
+                if (it->second && (currentTime - it->second->timestamp) > timeoutMs) {
+                    // 检查引用计数
+                    if (it->second->refCount.load() <= 0) {
+                        shards[i].totalSize -= it->second->size;
+                        totalMemory.fetch_sub(it->second->size);
+                        shards[i].blockCount--;
+                        totalBlocks.fetch_sub(1);
+
+                        it = shards[i].blocks.erase(it);
+                        collected++;
+                        continue;
+                    }
+                }
+                ++it;
+            }
+        }
+
+        if (collected > 0) {
+            LogMessage("[BigBlocks] 垃圾回收: 清理了 %zu 个超时块信息", collected);
+        }
+
+        return collected;
+    }
+
+    // 获取内存统计
+    struct MemoryStats {
+        size_t totalBlocks;
+        size_t totalMemory;
+        size_t avgBlockSize;
+        std::map<size_t, size_t> shardDistribution;  // 每个分片的块数
+    };
+
+    MemoryStats getStats() const {
+        MemoryStats stats;
+        stats.totalBlocks = totalBlocks.load();
+        stats.totalMemory = totalMemory.load();
+        stats.avgBlockSize = stats.totalBlocks > 0 ? stats.totalMemory / stats.totalBlocks : 0;
+
+        for (size_t i = 0; i < LOCK_SHARD_COUNT; ++i) {
+            std::shared_lock<std::shared_mutex> lock(shards[i].rwMutex);
+            stats.shardDistribution[i] = shards[i].blockCount.load();
+        }
+
+        return stats;
     }
 };
 
 // 定义全局哈希表 (已在 .h 中声明为 extern)
-BlockInfoShardedMap g_bigBlocks;
+BlockInfoShardedMapSafe g_bigBlocks;
 // 定义全局内存统计 (已在 .h 中声明为 extern)
 MemoryStats g_memStats;
 // 其他全局状态变量 (已在 .h 中声明为 extern)
@@ -242,6 +345,71 @@ public:
 
 ThreadSafeTempStabilizers g_tempStabilizers;
 
+class SafeAsyncTaskManager {
+private:
+    std::mutex m_mutex;
+    std::list<std::future<void>> m_pendingTasks;
+    std::atomic<bool> m_shuttingDown{ false };
+
+public:
+    // 添加异步任务
+    void AddTask(std::function<void()> task) {
+        if (m_shuttingDown.load()) {
+            LogMessage("[AsyncTask] 系统关闭中，跳过新任务");
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // 清理已完成的任务
+        m_pendingTasks.remove_if([](std::future<void>& f) {
+            return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+            });
+
+        // 添加新任务
+        m_pendingTasks.push_back(std::async(std::launch::async, [task, this]() {
+            __try {
+                task();
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                LogMessage("[AsyncTask] 任务执行异常: 0x%08X", GetExceptionCode());
+            }
+            }));
+    }
+
+    // 等待所有任务完成
+    void WaitAllTasks(DWORD timeoutMs = 5000) {
+        m_shuttingDown.store(true);
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        auto startTime = GetTickCount();
+        for (auto& future : m_pendingTasks) {
+            if (future.valid()) {
+                DWORD elapsed = GetTickCount() - startTime;
+                DWORD remaining = (elapsed < timeoutMs) ? (timeoutMs - elapsed) : 0;
+
+                auto status = future.wait_for(std::chrono::milliseconds(remaining));
+                if (status != std::future_status::ready) {
+                    LogMessage("[AsyncTask] 任务未能在超时内完成");
+                }
+            }
+        }
+
+        m_pendingTasks.clear();
+        LogMessage("[AsyncTask] 所有异步任务已清理");
+    }
+
+    // 获取待处理任务数
+    size_t GetPendingCount() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_mutex));
+        return m_pendingTasks.size();
+    }
+};
+
+// 全局异步任务管理器
+static SafeAsyncTaskManager g_asyncTaskManager;
+
 // Storm原始函数指针
 Storm_MemAlloc_t    s_origStormAlloc = nullptr;
 Storm_MemFree_t     s_origStormFree = nullptr;
@@ -254,6 +422,19 @@ static FILE* g_logFile = nullptr;
 ///////////////////////////////////////////////////////////////////////////////
 // 优化实现
 ///////////////////////////////////////////////////////////////////////////////
+
+template<typename Func>
+void SafeExecuteAsync(const char* taskName, Func&& func) {
+    g_asyncTaskManager.AddTask([taskName, func = std::forward<Func>(func)]() {
+        LogMessage("[AsyncTask] 开始执行: %s", taskName);
+        auto startTime = GetTickCount();
+
+        func();
+
+        auto duration = GetTickCount() - startTime;
+        LogMessage("[AsyncTask] 完成: %s (耗时: %u ms)", taskName, duration);
+        });
+}
 
 // 优化大块缓存 - 使用分片锁和更高效的查找
 class LargeBlockCache {
@@ -497,6 +678,89 @@ thread_local std::vector<AsyncMemoryReleaser::DeferredFree> AsyncMemoryReleaser:
 // 辅助函数
 ///////////////////////////////////////////////////////////////////////////////
 
+bool SafeValidatePointer(void* ptr, size_t expectedSize) {
+    if (!ptr) return false;
+
+    __try {
+        // 多级验证
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) {
+            return false;
+        }
+
+        // 检查内存状态
+        if (mbi.State != MEM_COMMIT) {
+            return false;
+        }
+
+        // 检查保护属性
+        if (mbi.Protect & PAGE_NOACCESS ||
+            mbi.Protect & PAGE_GUARD) {
+            return false;
+        }
+
+        // 检查是否有足够的可访问空间
+        uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+        if (ptrAddr + expectedSize > regionEnd) {
+            return false;
+        }
+
+        // 尝试读取第一个和最后一个字节
+        volatile char firstByte, lastByte;
+        firstByte = *static_cast<char*>(ptr);
+        lastByte = *static_cast<char*>(static_cast<char*>(ptr) + expectedSize - 1);
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 安全验证Storm头部
+bool SafeValidateStormHeader(void* userPtr) {
+    if (!userPtr) return false;
+
+    __try {
+        // 计算头部地址
+        char* headerPtr = static_cast<char*>(userPtr) - sizeof(StormAllocHeader);
+
+        // 先验证头部内存可访问
+        if (!SafeValidatePointer(headerPtr, sizeof(StormAllocHeader))) {
+            return false;
+        }
+
+        // 安全读取头部
+        StormAllocHeader header;
+        if (!SafeReadMemory(headerPtr, header)) {
+            return false;
+        }
+
+        // 验证魔数
+        if (header.Magic != STORM_MAGIC) {
+            return false;
+        }
+
+        // 验证大小合理性
+        if (header.Size == 0 || header.Size > 0x10000000) {  // 256MB上限
+            return false;
+        }
+
+        // 验证标志位
+        if (header.Flags & 0xF0) {  // 高4位应该为0
+            return false;
+        }
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+
 // 设置内存跟踪级别
 void SetMemoryTrackingLevel(MemoryTrackingLevel level) {
     MemoryTrackingLevel oldLevel = g_trackingLevel.exchange(level);
@@ -685,6 +949,48 @@ void GenerateMemoryReport(bool forceWrite) {
     LogMessage("\n%s", reportBuffer);
 }
 
+void PeriodicGarbageCollection() {
+    static DWORD lastGCTime = 0;
+    DWORD currentTime = GetTickCount();
+    
+    // 每5分钟执行一次垃圾回收
+    if (currentTime - lastGCTime > 300000) {
+        lastGCTime = currentTime;
+        
+        size_t collected = g_bigBlocks.collectGarbage(600000);  // 清理10分钟未使用的
+        
+        if (collected > 0) {
+            auto stats = g_bigBlocks.getStats();
+            LogMessage("[GC] BigBlocks垃圾回收完成: 清理=%zu, 剩余=%zu, 内存=%zu MB",
+                collected, stats.totalBlocks, stats.totalMemory / (1024 * 1024));
+        }
+    }
+}
+
+// 指针安全检查
+inline bool SafeIsPermanentBlock(void* ptr) {
+    bool result = false;
+    __try { result = IsPermanentBlock(ptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { result = false; }
+    return result;
+}
+
+// 安全重分配
+inline void* SafeRealloc(void* ptr, size_t newSize) {
+    void* result = nullptr;
+    __try { result = MemPool::ReallocSafe(ptr, newSize); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { result = nullptr; }
+    return result;
+}
+
+// 安全原始分配
+inline void* SafeStormAlloc(int ecx, int edx, size_t newSize, const char* name, DWORD src_line, DWORD flag) {
+    void* result = nullptr;
+    __try { result = reinterpret_cast<void*>(s_origStormAlloc(ecx, edx, newSize, name, src_line, flag)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { result = nullptr; }
+    return result;
+}
+
 // 简化版状态输出，适合频繁调用 - 使用线程本地存储减少内存分配
 void PrintMemoryStatus() {
     // 使用线程本地缓冲区
@@ -723,6 +1029,66 @@ void PrintMemoryStatus() {
 
     // 日志输出
     LogMessage("%s", buffer);
+}
+
+void DetectBigBlockLeaks() {
+    LogMessage("[泄漏检测] 开始检查BigBlocks泄漏...");
+
+    std::map<std::string, size_t> sourceStats;
+    std::map<ResourceType, size_t> typeStats;
+    size_t totalLeaks = 0;
+    size_t totalLeakSize = 0;
+
+    // 遍历所有分片
+    for (size_t i = 0; i < LOCK_SHARD_COUNT; ++i) {
+        std::shared_lock<std::shared_mutex> lock(g_bigBlocks.shards[i].rwMutex);
+
+        for (const auto& entry : g_bigBlocks.shards[i].blocks) {
+            if (entry.second) {
+                totalLeaks++;
+                totalLeakSize += entry.second->size;
+
+                // 按源统计
+                std::string source = entry.second->GetSource();
+                if (source.empty()) source = "<unknown>";
+                sourceStats[source]++;
+
+                // 按类型统计
+                typeStats[entry.second->type]++;
+
+                // 详细日志（仅前10个）
+                if (totalLeaks <= 10) {
+                    LogMessage("[泄漏] 块 %p: 大小=%zu, 源=%s:%u, 时间=%u",
+                        entry.first, entry.second->size,
+                        entry.second->GetSource(), entry.second->srcLine,
+                        entry.second->timestamp);
+                }
+            }
+        }
+    }
+
+    // 输出统计
+    LogMessage("[泄漏检测] 总计: %zu 块, %zu MB",
+        totalLeaks, totalLeakSize / (1024 * 1024));
+
+    LogMessage("[泄漏检测] 按源分布:");
+    for (const auto& src : sourceStats) {
+        LogMessage("  %s: %zu 块", src.first.c_str(), src.second);
+    }
+
+    LogMessage("[泄漏检测] 按类型分布:");
+    for (const auto& type : typeStats) {
+        const char* typeName = "未知";
+        switch (type.first) {
+        case ResourceType::Model: typeName = "模型"; break;
+        case ResourceType::Unit: typeName = "单位"; break;
+        case ResourceType::Terrain: typeName = "地形"; break;
+        case ResourceType::Sound: typeName = "声音"; break;
+        case ResourceType::File: typeName = "文件"; break;
+        case ResourceType::JassVM: typeName = "JassVM"; break;
+        }
+        LogMessage("  %s: %zu 块", typeName, type.second);
+    }
 }
 
 // 使用SEH包装SafeMemCopy实现，优化异常处理
@@ -963,11 +1329,11 @@ void* AllocateJassVMMemory(size_t size) {
     SetupCompatibleHeader(userPtr, size);
 
     // 记录此块信息
-    BigBlockInfo info;
+    BigBlockInfoSafe info;
     info.rawPtr = rawPtr;
     info.size = size;
     info.timestamp = GetTickCount();
-    info.source = _strdup("JassVM_专用内存");
+    info.SetSource("JassVM_专用内存");  // 使用安全的SetSource方法
     info.srcLine = 0;
     info.type = ResourceType::JassVM;
 
@@ -1930,6 +2296,7 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
     DWORD lastStatsTime = GetTickCount();
     DWORD lastReportTime = GetTickCount();
     DWORD lastProfileTime = GetTickCount();
+    DWORD lastGCTime = GetTickCount();
 
     while (!g_shouldExit.load(std::memory_order_acquire)) {
         // 使用条件变量等待而不是Sleep
@@ -1946,7 +2313,7 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
         // 使用批处理减少锁争用，同一时间只做一种操作
         // 1. 每30秒生成内存报告
         if (currentTime - lastReportTime > 30000) {
-            GenerateMemoryReport();
+            DetectBigBlockLeaks();
             lastReportTime = currentTime;
             continue; // 跳过其他操作，减少同一周期的工作量
         }
@@ -2009,6 +2376,20 @@ DWORD WINAPI MemoryStatsThread(LPVOID) {
             MemPool::PrintStats();
 
             lastStatsTime = currentTime;
+            continue;
+        }
+
+        // 每5分钟执行一次垃圾回收
+        if (currentTime - lastGCTime > 300000) {
+            lastGCTime = currentTime;
+
+            size_t collected = g_bigBlocks.collectGarbage(600000);  // 清理10分钟未使用的
+
+            if (collected > 0) {
+                auto stats = g_bigBlocks.getStats();
+                LogMessage("[GC] BigBlocks垃圾回收完成: 清理=%zu, 剩余=%zu, 内存=%zu MB",
+                    collected, stats.totalBlocks, stats.totalMemory / (1024 * 1024));
+            }
         }
     }
 
@@ -2181,11 +2562,11 @@ void CreateStabilizingBlocks(int cleanAllCount) {
             g_tempStabilizers.add(block);
 
             // 记录到大块管理
-            BigBlockInfo info;
+            BigBlockInfoSafe info;
             info.rawPtr = static_cast<char*>(stabilizer) - sizeof(StormAllocHeader);
             info.size = blockSize;
             info.timestamp = GetTickCount();
-            info.source = _strdup("临时稳定块");
+            info.SetSource("临时稳定块");  // 使用安全的SetSource方法
             info.srcLine = 0;
             info.type = ResourceType::Unknown;
 
@@ -2208,10 +2589,10 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         static std::atomic<int> cleanAllCounter{ 0 };
         int newCounter = cleanAllCounter.fetch_add(1, std::memory_order_relaxed) + 1;
 
-        // 使用异步方式创建稳定块，避免阻塞主线程
-        std::thread([newCounter] {
+        // 使用安全的异步任务管理器替代 detached thread
+        g_asyncTaskManager.AddTask([newCounter] {
             CreateStabilizingBlocks(newCounter);
-            }).detach();
+            });
     }
 
     // 检查是否为 JassVM 相关分配 - 使用严格的识别
@@ -2243,11 +2624,11 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
             SetupCompatibleHeader(userPtr, size);
 
             // 记录此块信息
-            BigBlockInfo info;
+            BigBlockInfoSafe info;
             info.rawPtr = cachedPtr;
             info.size = size;
             info.timestamp = GetTickCount();
-            info.source = name ? _strdup(name) : nullptr;
+            info.SetSource(name);  // 使用安全的SetSource方法
             info.srcLine = src_line;
             info.type = GetResourceType(name);
 
@@ -2290,11 +2671,11 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         }
 
         // 记录此块信息
-        BigBlockInfo info;
+        BigBlockInfoSafe info;
         info.rawPtr = rawPtr;
         info.size = size;
         info.timestamp = GetTickCount();
-        info.source = name ? _strdup(name) : nullptr;
+        info.SetSource(name);  // 使用安全的SetSource方法
         info.srcLine = src_line;
         info.type = GetResourceType(name);
 
@@ -2331,11 +2712,13 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     const char* blockSource = nullptr;
 
     // 尝试从g_bigBlocks获取块信息
-    BigBlockInfo blockInfo;
+    BigBlockInfoSafe blockInfo;
     bool blockFound = g_bigBlocks.find(ptr, blockInfo);
     if (blockFound) {
+        g_bigBlocks.erase(ptr);
+        g_memStats.OnFree(blockInfo.size);
         blockSize = blockInfo.size;
-        blockSource = blockInfo.source;
+        blockSource = blockInfo.GetSource();
     }
     else {
         // 尝试使用GetBlockSize获取大小
@@ -2343,71 +2726,50 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
     }
 
     // 记录内存释放，使用找到的源信息
-    g_memoryTracker.RecordFree(blockSize, blockSource ? blockSource : name);
+    g_memoryTracker.RecordFree(blockSize, blockSource && *blockSource ? blockSource : name);
 
-    // 先检查是否为 JVM_MemPool 指针
+    // 检查是否为 JVM_MemPool 指针
     if (JVM_MemPool::IsFromPool(ptr)) {
-        // 使用 JVM_MemPool 专用释放
         g_memoryTracker.RecordFree(10408, "Instance.cpp");
         JVM_MemPool::Free(ptr);
         return 1;
     }
 
-    bool ourBlock = false;
-    bool permanentBlock = false;
-
-    // 使用异常处理检查指针
-    __try {
-        // 先执行最轻量级的检查 - 永久块检查
-        permanentBlock = IsPermanentBlock(ptr);
-        if (permanentBlock) {
-            return 1; // 假装成功，无需记录日志
-        }
-
-        // 检查是否为我们管理的块
-        ourBlock = IsOurBlock(ptr);
+    bool permanentBlock = SafeIsPermanentBlock(ptr);
+    if (permanentBlock) {
+        return 1; // 假装成功，无需记录日志
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // 如果检查过程中出现异常，认为不是我们的块
-        return s_origStormFree(a1, name, argList, a4);
-    }
+
+    bool ourBlock = IsOurBlock(ptr);
 
     // 常规释放流程
     if (ourBlock) {
-        // 获取块信息
-        BigBlockInfo blockInfo;
-        bool blockFound = g_bigBlocks.find(ptr, blockInfo);
+        BigBlockInfoSafe info;
+        bool found = g_bigBlocks.find(ptr, info);
 
-        if (blockFound) {
-            // 从哈希表中移除块信息 - 在erase内部释放source指针
+        if (found) {
             g_bigBlocks.erase(ptr);
-
-            // 更新统计
-            g_memStats.OnFree(blockInfo.size);
+            g_memStats.OnFree(info.size);
 
             // 安全取消注册 - 只在安全期间执行
             if (!g_cleanAllInProgress && !g_insideUnsafePeriod.load(std::memory_order_acquire)) {
                 g_MemSafety.TryUnregisterBlock(ptr);
             }
 
-            // 对于大块，考虑放入缓存或异步释放
-            if (blockInfo.size >= g_bigThreshold.load(std::memory_order_relaxed)) {
+            if (info.size >= g_bigThreshold.load(std::memory_order_relaxed)) {
                 // 如果在不安全期，使用异步释放
                 if (g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire)) {
-                    g_asyncReleaser.QueueFree(blockInfo.rawPtr, blockInfo.size);
+                    g_asyncReleaser.QueueFree(info.rawPtr, info.size);
                 }
-                // 否则尝试放入缓存
                 else if (g_largeBlockCache.GetCacheSize() < MAX_CACHE_BLOCKS) {
-                    g_largeBlockCache.ReleaseBlock(blockInfo.rawPtr, blockInfo.size);
+                    g_largeBlockCache.ReleaseBlock(info.rawPtr, info.size);
                 }
-                // 缓存已满，直接释放
                 else {
-                    MemPool::FreeSafe(blockInfo.rawPtr);
+                    MemPool::FreeSafe(info.rawPtr);
                 }
             }
-            // 小块直接释放
             else {
-                MemPool::FreeSafe(blockInfo.rawPtr);
+                MemPool::FreeSafe(info.rawPtr);
             }
 
             g_freedByFreeHook.fetch_add(1, std::memory_order_relaxed);
@@ -2431,8 +2793,6 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
     const char* name, DWORD src_line, DWORD flag)
 {
-
-    // 基本边界情况处理
     if (!oldPtr) {
         return reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
     }
@@ -2442,88 +2802,58 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         return nullptr;
     }
 
-    // 检查是否是 JVM_MemPool 内存
     if (JVM_MemPool::IsFromPool(oldPtr)) {
-        // 使用 JVM_MemPool 专用重分配
         return JVM_MemPool::Realloc(oldPtr, newSize);
     }
 
-    // 永久块特殊处理
-    if (IsPermanentBlock(oldPtr)) {
+    if (SafeIsPermanentBlock(oldPtr)) {
         void* newPtr = reinterpret_cast<void*>(Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
-
         if (newPtr) {
-            // 只复制最少必要数据
-            SafeMemCopy(newPtr, oldPtr, min(64, newSize));
+            SafeMemCopy(newPtr, oldPtr, std::min<size_t>(64, newSize));
         }
-
         return newPtr;
     }
 
-    // 不安全期特殊处理
     bool inUnsafePeriod = g_cleanAllInProgress || g_insideUnsafePeriod.load(std::memory_order_acquire);
     if (inUnsafePeriod) {
         if (IsOurBlock(oldPtr)) {
-            // 只分配，不释放
             void* newPtr = reinterpret_cast<void*>(
                 Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag));
-
             if (!newPtr) {
                 return nullptr;
             }
-
-            // 尝试安全复制
             size_t oldSize = GetBlockSize(oldPtr);
             if (oldSize > 0) {
                 SafeMemCopy(newPtr, oldPtr, min(oldSize, newSize));
             }
             else {
-                // 如果无法获取大小，只复制少量数据
-                SafeMemCopy(newPtr, oldPtr, min(64, newSize));
+                SafeMemCopy(newPtr, oldPtr, std::min<size_t>(64, newSize));
             }
-
-            // 将oldPtr放入延迟释放队列
             g_MemSafety.EnqueueDeferredFree(oldPtr, oldSize);
-
             return newPtr;
         }
-
-        // 不是我们的块，使用原始函数
         return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
     }
 
-    // 确定重分配策略
     bool isOurOldBlock = IsOurBlock(oldPtr);
     bool shouldUseTLSF = (newSize >= g_bigThreshold.load(std::memory_order_relaxed)) ||
         IsSpecialBlockAllocation(newSize, name, src_line);
 
     // 情况1: 我们的块重分配为我们的块
     if (isOurOldBlock && shouldUseTLSF) {
-        BigBlockInfo oldInfo;
-        bool blockFound = g_bigBlocks.find(oldPtr, oldInfo);
-
-        if (!blockFound) {
+        BigBlockInfoSafe oldInfo;
+        bool found = g_bigBlocks.find(oldPtr, oldInfo);
+        if (!found) {
             return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
         }
 
-        // 尝试重新分配
-        void* newRawPtr = nullptr;
-        void* newPtr = nullptr;
-
-        __try {
-            newRawPtr = MemPool::ReallocSafe(oldInfo.rawPtr, newSize + sizeof(StormAllocHeader));
-            if (!newRawPtr) {
-                LogMessage("[Realloc] TLSF重分配失败, 大小=%zu", newSize);
-                return nullptr;
-            }
-
-            newPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
-            SetupCompatibleHeader(newPtr, newSize);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            LogMessage("[Realloc] TLSF重分配异常: %p", oldPtr);
+        void* newRawPtr = SafeRealloc(oldInfo.rawPtr, newSize + sizeof(StormAllocHeader));
+        if (!newRawPtr) {
+            LogMessage("[Realloc] TLSF重分配失败, 大小=%zu", newSize);
             return nullptr;
         }
+        void* newPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
+        SetupCompatibleHeader(newPtr, newSize);
 
         // 更新安全系统
         if (!inUnsafePeriod) {
@@ -2533,80 +2863,70 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 
         // 更新大块跟踪
         if (newPtr != oldPtr) {
-            // 指针变化，更新映射
             g_bigBlocks.erase(oldPtr);
 
-            BigBlockInfo info;
+            BigBlockInfoSafe info;
             info.rawPtr = newRawPtr;
             info.size = newSize;
             info.timestamp = GetTickCount();
-            info.source = name ? _strdup(name) : (oldInfo.source ? _strdup(oldInfo.source) : nullptr);
+            if (name && *name) {
+                info.SetSource(name);
+            }
+            else if (oldInfo.source) {
+                info.source = oldInfo.source;
+            }
+            else {
+                info.source.reset();
+            }
             info.srcLine = src_line;
             info.type = oldInfo.type;
-
             g_bigBlocks.insert(newPtr, info);
-
-            // 注意：这里不需要释放 oldInfo.source，因为 erase 已经处理了
         }
         else {
-            // 指针未变，通过移除再插入更新信息
             g_bigBlocks.erase(oldPtr);
 
-            BigBlockInfo info;
+            BigBlockInfoSafe info;
             info.rawPtr = newRawPtr;
             info.size = newSize;
             info.timestamp = GetTickCount();
-            info.source = name ? _strdup(name) : (oldInfo.source ? _strdup(oldInfo.source) : nullptr);
+            if (name && *name) {
+                info.SetSource(name);
+            }
+            else if (oldInfo.source) {
+                info.source = oldInfo.source;
+            }
+            else {
+                info.source.reset();
+            }
             info.srcLine = src_line;
             info.type = oldInfo.type;
-
             g_bigBlocks.insert(newPtr, info);
         }
 
-        // 更新统计
         g_memStats.OnFree(oldInfo.size);
         g_memStats.OnAlloc(newSize);
 
         return newPtr;
     }
-
     // 情况2: 我们的块重分配为Storm块（变小）
     else if (isOurOldBlock && !shouldUseTLSF) {
-        BigBlockInfo oldInfo;
-        bool blockFound = g_bigBlocks.find(oldPtr, oldInfo);
-
-        if (!blockFound) {
+        BigBlockInfoSafe oldInfo;
+        bool found = g_bigBlocks.find(oldPtr, oldInfo);
+        if (!found) {
             return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
         }
 
-        // 使用Storm分配新块
-        void* newPtr = nullptr;
-
-        __try {
-            newPtr = reinterpret_cast<void*>(s_origStormAlloc(ecx, edx, newSize, name, src_line, flag));
-            if (!newPtr) {
-                return nullptr;
-            }
-
-            // 安全复制数据
-            SafeMemCopy(newPtr, oldPtr, min(oldInfo.size, newSize));
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            if (newPtr) {
-                s_origStormFree(reinterpret_cast<int>(newPtr), const_cast<char*>(name), src_line, flag);
-            }
+        void* newPtr = SafeStormAlloc(ecx, edx, newSize, name, src_line, flag);
+        if (!newPtr) {
             return nullptr;
         }
+        SafeMemCopy(newPtr, oldPtr, min(oldInfo.size, newSize));
 
-        // 取消注册
         if (!inUnsafePeriod) {
             g_MemSafety.UnregisterMemoryBlock(oldPtr);
         }
-
-        // 移除块信息
         g_bigBlocks.erase(oldPtr);
 
-        // 释放TLSF旧块
         if (g_largeBlockCache.GetCacheSize() < MAX_CACHE_BLOCKS) {
             g_largeBlockCache.ReleaseBlock(oldInfo.rawPtr, oldInfo.size);
         }
@@ -2614,75 +2934,48 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
             MemPool::FreeSafe(oldInfo.rawPtr);
         }
 
-        // 更新统计
         g_memStats.OnFree(oldInfo.size);
         g_memStats.OnAlloc(newSize);
 
         return newPtr;
     }
-
     // 情况3: Storm块重分配为我们的块（变大）
     else if (!isOurOldBlock && shouldUseTLSF) {
-        void* newRawPtr = nullptr;
-        void* newUserPtr = nullptr;
-
-        __try {
-            // 分配新的TLSF块
-            size_t totalSize = newSize + sizeof(StormAllocHeader);
-            newRawPtr = MemPool::AllocateSafe(totalSize);
-            if (!newRawPtr) {
-                return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
-            }
-
-            newUserPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
-            SetupCompatibleHeader(newUserPtr, newSize);
-
-            // 尝试获取旧块大小
-            size_t oldSize = GetBlockSize(oldPtr);
-
-            // 安全复制数据
-            if (oldSize > 0) {
-                SafeMemCopy(newUserPtr, oldPtr, min(oldSize, newSize));
-            }
-            else {
-                // 保守估计复制大小
-                SafeMemCopy(newUserPtr, oldPtr, min(newSize, (size_t)128));
-            }
-
-            // 释放Storm旧块
-            s_origStormFree(reinterpret_cast<int>(oldPtr), const_cast<char*>(name), src_line, flag);
+        void* newRawPtr = SafeRealloc(nullptr, newSize + sizeof(StormAllocHeader));
+        if (!newRawPtr) {
+            return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            LogMessage("[Realloc] Storm到TLSF转换异常");
-            if (newRawPtr) {
-                MemPool::FreeSafe(newRawPtr);
-            }
-            return nullptr;
+        void* newUserPtr = static_cast<char*>(newRawPtr) + sizeof(StormAllocHeader);
+        SetupCompatibleHeader(newUserPtr, newSize);
+
+        size_t oldSize = GetBlockSize(oldPtr);
+        if (oldSize > 0) {
+            SafeMemCopy(newUserPtr, oldPtr, min(oldSize, newSize));
+        }
+        else {
+            SafeMemCopy(newUserPtr, oldPtr, std::min<size_t>(newSize, 128));
         }
 
-        // 注册新块
+        s_origStormFree(reinterpret_cast<int>(oldPtr), const_cast<char*>(name), src_line, flag);
+
         if (!inUnsafePeriod) {
             g_MemSafety.RegisterMemoryBlock(newRawPtr, newUserPtr, newSize, name, src_line);
         }
 
-        // 记录大块信息
-        BigBlockInfo info;
+        BigBlockInfoSafe info;
         info.rawPtr = newRawPtr;
         info.size = newSize;
         info.timestamp = GetTickCount();
-        info.source = name ? _strdup(name) : nullptr;
+        info.SetSource(name);
         info.srcLine = src_line;
         info.type = GetResourceType(name);
-
         g_bigBlocks.insert(newUserPtr, info);
 
         g_memStats.OnAlloc(newSize);
         return newUserPtr;
     }
-
     // 情况4: Storm块重分配为Storm块
     else {
-        // 小块使用Storm重分配
         void* result = s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
         if (result) {
             g_memStats.OnAlloc(newSize);
@@ -2959,6 +3252,27 @@ void ShutdownStormMemoryHooks() {
     // 停止定期报告线程
     LogMessage("[关闭] 停止定期报告生成...");
     g_memoryTracker.StopPeriodicReporting();
+
+    LogMessage("[关闭] 等待异步任务完成...");
+    size_t pendingTasks = g_asyncTaskManager.GetPendingCount();
+    if (pendingTasks > 0) {
+        LogMessage("[关闭] 等待 %zu 个异步任务...", pendingTasks);
+        g_asyncTaskManager.WaitAllTasks(3000);  // 最多等待3秒
+    }
+
+    // 在清理前打印BigBlocks统计
+    auto stats = g_bigBlocks.getStats();
+    LogMessage("[关闭] BigBlocks统计: 块数=%zu, 总内存=%zu MB, 平均块大小=%zu KB",
+        stats.totalBlocks, stats.totalMemory / (1024 * 1024),
+        stats.avgBlockSize / 1024);
+
+    // 打印分片分布
+    LogMessage("[关闭] BigBlocks分片分布:");
+    for (const auto& shard : stats.shardDistribution) {
+        if (shard.second > 0) {
+            LogMessage("  分片[%zu]: %zu 块", shard.first, shard.second);
+        }
+    }
 
     // 生成内存分配报告
     LogMessage("[关闭] 正在生成内存分配报告...");
