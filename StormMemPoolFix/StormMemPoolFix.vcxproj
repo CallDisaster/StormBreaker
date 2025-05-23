@@ -162,6 +162,8 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
+    <ClInclude Include="Storm\StormCompatible.h" />
+    <ClInclude Include="Storm\StormDiagnostic.h" />
     <ClInclude Include="Storm\StormFileIO.h" />
     <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
@@ -184,6 +186,9 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Storm\MemoryPool.cpp" />
+    <ClCompile Include="Storm\StormCompatible.cpp" />
+    <ClCompile Include="Storm\StormDiagnostic.cpp" />
+    <ClCompile Include="Storm\StormHeapCompat.cpp" />
     <ClCompile Include="Storm\StormHeapHook.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />

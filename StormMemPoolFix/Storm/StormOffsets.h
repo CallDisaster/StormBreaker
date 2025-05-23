@@ -66,3 +66,34 @@ inline LPCRITICAL_SECTION Storm_g_HeapCriticalSectionPtr(uint8_t index)
 
 // 新增Storm_g_HeapTable宏定义
 #define Storm_g_HeapTable (*(DWORD***)(gStormDllBase + OFFSET_g_HeapTable))
+
+// Storm兼容分配器配置
+namespace StormCompatConfig {
+    // 堆配置
+    constexpr size_t DEFAULT_HEAP_SIZE = 16 * 1024 * 1024;  // 16MB per heap
+    constexpr size_t MAX_HEAPS = 256;                       // 最大堆数量
+    constexpr size_t HEAP_ALIGNMENT = 8;                   // 堆内存对齐
+
+    // 空闲链表配置
+    constexpr int FREE_LIST_LEVELS = 9;                    // 9个空闲链表级别
+    constexpr size_t MIN_BLOCK_SIZE = 16;                  // 最小块大小
+    constexpr size_t MAX_BLOCK_SIZE = 0xFFFF;              // 最大块大小（16位）
+
+    // 性能配置
+    constexpr DWORD STATS_UPDATE_INTERVAL = 30000;        // 统计更新间隔（毫秒）
+    constexpr DWORD MEMORY_REPORT_INTERVAL = 60000;       // 内存报告间隔（毫秒）
+    constexpr double MAX_FALLBACK_RATE = 0.20;            // 最大回退率（20%）
+
+    // 调试配置
+    constexpr bool ENABLE_BOUNDARY_CHECKS = true;         // 启用边界检查
+    constexpr bool ENABLE_FILL_PATTERNS = false;          // 启用填充模式
+    constexpr bool ENABLE_DETAILED_LOGGING = false;       // 启用详细日志
+
+    // 魔数定义
+    constexpr WORD STORM_MAGIC = 0x6F6D;                  // Storm标准魔数
+    constexpr WORD BOUNDARY_MAGIC = 0x12B1;               // 边界检查魔数（4785）
+    constexpr DWORD HEAP_SIGNATURE_BASE = 0x6F6D0000;     // 堆签名基础值
+
+    bool ValidateConfiguration();
+    void PrintConfiguration();
+}
