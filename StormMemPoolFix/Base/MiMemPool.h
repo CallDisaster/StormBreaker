@@ -109,7 +109,7 @@ namespace MiMemPool {
     void* AllocateSafe(size_t size) {
         if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
             // 在不安全期间使用系统分配
-            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!sysPtr) {
                 LogMessage("[MiMemPool] 不安全期间系统内存分配失败: %zu", size);
@@ -126,7 +126,7 @@ namespace MiMemPool {
         SafeExecutionGuard guard(g_inOperation, "MiMemPool::AllocateSafe");
         if (!guard.CanProceed()) {
             // 使用系统分配作为备选
-            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!sysPtr) return nullptr;
 
@@ -165,7 +165,7 @@ namespace MiMemPool {
 
         if (!ptr) {
             LogMessage("[MiMemPool] 分配失败，使用系统备选: %zu", size);
-            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!sysPtr) return nullptr;
 
@@ -231,7 +231,7 @@ namespace MiMemPool {
             }
 
             if (header->Magic == STORM_MAGIC &&
-                header->HeapPtr == SPECIAL_MARKER) {
+                header->HeapId == SPECIAL_MARKER) {
                 result = true;
             }
         }
@@ -257,7 +257,9 @@ namespace MiMemPool {
             }
 
             if (header->Magic == STORM_MAGIC) {
-                size = header->Size;
+                size_t total = header->Size;
+                size = total - sizeof(StormAllocHeader) - header->AlignPadding;
+                if (header->Flags & 0x1) size -= 2;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {

@@ -770,7 +770,10 @@ size_t GetBlockSize(void* ptr) noexcept {
         }
 
         if (header->Magic == STORM_MAGIC) {
-            return header->Size;
+            size_t total = header->Size;
+            size_t user = total - sizeof(StormAllocHeader) - header->AlignPadding;
+            if (header->Flags & 0x1) user -= 2; // 尾部哨兵
+            return user;
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -831,11 +834,16 @@ void SetupCompatibleHeader(void* userPtr, size_t size) {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
 
-        header->HeapPtr = SPECIAL_MARKER;  // 特殊标记
-        header->Size = static_cast<DWORD>(size);
+        WORD total = static_cast<WORD>(sizeof(StormAllocHeader) + size + 2);
+        header->Size = total;            // 头部存储总大小
         header->AlignPadding = 0;
-        header->Flags = 0x4;  // 标记为大块VirtualAlloc
+        header->Flags = 0x5;  // 大块VirtualAlloc + 尾部哨兵
+        header->HeapId = SPECIAL_MARKER;
         header->Magic = STORM_MAGIC;
+
+        // 写入尾部哨兵
+        WORD* tail = reinterpret_cast<WORD*>(static_cast<char*>(userPtr) + size);
+        *tail = 0x12B1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         LogMessage("[ERROR] 设置兼容头失败: %p, 错误=0x%x", userPtr, GetExceptionCode());
@@ -861,7 +869,7 @@ bool IsOurBlock(void* ptr) {
         }
 
         return (header->Magic == STORM_MAGIC &&
-            header->HeapPtr == SPECIAL_MARKER);
+            header->HeapId == SPECIAL_MARKER);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -951,7 +959,7 @@ bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line) {
 // JassVM内存分配函数优化
 void* AllocateJassVMMemory(size_t size) {
     // 使用 VirtualAlloc 直接分配而非 TLSF
-    void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+    void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
     if (!rawPtr) {
@@ -1419,7 +1427,7 @@ namespace MemPool {
     void* AllocateSafe(size_t size) {
         // 在不安全期间直接使用系统分配
         if (g_cleanAllInProgress || g_insideUnsafePeriod.load()) {
-            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!sysPtr) {
                 LogMessage("[MemPool] 不安全期间系统内存分配失败: %zu", size);
@@ -1444,7 +1452,7 @@ namespace MemPool {
             LogMessage("[MemPool] Allocate: TLSF分配操作正在进行，回退到系统分配");
 
             // 使用系统分配作为备选
-            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!sysPtr) return nullptr;
 
@@ -1552,7 +1560,7 @@ namespace MemPool {
                 StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
                     static_cast<char*>(ptr) - sizeof(StormAllocHeader));
 
-                if (header->Magic == STORM_MAGIC && header->HeapPtr == SPECIAL_MARKER) {
+                if (header->Magic == STORM_MAGIC && header->HeapId == SPECIAL_MARKER) {
                     void* basePtr = static_cast<char*>(ptr) - sizeof(StormAllocHeader);
                     VirtualFree(basePtr, 0, MEM_RELEASE);
                     return;
@@ -1897,7 +1905,7 @@ namespace MemPool {
         }
 
         // 使用系统分配确保稳定性
-        void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+        void* rawPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!rawPtr) {
             LogMessage("[MemPool] 无法分配稳定化块: %zu", size);
@@ -2237,7 +2245,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
 
     if (useTLSF) {
         // 先尝试从缓存获取大块
-        void* cachedPtr = g_largeBlockCache.GetBlock(size + sizeof(StormAllocHeader));
+        void* cachedPtr = g_largeBlockCache.GetBlock(size + sizeof(StormAllocHeader) + 2);
         if (cachedPtr) {
             void* userPtr = static_cast<char*>(cachedPtr) + sizeof(StormAllocHeader);
             SetupCompatibleHeader(userPtr, size);
@@ -2263,7 +2271,7 @@ size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size, const cha
         }
 
         // 缓存未命中，使用 TLSF 分配
-        size_t totalSize = size + sizeof(StormAllocHeader);
+        size_t totalSize = size + sizeof(StormAllocHeader) + 2;
         void* rawPtr = MemPool::AllocateSafe(totalSize);
 
         if (!rawPtr) {
@@ -2511,7 +2519,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
         void* newPtr = nullptr;
 
         __try {
-            newRawPtr = MemPool::ReallocSafe(oldInfo.rawPtr, newSize + sizeof(StormAllocHeader));
+            newRawPtr = MemPool::ReallocSafe(oldInfo.rawPtr, newSize + sizeof(StormAllocHeader) + 2);
             if (!newRawPtr) {
                 LogMessage("[Realloc] TLSF重分配失败, 大小=%zu", newSize);
                 return nullptr;
@@ -2628,7 +2636,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 
         __try {
             // 分配新的TLSF块
-            size_t totalSize = newSize + sizeof(StormAllocHeader);
+            size_t totalSize = newSize + sizeof(StormAllocHeader) + 2;
             newRawPtr = MemPool::AllocateSafe(totalSize);
             if (!newRawPtr) {
                 return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);

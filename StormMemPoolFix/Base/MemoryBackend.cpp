@@ -76,7 +76,7 @@ namespace MemoryPool {
         case MemBackendType::System:
         {
             // 使用系统分配 - 添加花括号创建作用域
-            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader),
+            void* sysPtr = VirtualAlloc(NULL, size + sizeof(StormAllocHeader) + 2,
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!sysPtr) return nullptr;
 
@@ -193,7 +193,9 @@ namespace MemoryPool {
 
                 if (!IsBadReadPtr(header, sizeof(StormAllocHeader)) &&
                     header->Magic == STORM_MAGIC) {
-                    oldSize = header->Size;
+                    size_t total = header->Size;
+                    oldSize = total - sizeof(StormAllocHeader) - header->AlignPadding;
+                    if (header->Flags & 0x1) oldSize -= 2;
                 }
             }
             catch (...) {
