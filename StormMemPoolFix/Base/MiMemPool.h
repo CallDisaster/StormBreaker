@@ -257,7 +257,9 @@ namespace MiMemPool {
             }
 
             if (header->Magic == STORM_MAGIC) {
-                size = header->Size;
+                size_t total = header->Size;
+                size = total - sizeof(StormAllocHeader) - header->AlignPadding;
+                if (header->Flags & 0x1) size -= 2;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {

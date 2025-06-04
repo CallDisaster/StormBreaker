@@ -148,6 +148,7 @@ static size_t StormBlockGetTotalSize(const void* pBlock)
     {
         // => StormAllocHeader
         const StormAllocHeader* ah = reinterpret_cast<const StormAllocHeader*>(pBlock);
+        return ah->Size;
         size_t total = ah->Size + sizeof(StormAllocHeader) + ah->AlignPadding;
         if (ah->Flags & 0x1) total += 2; // 尾部哨兵
         return total;

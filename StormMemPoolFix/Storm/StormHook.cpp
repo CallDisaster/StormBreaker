@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include "StormHook.h"
 #include "StormOffsets.h"
 #include <Windows.h>
@@ -770,7 +770,10 @@ size_t GetBlockSize(void* ptr) noexcept {
         }
 
         if (header->Magic == STORM_MAGIC) {
-            return header->Size;
+            size_t total = header->Size;
+            size_t user = total - sizeof(StormAllocHeader) - header->AlignPadding;
+            if (header->Flags & 0x1) user -= 2; // 尾部哨兵
+            return user;
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -830,7 +833,8 @@ void SetupCompatibleHeader(void* userPtr, size_t size) {
     __try {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
-
+        WORD total = static_cast<WORD>(sizeof(StormAllocHeader) + size + 2);
+        header->Size = total;            // 头部存储总大小
         header->Size = static_cast<WORD>(size + sizeof(StormAllocHeader) + 2);
         header->AlignPadding = 0;
         header->Flags = 0x5;  // 大块VirtualAlloc + 尾部哨兵

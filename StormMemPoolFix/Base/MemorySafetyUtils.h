@@ -109,13 +109,15 @@ public:
 
         // 验证Storm块一致性
         if (header->Size == 0 ||
-            header->Size > 0x1000000 || // 16MB是一个合理的上限
+            header->Size > 0x1000000 || // 合理的上限
             (header->Flags & 0x2)) { // 标记为已释放
             return false;
         }
 
-        // 检查用户区是否可访问
-        return !IsBadReadPtr(userPtr, header->Size);
+        size_t userSize = header->Size - sizeof(StormAllocHeader) - header->AlignPadding;
+        if (header->Flags & 0x1) userSize -= 2;
+
+        return !IsBadReadPtr(userPtr, userSize);
     }
 
     // 尝试获取块大小
@@ -136,7 +138,10 @@ public:
         }
 
         if (header->Magic == STORM_MAGIC) {
-            return header->Size;
+            size_t total = header->Size;
+            size_t user = total - sizeof(StormAllocHeader) - header->AlignPadding;
+            if (header->Flags & 0x1) user -= 2;
+            return user;
         }
 
         return 0;

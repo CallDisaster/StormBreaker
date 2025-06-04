@@ -193,7 +193,9 @@ namespace MemoryPool {
 
                 if (!IsBadReadPtr(header, sizeof(StormAllocHeader)) &&
                     header->Magic == STORM_MAGIC) {
-                    oldSize = header->Size;
+                    size_t total = header->Size;
+                    oldSize = total - sizeof(StormAllocHeader) - header->AlignPadding;
+                    if (header->Flags & 0x1) oldSize -= 2;
                 }
             }
             catch (...) {
