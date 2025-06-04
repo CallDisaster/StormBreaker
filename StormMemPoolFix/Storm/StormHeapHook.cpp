@@ -148,11 +148,7 @@ static size_t StormBlockGetTotalSize(const void* pBlock)
     {
         // => StormAllocHeader
         const StormAllocHeader* ah = reinterpret_cast<const StormAllocHeader*>(pBlock);
-        size_t total = ah->Size + sizeof(StormAllocHeader) + ah->AlignPadding;
-        // 如果 (ah->Flags & 0x1) => boundaryMagic, 可能还会多 2字节
-        // 不同版本Storm 里 boundaryMagic 不一定; 这里先演示不加
-        // if (ah->Flags & 0x1) total += 2; 
-        return total;
+        return ah->Size;
     }
 }
 

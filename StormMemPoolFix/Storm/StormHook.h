@@ -18,11 +18,11 @@
 // Storm结构体定义
 #pragma pack(push, 1)
 struct StormAllocHeader {
-    DWORD HeapPtr;      // 指向所属堆结构
-    DWORD Size;         // 用户数据区大小
-    BYTE  AlignPadding; // 对齐填充字节数
-    BYTE  Flags;        // 标志位: 0x1=魔数校验, 0x2=已释放, 0x4=大块VirtualAlloc, 0x8=特殊指针
-    WORD  Magic;        // 魔数 (0x6F6D)
+    WORD Size;          // 用户数据大小(不含头部和尾部)
+    BYTE AlignPadding;  // 对齐填充字节数
+    BYTE Flags;         // 标志位: 0x1=尾部哨兵, 0x2=已释放, 0x4=大块VirtualAlloc, 0x8=特殊指针
+    WORD HeapId;        // 高16位堆标识或特殊标记
+    WORD Magic;         // 魔数 (0x6F6D)
 };
 #pragma pack(pop)
 
@@ -95,8 +95,8 @@ typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, s
 typedef void(*StormHeap_CleanupAll_t)();
 
 // 常量定义
-constexpr DWORD STORM_MAGIC = 0x6F6D;        // Storm块头魔数 "mo"
-constexpr DWORD SPECIAL_MARKER = 0xC0DEFEED; // 特殊标记，表明是我们管理的块
+constexpr WORD  STORM_MAGIC = 0x6F6D;        // Storm块头魔数 "mo"
+constexpr WORD  SPECIAL_MARKER = 0xC0DE;    // 特殊标记，高位堆标识
 
 // 全局变量声明
 extern std::atomic<size_t> g_bigThreshold;      // 大块阈值
@@ -131,7 +131,6 @@ void CreateStabilizingBlocks(int cleanAllCount);
 bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);
 bool IsPermanentBlock(void* ptr);
 ResourceType GetResourceType(const char* name);
-bool AddExtraPool(size_t size, bool callerHasLock = false);
 void SafeExecuteCleanupAll();
 void SafelyDetachHooks();
 DWORD WINAPI MemoryStatsThread(LPVOID);
@@ -157,22 +156,6 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4);
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize, const char* name, DWORD src_line, DWORD flag);
 void Hooked_StormHeap_CleanupAll();
 
-
-// TLSF内存池封装
-namespace MemPool {
-    bool Initialize(size_t initialSize);
-    void Shutdown();
-    void* Allocate(size_t size);
-    void Free(void* ptr);
-    void* Realloc(void* oldPtr, size_t newSize);
-    size_t GetUsedSize();
-    size_t GetTotalSize();
-    void PrintStats();
-    bool IsFromPool(void* ptr);
-    void* AllocateSafe(size_t size);
-    void FreeSafe(void* ptr);
-    void* ReallocSafe(void* oldPtr, size_t newSize);
-}
 
 // 定义临时稳定块结构
 struct TempStabilizerBlock {
