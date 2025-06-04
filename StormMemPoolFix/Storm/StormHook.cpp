@@ -831,7 +831,7 @@ void SetupCompatibleHeader(void* userPtr, size_t size) {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
 
-        header->Size = static_cast<WORD>(size + sizeof(StormAllocHeader) + 2);
+        header->Size = static_cast<WORD>(size);
         header->AlignPadding = 0;
         header->Flags = 0x5;  // 大块VirtualAlloc + 尾部哨兵
         header->HeapId = SPECIAL_MARKER;

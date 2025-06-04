@@ -18,7 +18,7 @@
 // Storm结构体定义
 #pragma pack(push, 1)
 struct StormAllocHeader {
-    WORD Size;          // Block size including header and tail
+    WORD Size;          // 用户数据大小(不含头部和尾部)
     BYTE AlignPadding;  // 对齐填充字节数
     BYTE Flags;         // 标志位: 0x1=尾部哨兵, 0x2=已释放, 0x4=大块VirtualAlloc, 0x8=特殊指针
     WORD HeapId;        // 高16位堆标识或特殊标记
