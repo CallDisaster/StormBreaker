@@ -131,7 +131,6 @@ void CreateStabilizingBlocks(int cleanAllCount);
 bool IsSpecialBlockAllocation(size_t size, const char* name, DWORD src_line);
 bool IsPermanentBlock(void* ptr);
 ResourceType GetResourceType(const char* name);
-bool AddExtraPool(size_t size, bool callerHasLock = false);
 void SafeExecuteCleanupAll();
 void SafelyDetachHooks();
 DWORD WINAPI MemoryStatsThread(LPVOID);
@@ -157,22 +156,6 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4);
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize, const char* name, DWORD src_line, DWORD flag);
 void Hooked_StormHeap_CleanupAll();
 
-
-// TLSF内存池封装
-namespace MemPool {
-    bool Initialize(size_t initialSize);
-    void Shutdown();
-    void* Allocate(size_t size);
-    void Free(void* ptr);
-    void* Realloc(void* oldPtr, size_t newSize);
-    size_t GetUsedSize();
-    size_t GetTotalSize();
-    void PrintStats();
-    bool IsFromPool(void* ptr);
-    void* AllocateSafe(size_t size);
-    void FreeSafe(void* ptr);
-    void* ReallocSafe(void* oldPtr, size_t newSize);
-}
 
 // 定义临时稳定块结构
 struct TempStabilizerBlock {
