@@ -18,11 +18,11 @@
 // Storm结构体定义
 #pragma pack(push, 1)
 struct StormAllocHeader {
-    DWORD HeapPtr;      // 指向所属堆结构
-    DWORD Size;         // 用户数据区大小
-    BYTE  AlignPadding; // 对齐填充字节数
-    BYTE  Flags;        // 标志位: 0x1=魔数校验, 0x2=已释放, 0x4=大块VirtualAlloc, 0x8=特殊指针
-    WORD  Magic;        // 魔数 (0x6F6D)
+    WORD Size;          // Block size including header and tail
+    BYTE AlignPadding;  // 对齐填充字节数
+    BYTE Flags;         // 标志位: 0x1=尾部哨兵, 0x2=已释放, 0x4=大块VirtualAlloc, 0x8=特殊指针
+    WORD HeapId;        // 高16位堆标识或特殊标记
+    WORD Magic;         // 魔数 (0x6F6D)
 };
 #pragma pack(pop)
 
@@ -95,8 +95,8 @@ typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, s
 typedef void(*StormHeap_CleanupAll_t)();
 
 // 常量定义
-constexpr DWORD STORM_MAGIC = 0x6F6D;        // Storm块头魔数 "mo"
-constexpr DWORD SPECIAL_MARKER = 0xC0DEFEED; // 特殊标记，表明是我们管理的块
+constexpr WORD  STORM_MAGIC = 0x6F6D;        // Storm块头魔数 "mo"
+constexpr WORD  SPECIAL_MARKER = 0xC0DE;    // 特殊标记，高位堆标识
 
 // 全局变量声明
 extern std::atomic<size_t> g_bigThreshold;      // 大块阈值

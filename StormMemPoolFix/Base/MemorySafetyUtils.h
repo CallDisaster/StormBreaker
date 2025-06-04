@@ -103,7 +103,7 @@ public:
         }
 
         // 如果特殊标记
-        if (header->HeapPtr == SPECIAL_MARKER) {
+        if (header->HeapId == SPECIAL_MARKER) {
             return true;
         }
 
