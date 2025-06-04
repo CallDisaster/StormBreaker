@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include "StormHook.h"
 #include "StormOffsets.h"
 #include <Windows.h>
@@ -833,9 +833,9 @@ void SetupCompatibleHeader(void* userPtr, size_t size) {
     __try {
         StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
             static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
-
         WORD total = static_cast<WORD>(sizeof(StormAllocHeader) + size + 2);
         header->Size = total;            // 头部存储总大小
+        header->Size = static_cast<WORD>(size + sizeof(StormAllocHeader) + 2);
         header->AlignPadding = 0;
         header->Flags = 0x5;  // 大块VirtualAlloc + 尾部哨兵
         header->HeapId = SPECIAL_MARKER;
@@ -984,9 +984,6 @@ void* AllocateJassVMMemory(size_t size) {
 
     return userPtr;
 }
-
-///////////////////////////////////////////////////////////////////////////////
-// TLSF 内存池实现
 
 ///////////////////////////////////////////////////////////////////////////////
 // 统计信息线程
