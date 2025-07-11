@@ -1,13 +1,16 @@
-﻿#pragma once
+﻿// StormHook.h - 修复后的Storm Hook系统
+#pragma once
 
 #include "pch.h"
 #include "StormOffsets.h"
 #include <Windows.h>
 #include <atomic>
 #include <cstddef>
+#include <vector>
+#include <mutex>
 
 ///////////////////////////////////////////////////////////////////////////////
-// Storm结构体定义 - 基于逆向文档
+// Storm结构体定义 - 基于IDA Pro逆向分析
 ///////////////////////////////////////////////////////////////////////////////
 
 #pragma pack(push, 1)
@@ -36,7 +39,7 @@ constexpr size_t DEFAULT_BIG_BLOCK_THRESHOLD = 128 * 1024;  // 128KB
 constexpr size_t JASSVM_BLOCK_SIZE = 0x28A8;                // JassVM特殊块大小
 
 ///////////////////////////////////////////////////////////////////////////////
-// Storm函数类型定义
+// Storm函数类型定义 - 基于IDA Pro确认的地址
 ///////////////////////////////////////////////////////////////////////////////
 
 typedef size_t(__fastcall* Storm_MemAlloc_t)(int ecx, int edx, size_t size,
@@ -45,6 +48,55 @@ typedef int(__stdcall* Storm_MemFree_t)(int a1, char* name, int argList, int a4)
 typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, size_t newSize,
     const char* name, DWORD src_line, DWORD flag);
 typedef void(*StormHeap_CleanupAll_t)();
+
+///////////////////////////////////////////////////////////////////////////////
+// SEH安全包装 - 修复语法问题的版本
+///////////////////////////////////////////////////////////////////////////////
+
+// 简单的SEH包装宏，接受代码块
+#define SAFE_CALL_BOOL(operation, code_block) \
+    do { \
+        __try { \
+            code_block \
+        } \
+        __except (EXCEPTION_EXECUTE_HANDLER) { \
+            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
+            return false; \
+        } \
+    } while(0)
+
+#define SAFE_CALL_PTR(operation, code_block) \
+    do { \
+        __try { \
+            code_block \
+        } \
+        __except (EXCEPTION_EXECUTE_HANDLER) { \
+            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
+            return nullptr; \
+        } \
+    } while(0)
+
+#define SAFE_CALL_VOID(operation, code_block) \
+    do { \
+        __try { \
+            code_block \
+        } \
+        __except (EXCEPTION_EXECUTE_HANDLER) { \
+            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
+            return; \
+        } \
+    } while(0)
+
+#define SAFE_CALL_INT(operation, code_block) \
+    do { \
+        __try { \
+            code_block \
+        } \
+        __except (EXCEPTION_EXECUTE_HANDLER) { \
+            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
+            return 0; \
+        } \
+    } while(0)
 
 ///////////////////////////////////////////////////////////////////////////////
 // 全局状态变量声明
@@ -76,6 +128,27 @@ extern std::atomic<int> g_cleanAllCounter;
 extern thread_local bool tls_inCleanAll;
 
 ///////////////////////////////////////////////////////////////////////////////
+// 永久块管理
+///////////////////////////////////////////////////////////////////////////////
+
+class ThreadSafePermanentBlocks {
+private:
+    mutable CRITICAL_SECTION m_cs;
+    std::vector<void*> m_blocks;
+
+public:
+    ThreadSafePermanentBlocks() noexcept;
+    ~ThreadSafePermanentBlocks() noexcept;
+
+    void Add(void* ptr) noexcept;
+    bool Contains(void* ptr) const noexcept;
+    void Clear() noexcept;
+    size_t Size() const noexcept;
+};
+
+extern ThreadSafePermanentBlocks g_permanentBlocks;
+
+///////////////////////////////////////////////////////////////////////////////
 // 主要接口函数
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -83,19 +156,19 @@ extern thread_local bool tls_inCleanAll;
  * 初始化Storm内存Hook系统
  * @return 成功返回true，失败返回false
  */
-bool InitializeStormMemoryHooks();
+bool InitializeStormMemoryHooks() noexcept;
 
 /**
  * 关闭Storm内存Hook系统
  * 安全卸载所有Hook并清理资源
  */
-void ShutdownStormMemoryHooks();
+void ShutdownStormMemoryHooks() noexcept;
 
 /**
  * 检查Hook系统是否已初始化
  * @return 已初始化返回true
  */
-bool IsHooksInitialized();
+bool IsHooksInitialized() noexcept;
 
 ///////////////////////////////////////////////////////////////////////////////
 // 配置和监控接口
@@ -106,7 +179,7 @@ bool IsHooksInitialized();
  * 超过此大小的分配将使用MemoryPool管理
  * @param sizeInBytes 阈值大小（字节）
  */
-void SetBigBlockThreshold(size_t sizeInBytes);
+void SetBigBlockThreshold(size_t sizeInBytes) noexcept;
 
 /**
  * 获取内存统计信息
@@ -115,24 +188,23 @@ void SetBigBlockThreshold(size_t sizeInBytes);
  * @param allocCount 分配次数
  * @param freeCount 释放次数
  */
-void GetMemoryStatistics(size_t& allocated, size_t& freed, size_t& allocCount, size_t& freeCount);
+void GetMemoryStatistics(size_t& allocated, size_t& freed, size_t& allocCount, size_t& freeCount) noexcept;
 
 /**
  * 打印当前内存状态到日志
  */
-void PrintMemoryStatus();
+void PrintMemoryStatus() noexcept;
 
 /**
  * 强制触发内存清理
  * 立即清理MemoryPool中的缓存和队列
  */
-void ForceMemoryCleanup();
+void ForceMemoryCleanup() noexcept;
 
 ///////////////////////////////////////////////////////////////////////////////
-// Hook函数声明
+// Hook函数声明 - 内部使用
 ///////////////////////////////////////////////////////////////////////////////
 
-// 这些函数是内部实现，外部代码不应直接调用
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
     const char* name, DWORD src_line, DWORD flag);
 int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4);
@@ -150,6 +222,13 @@ void Hooked_StormHeap_CleanupAll();
  * @param ... 参数
  */
 void LogMessage(const char* format, ...) noexcept;
+
+/**
+ * 错误日志记录函数
+ * @param format 格式字符串
+ * @param ... 参数
+ */
+void LogError(const char* format, ...) noexcept;
 
 /**
  * 检查指针是否为永久稳定块
@@ -172,20 +251,45 @@ bool IsJassVMAllocation(size_t size, const char* name) noexcept;
  */
 size_t GetProcessVirtualMemoryUsage() noexcept;
 
+/**
+ * 创建永久稳定块
+ * @param count 创建数量
+ * @param reason 创建原因
+ */
+void CreatePermanentStabilizers(int count, const char* reason) noexcept;
+
+/**
+ * 创建临时稳定块
+ * @param cleanAllCount CleanAll计数
+ */
+void CreateTemporaryStabilizers(int cleanAllCount) noexcept;
+
 ///////////////////////////////////////////////////////////////////////////////
-// SEH异常安全包装
+// 初始化相关函数
 ///////////////////////////////////////////////////////////////////////////////
 
 /**
- * SEH异常安全执行模板
- * 捕获异常并返回默认值，确保不会崩溃
- * @param func 要执行的函数
- * @param operation 操作名称（用于日志）
- * @param defaultValue 异常时返回的默认值
- * @return 函数执行结果或默认值
+ * 初始化日志系统
+ * @return 成功返回true
  */
-template<typename Func>
-auto SafeExecute(Func&& func, const char* operation, auto defaultValue) noexcept -> decltype(func());
+bool InitializeLogging() noexcept;
+
+/**
+ * 查找Storm函数地址
+ * @return 成功返回true
+ */
+bool FindStormFunctions() noexcept;
+
+/**
+ * 安装Hook
+ * @return 成功返回true
+ */
+bool InstallHooks() noexcept;
+
+/**
+ * 卸载Hook
+ */
+void UninstallHooks() noexcept;
 
 ///////////////////////////////////////////////////////////////////////////////
 // 兼容性说明

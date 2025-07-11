@@ -1,4 +1,4 @@
-﻿// MemoryPool.cpp - 基于MemorySafety的完整重写版本
+﻿// MemoryPool.cpp - 修复后的内存池实现
 #include "pch.h"
 #include "MemoryPool.h"
 #include <iostream>
@@ -9,32 +9,6 @@
 #include <cassert>
 
 #pragma comment(lib, "psapi.lib")
-
-// SEH安全包装模板实现
-template<typename Func>
-auto MemoryPool::SafeExecute(Func&& func, const char* operation) noexcept -> decltype(func()) {
-    __try {
-        return func();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogError("[MemoryPool] 异常在操作 %s: 0x%08X", operation, GetExceptionCode());
-
-        using ReturnType = decltype(func());
-        if constexpr (std::is_pointer_v<ReturnType>) {
-            return nullptr;
-        }
-        else if constexpr (std::is_same_v<ReturnType, bool>) {
-            return false;
-        }
-        else if constexpr (std::is_arithmetic_v<ReturnType>) {
-            return static_cast<ReturnType>(0);
-        }
-        else {
-            return ReturnType{};
-        }
-    }
-}
-
 
 // 常量定义
 namespace {
@@ -61,7 +35,7 @@ namespace JVM_MemPool {
 
     static alignas(64) char s_poolMemory[JVM_POOL_CAPACITY][JVM_BLOCK_SIZE + sizeof(JVMBlock)];
     static bool s_usedFlags[JVM_POOL_CAPACITY];
-    static std::mutex s_poolMutex;
+    static CRITICAL_SECTION s_poolCs;
     static std::atomic<bool> s_initialized{ false };
     static std::atomic<size_t> s_allocatedCount{ 0 };
 
@@ -70,9 +44,9 @@ namespace JVM_MemPool {
     }
 
     void Initialize() {
-        std::lock_guard<std::mutex> lock(s_poolMutex);
         if (s_initialized.exchange(true)) return;
 
+        InitializeCriticalSection(&s_poolCs);
         memset(s_usedFlags, 0, sizeof(s_usedFlags));
         s_allocatedCount = 0;
     }
@@ -80,8 +54,9 @@ namespace JVM_MemPool {
     void* Allocate(std::size_t size) {
         if (size != JVM_BLOCK_SIZE) return nullptr;
 
-        std::lock_guard<std::mutex> lock(s_poolMutex);
+        EnterCriticalSection(&s_poolCs);
 
+        void* result = nullptr;
         for (size_t i = 0; i < JVM_POOL_CAPACITY; i++) {
             if (!s_usedFlags[i]) {
                 s_usedFlags[i] = true;
@@ -92,38 +67,36 @@ namespace JVM_MemPool {
                 header->index = static_cast<uint32_t>(i);
                 header->checksum = CalculateChecksum(header);
 
-                void* userPtr = &s_poolMemory[i][sizeof(JVMBlock)];
-                memset(userPtr, 0, JVM_BLOCK_SIZE);
-
+                result = &s_poolMemory[i][sizeof(JVMBlock)];
+                memset(result, 0, JVM_BLOCK_SIZE);
                 s_allocatedCount.fetch_add(1);
-                return userPtr;
+                break;
             }
         }
-        return nullptr;
+
+        LeaveCriticalSection(&s_poolCs);
+        return result;
     }
 
     void Free(void* p) {
         if (!p || !IsFromPool(p)) return;
 
-        std::lock_guard<std::mutex> lock(s_poolMutex);
+        EnterCriticalSection(&s_poolCs);
 
         JVMBlock* header = reinterpret_cast<JVMBlock*>(static_cast<char*>(p) - sizeof(JVMBlock));
 
-        if (header->magic != JVM_MAGIC || header->checksum != CalculateChecksum(header)) {
-            return; // 无效块
+        if (header->magic == JVM_MAGIC && header->checksum == CalculateChecksum(header)) {
+            size_t index = header->index;
+            if (index < JVM_POOL_CAPACITY && s_usedFlags[index]) {
+                header->magic = JVM_MAGIC_FREED;
+                header->checksum = 0;
+                memset(p, 0xDD, JVM_BLOCK_SIZE);
+                s_usedFlags[index] = false;
+                s_allocatedCount.fetch_sub(1);
+            }
         }
 
-        size_t index = header->index;
-        if (index >= JVM_POOL_CAPACITY || !s_usedFlags[index]) {
-            return; // 双重释放
-        }
-
-        header->magic = JVM_MAGIC_FREED;
-        header->checksum = 0;
-        memset(p, 0xDD, JVM_BLOCK_SIZE);
-
-        s_usedFlags[index] = false;
-        s_allocatedCount.fetch_sub(1);
+        LeaveCriticalSection(&s_poolCs);
     }
 
     void* Realloc(void* oldPtr, std::size_t newSize) {
@@ -154,18 +127,22 @@ namespace JVM_MemPool {
     }
 
     void Cleanup() {
-        std::lock_guard<std::mutex> lock(s_poolMutex);
+        if (!s_initialized.exchange(false)) return;
+
+        EnterCriticalSection(&s_poolCs);
         size_t leakedBlocks = s_allocatedCount.load();
         if (leakedBlocks > 0) {
             printf("[JVM_MemPool] 清理完成，检测到%zu个泄漏块\n", leakedBlocks);
         }
         memset(s_usedFlags, 0, sizeof(s_usedFlags));
         s_allocatedCount = 0;
-        s_initialized = false;
+        LeaveCriticalSection(&s_poolCs);
+
+        DeleteCriticalSection(&s_poolCs);
     }
 }
 
-// 小块内存池简化实现（直接使用系统分配）
+// 小块内存池简化实现
 namespace SmallBlockPool {
     static std::atomic<bool> s_initialized{ false };
 
@@ -183,12 +160,10 @@ namespace SmallBlockPool {
     void* Allocate(std::size_t size) {
         if (!ShouldIntercept(size)) return nullptr;
 
-        // 简化实现：直接使用系统分配
         size_t totalSize = size + 16; // 简单头部
         void* ptr = VirtualAlloc(NULL, totalSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!ptr) return nullptr;
 
-        // 设置简单头部
         *reinterpret_cast<size_t*>(ptr) = size;
         return static_cast<char*>(ptr) + 16;
     }
@@ -223,7 +198,7 @@ MemoryPool::~MemoryPool() noexcept {
 }
 
 bool MemoryPool::Initialize(const MemoryPoolConfig& config) noexcept {
-    return SafeExecute([this, &config]() -> bool {
+    return SafeExecuteNonConst([this, &config]() -> bool {
         bool expected = false;
         if (!m_initialized.compare_exchange_strong(expected, true)) {
             return true; // 已初始化
@@ -272,7 +247,7 @@ bool MemoryPool::Initialize(const MemoryPoolConfig& config) noexcept {
         StartBackgroundTasks();
 
         // 重置统计
-        m_stats.Reset();
+        ResetStatistics();
 
         LogMessage("[MemoryPool] 初始化完成");
         return true;
@@ -281,7 +256,7 @@ bool MemoryPool::Initialize(const MemoryPoolConfig& config) noexcept {
 }
 
 void MemoryPool::Shutdown() noexcept {
-    SafeExecute([this]() -> void {
+    SafeExecuteNonConst([this]() -> void {
         bool expected = true;
         if (!m_initialized.compare_exchange_strong(expected, false)) {
             return; // 已关闭
@@ -339,12 +314,12 @@ void* MemoryPool::ReallocSafe(void* oldPtr, size_t newSize, const char* sourceNa
 }
 
 void* MemoryPool::InternalAllocate(size_t size, const char* sourceName, DWORD sourceLine, bool useFallback) noexcept {
-    return SafeExecute([this, size, sourceName, sourceLine, useFallback]() -> void* {
+    return SafeExecuteNonConst([this, size, sourceName, sourceLine, useFallback]() -> void* {
         if (!m_initialized.load()) {
             return nullptr;
         }
 
-        m_stats.allocCount.fetch_add(1);
+        m_allocCount.fetch_add(1);
 
         // 特殊处理JVM块
         if (size == JVM_BLOCK_SIZE) {
@@ -374,7 +349,7 @@ void* MemoryPool::InternalAllocate(size_t size, const char* sourceName, DWORD so
         if (IsLargeBlock(size)) {
             void* largePtr = m_memorySafety.AllocateBlock(size, sourceName, sourceLine);
             if (largePtr) {
-                m_stats.cacheHits.fetch_add(1);
+                m_cacheHits.fetch_add(1);
                 UpdateMemoryStats(size, true);
                 if (m_config.enableDetailedLogging) {
                     LogDebug("[MemoryPool] 大块分配: %p, 大小:%zu, 来源:%s:%u",
@@ -382,7 +357,7 @@ void* MemoryPool::InternalAllocate(size_t size, const char* sourceName, DWORD so
                 }
                 return largePtr;
             }
-            m_stats.cacheMisses.fetch_add(1);
+            m_cacheMisses.fetch_add(1);
         }
 
         // 回退到系统分配
@@ -403,12 +378,12 @@ void* MemoryPool::InternalAllocate(size_t size, const char* sourceName, DWORD so
 }
 
 bool MemoryPool::InternalFree(void* ptr, bool useFallback) noexcept {
-    return SafeExecute([this, ptr, useFallback]() -> bool {
+    return SafeExecuteNonConst([this, ptr, useFallback]() -> bool {
         if (!ptr || !m_initialized.load()) {
             return false;
         }
 
-        m_stats.freeCount.fetch_add(1);
+        m_freeCount.fetch_add(1);
 
         // 检查JVM池
         if (JVM_MemPool::IsFromPool(ptr)) {
@@ -463,12 +438,12 @@ bool MemoryPool::InternalFree(void* ptr, bool useFallback) noexcept {
 }
 
 void* MemoryPool::InternalRealloc(void* oldPtr, size_t newSize, const char* sourceName, DWORD sourceLine, bool useFallback) noexcept {
-    return SafeExecute([this, oldPtr, newSize, sourceName, sourceLine, useFallback]() -> void* {
+    return SafeExecuteNonConst([this, oldPtr, newSize, sourceName, sourceLine, useFallback]() -> void* {
         if (!m_initialized.load()) {
             return nullptr;
         }
 
-        m_stats.reallocCount.fetch_add(1);
+        m_reallocCount.fetch_add(1);
 
         if (!oldPtr) {
             return InternalAllocate(newSize, sourceName, sourceLine, useFallback);
@@ -525,7 +500,7 @@ void* MemoryPool::InternalRealloc(void* oldPtr, size_t newSize, const char* sour
 }
 
 bool MemoryPool::IsFromPool(void* ptr) const noexcept {
-    return SafeExecute([this, ptr]() -> bool {
+    return SafeExecuteNonConst([this, ptr]() -> bool {
         if (!ptr || !m_initialized.load()) {
             return false;
         }
@@ -536,7 +511,7 @@ bool MemoryPool::IsFromPool(void* ptr) const noexcept {
 }
 
 size_t MemoryPool::GetBlockSize(void* ptr) const noexcept {
-    return SafeExecute([this, ptr]() -> size_t {
+    return SafeExecuteNonConst([this, ptr]() -> size_t {
         if (!ptr || !m_initialized.load()) {
             return 0;
         }
@@ -556,12 +531,12 @@ bool MemoryPool::IsLargeBlock(size_t size) const noexcept {
 }
 
 void MemoryPool::CheckMemoryPressure() noexcept {
-    SafeExecute([this]() -> void {
+    SafeExecuteNonConst([this]() -> void {
         if (!m_config.enableMemoryPressureMonitoring) {
             return;
         }
 
-        DWORD currentTime = GetTickCount();
+        DWORD currentTime = MemorySafetyUtils::GetTickCount();
         DWORD lastCleanup = m_lastCleanupTime.load();
 
         if (currentTime - lastCleanup < MIN_CLEANUP_INTERVAL) {
@@ -571,17 +546,17 @@ void MemoryPool::CheckMemoryPressure() noexcept {
         if (IsMemoryUnderPressure()) {
             LogMessage("[MemoryPool] 检测到内存压力，触发清理");
             ForceCleanup();
-            m_stats.pressureCleanups.fetch_add(1);
+            m_pressureCleanups.fetch_add(1);
         }
 
         }, "CheckMemoryPressure");
 }
 
 void MemoryPool::ForceCleanup() noexcept {
-    SafeExecute([this]() -> void {
+    SafeExecuteNonConst([this]() -> void {
         LogMessage("[MemoryPool] 开始强制清理");
 
-        DWORD currentTime = GetTickCount();
+        DWORD currentTime = MemorySafetyUtils::GetTickCount();
         m_lastCleanupTime.store(currentTime);
 
         // 清理MemorySafety缓存
@@ -596,12 +571,12 @@ void MemoryPool::ForceCleanup() noexcept {
 }
 
 void MemoryPool::TriggerStormCleanup() noexcept {
-    SafeExecute([this]() -> void {
+    SafeExecuteNonConst([this]() -> void {
         if (!m_stormCleanupFunc) {
             return;
         }
 
-        DWORD currentTime = GetTickCount();
+        DWORD currentTime = MemorySafetyUtils::GetTickCount();
         DWORD lastStormCleanup = m_lastStormCleanupTime.load();
 
         if (currentTime - lastStormCleanup < MIN_STORM_CLEANUP_INTERVAL) {
@@ -613,7 +588,7 @@ void MemoryPool::TriggerStormCleanup() noexcept {
 
         __try {
             m_stormCleanupFunc();
-            m_stats.stormCleanupTriggers.fetch_add(1);
+            m_stormCleanupTriggers.fetch_add(1);
             LogMessage("[MemoryPool] Storm清理完成");
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -624,7 +599,7 @@ void MemoryPool::TriggerStormCleanup() noexcept {
 }
 
 void MemoryPool::StartBackgroundTasks() noexcept {
-    SafeExecute([this]() -> void {
+    SafeExecuteNonConst([this]() -> void {
         if (m_backgroundTaskRunning.exchange(true)) {
             return; // 已在运行
         }
@@ -636,7 +611,7 @@ void MemoryPool::StartBackgroundTasks() noexcept {
 }
 
 void MemoryPool::StopBackgroundTasks() noexcept {
-    SafeExecute([this]() -> void {
+    SafeExecuteNonConst([this]() -> void {
         m_shutdownRequested.store(true);
         m_backgroundTaskRunning.store(false);
 
@@ -681,8 +656,8 @@ void MemoryPool::BackgroundTaskLoop() noexcept {
 }
 
 void MemoryPool::RunPeriodicTasks() noexcept {
-    SafeExecute([this]() -> void {
-        DWORD currentTime = GetTickCount();
+    SafeExecuteNonConst([this]() -> void {
+        DWORD currentTime = MemorySafetyUtils::GetTickCount();
 
         // 处理Hold队列
         if (m_config.enablePeriodicCleanup) {
@@ -706,33 +681,33 @@ void MemoryPool::RunPeriodicTasks() noexcept {
 }
 
 void MemoryPool::ProcessHoldQueue() noexcept {
-    SafeExecute([this]() -> void {
+    SafeExecuteNonConst([this]() -> void {
         m_memorySafety.ProcessHoldQueue();
         }, "ProcessHoldQueue");
 }
 
 void MemoryPool::UpdateMemoryStats(size_t size, bool isAllocation) noexcept {
     if (isAllocation) {
-        m_stats.totalAllocated.fetch_add(size);
-        m_stats.currentInUse.fetch_add(size);
+        m_totalAllocated.fetch_add(size);
+        m_currentInUse.fetch_add(size);
 
         // 更新峰值
-        size_t currentUsage = m_stats.currentInUse.load();
-        size_t peakUsage = m_stats.peakUsage.load();
+        size_t currentUsage = m_currentInUse.load();
+        size_t peakUsage = m_peakUsage.load();
         while (currentUsage > peakUsage) {
-            if (m_stats.peakUsage.compare_exchange_weak(peakUsage, currentUsage)) {
+            if (m_peakUsage.compare_exchange_weak(peakUsage, currentUsage)) {
                 break;
             }
         }
     }
     else {
-        m_stats.totalFreed.fetch_add(size);
-        m_stats.currentInUse.fetch_sub(size);
+        m_totalFreed.fetch_add(size);
+        m_currentInUse.fetch_sub(size);
     }
 }
 
 bool MemoryPool::IsMemoryUnderPressure() const noexcept {
-    return SafeExecute([this]() -> bool {
+    return SafeExecuteNonConst([this]() -> bool {
         size_t currentVM = MemoryPoolUtils::GetProcessVirtualMemoryUsage();
         size_t watermarkBytes = m_config.memoryWatermarkMB * 1024 * 1024;
 
@@ -742,25 +717,29 @@ bool MemoryPool::IsMemoryUnderPressure() const noexcept {
 }
 
 MemoryPoolStats MemoryPool::GetStats() const noexcept {
-    return m_stats;
+    return MemoryPoolStats::FromAtomics(
+        m_totalAllocated, m_totalFreed, m_currentInUse, m_peakUsage,
+        m_allocCount, m_freeCount, m_reallocCount,
+        m_cacheHits, m_cacheMisses, m_stormCleanupTriggers, m_pressureCleanups
+    );
 }
 
 void MemoryPool::PrintStatistics() const noexcept {
-    SafeExecute([this]() -> void {
-        MemoryPoolStats stats = m_stats;
+    SafeExecuteNonConst([this]() -> void {
+        MemoryPoolStats stats = GetStats();
 
         LogMessage("[MemoryPool] === 统计报告 ===");
         LogMessage("  分配: 总计=%zuMB, 次数=%zu",
-            stats.totalAllocated.load() / (1024 * 1024), stats.allocCount.load());
+            stats.totalAllocated / (1024 * 1024), stats.allocCount);
         LogMessage("  释放: 总计=%zuMB, 次数=%zu",
-            stats.totalFreed.load() / (1024 * 1024), stats.freeCount.load());
+            stats.totalFreed / (1024 * 1024), stats.freeCount);
         LogMessage("  使用中: %zuMB (峰值: %zuMB)",
-            stats.currentInUse.load() / (1024 * 1024), stats.peakUsage.load() / (1024 * 1024));
-        LogMessage("  重分配: %zu次", stats.reallocCount.load());
+            stats.currentInUse / (1024 * 1024), stats.peakUsage / (1024 * 1024));
+        LogMessage("  重分配: %zu次", stats.reallocCount);
         LogMessage("  缓存: 命中=%zu, 未命中=%zu, 命中率=%.1f%%",
-            stats.cacheHits.load(), stats.cacheMisses.load(), GetCacheHitRate());
+            stats.cacheHits, stats.cacheMisses, GetCacheHitRate());
         LogMessage("  清理: Storm=%zu次, 压力=%zu次",
-            stats.stormCleanupTriggers.load(), stats.pressureCleanups.load());
+            stats.stormCleanupTriggers, stats.pressureCleanups);
 
         // MemorySafety统计
         LogMessage("  MemorySafety: 缓存=%zuMB, 队列=%zu",
@@ -775,8 +754,8 @@ void MemoryPool::PrintStatistics() const noexcept {
 }
 
 double MemoryPool::GetCacheHitRate() const noexcept {
-    size_t hits = m_stats.cacheHits.load();
-    size_t misses = m_stats.cacheMisses.load();
+    size_t hits = m_cacheHits.load();
+    size_t misses = m_cacheMisses.load();
     size_t total = hits + misses;
 
     return total > 0 ? (hits * 100.0 / total) : 0.0;
@@ -799,6 +778,32 @@ void MemoryPool::UpdateConfig(const MemoryPoolConfig& config) noexcept {
 MemoryPoolConfig MemoryPool::GetConfig() const noexcept {
     std::lock_guard<std::mutex> lock(m_configMutex);
     return m_config;
+}
+
+void MemoryPool::ResetStatistics() noexcept {
+    m_totalAllocated = 0;
+    m_totalFreed = 0;
+    m_currentInUse = 0;
+    m_peakUsage = 0;
+    m_allocCount = 0;
+    m_freeCount = 0;
+    m_reallocCount = 0;
+    m_cacheHits = 0;
+    m_cacheMisses = 0;
+    m_stormCleanupTriggers = 0;
+    m_pressureCleanups = 0;
+}
+
+size_t MemoryPool::GetCurrentMemoryUsage() const noexcept {
+    return m_currentInUse.load();
+}
+
+size_t MemoryPool::GetPeakMemoryUsage() const noexcept {
+    return m_peakUsage.load();
+}
+
+size_t MemoryPool::GetCacheSize() const noexcept {
+    return m_memorySafety.GetTotalCached();
 }
 
 // 日志函数实现
@@ -895,11 +900,11 @@ namespace MemPool {
     }
 
     size_t GetUsedSize() noexcept {
-        return g_MemoryPool.GetStats().currentInUse.load();
+        return g_MemoryPool.GetCurrentMemoryUsage();
     }
 
     size_t GetTotalSize() noexcept {
-        return g_MemoryPool.GetStats().peakUsage.load();
+        return g_MemoryPool.GetPeakMemoryUsage();
     }
 
     void PrintStats() noexcept {
@@ -911,14 +916,12 @@ namespace MemPool {
     }
 
     void DisableActualFree() noexcept {
-        // 在新架构中，这通过配置控制
         MemoryPoolConfig config = g_MemoryPool.GetConfig();
         config.holdBufferTimeMs = MAXDWORD; // 永不超时
         g_MemoryPool.UpdateConfig(config);
     }
 
     void DisableMemoryReleasing() noexcept {
-        // 类似上面，通过配置禁用清理
         MemoryPoolConfig config = g_MemoryPool.GetConfig();
         config.enablePeriodicCleanup = false;
         config.enableMemoryPressureMonitoring = false;
@@ -926,7 +929,6 @@ namespace MemPool {
     }
 
     void* CreateStabilizingBlock(size_t size, const char* purpose) noexcept {
-        // 创建一个永不释放的块
         void* ptr = g_MemoryPool.AllocateSafe(size, purpose, 0);
         if (ptr) {
             printf("[MemPool] 创建稳定化块: %p (大小:%zu, 用途:%s)\n",
@@ -1005,7 +1007,7 @@ namespace MemoryPoolUtils {
     }
 
     DWORD GetTickCount() noexcept {
-        return ::GetTickCount();
+        return static_cast<DWORD>(::GetTickCount64() & 0xFFFFFFFF);
     }
 
     bool HasTimeElapsed(DWORD startTime, DWORD intervalMs) noexcept {
