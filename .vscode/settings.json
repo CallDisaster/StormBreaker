@@ -1,5 +1,5 @@
 {
-    "cmake.sourceDirectory": "E:/Mycode/C++/StormBreaker/StormMemPoolFix/StormMemPoolFix",
+    "cmake.sourceDirectory": "D:/Mycode/Source/Repos/StormBreaker/StormMemPoolFix",
     "files.associations": {
         "shared_mutex": "cpp"
     }

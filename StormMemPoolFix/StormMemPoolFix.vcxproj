@@ -72,7 +72,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <OutDir>E:\Work\War3\StormBreaker</OutDir>
+    <OutDir>D:\Work\War3\StormBreaker</OutDir>
     <ExternalIncludePath>$(ProjectDir)Dependencies\nlohmann\include;$(ProjectDir)Dependencies\Detours\include;$(ProjectDir)Dependencies\mimalloc-dev\include;$(ProjectDir)Dependencies\spdlog\include;$(ProjectDir)Dependencies\tlsf;$(ExternalIncludePath)</ExternalIncludePath>
     <IncludePath>$(ProjectDir);$(IncludePath)</IncludePath>
     <LibraryPath>E:\Mycode\C++\StormMemPoolFix\StormMemPoolFix\StormMemPoolFix\Dependencies\mimalloc-dev\build\Release;$(ProjectDir)\Dependencies\Detours\lib.X86;$(LibraryPath)</LibraryPath>
@@ -153,6 +153,7 @@
   <ItemGroup>
     <ClInclude Include="Base\fp_call.h" />
     <ClInclude Include="Base\MemorySafety.h" />
+    <ClInclude Include="Base\SmartMemoryManager.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="Game\GameDllReverse\AIL.h" />
     <ClInclude Include="Game\GameHook.h" />
@@ -171,6 +172,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Base\MemroySafety.cpp" />
+    <ClCompile Include="Base\SmartMemoryManger.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="Game\GameDllReverse\AIL.cpp" />
     <ClCompile Include="Game\GameHook.cpp" />
