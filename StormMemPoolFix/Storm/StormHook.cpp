@@ -1,30 +1,19 @@
-﻿#include "pch.h"
+﻿// StormHook.cpp - 修复后的Storm Hook实现
+#include "pch.h"
 #include "StormHook.h"
 #include "StormOffsets.h"
 #include "MemoryPool.h"
-#include "Base/MemorySafety.h"
 #include <Windows.h>
 #include <detours.h>
 #include <vector>
 #include <atomic>
 #include <mutex>
-#include <shared_mutex>
 #include <thread>
 #include <condition_variable>
 #include <Psapi.h>
 
-///////////////////////////////////////////////////////////////////////////////
-// 全局常量和配置
-///////////////////////////////////////////////////////////////////////////////
-
-// 大块阈值配置
-constexpr size_t DEFAULT_BIG_BLOCK_THRESHOLD = 128 * 1024;  // 128KB
-constexpr size_t JASSVM_BLOCK_SIZE = 0x28A8;                // JassVM特殊块大小
-
-// Storm兼容魔数
-constexpr WORD STORM_FRONT_MAGIC = 0x6F6D;
-constexpr WORD STORM_TAIL_MAGIC = 0x12B1;
-constexpr DWORD STORM_SPECIAL_HEAP = 0xC0DEFEED;
+#pragma comment(lib, "detours.lib")
+#pragma comment(lib, "psapi.lib")
 
 ///////////////////////////////////////////////////////////////////////////////
 // 全局变量定义
@@ -45,7 +34,7 @@ std::atomic<size_t> g_totalFreed{ 0 };
 std::atomic<size_t> g_hookAllocCount{ 0 };
 std::atomic<size_t> g_hookFreeCount{ 0 };
 
-// Storm函数指针
+// Storm函数指针 - 基于IDA Pro确认的地址
 Storm_MemAlloc_t s_origStormAlloc = nullptr;
 Storm_MemFree_t s_origStormFree = nullptr;
 Storm_MemReAlloc_t s_origStormReAlloc = nullptr;
@@ -55,72 +44,83 @@ StormHeap_CleanupAll_t s_origCleanupAll = nullptr;
 std::atomic<int> g_cleanAllCounter{ 0 };
 thread_local bool tls_inCleanAll = false;
 
-// 永久稳定块管理
-class ThreadSafePermanentBlocks {
-private:
-    mutable std::shared_mutex m_mutex;
-    std::vector<void*> m_blocks;
+// 日志相关
+static CRITICAL_SECTION g_logCs;
+static FILE* g_logFile = nullptr;
+static bool g_logInitialized = false;
 
-public:
-    void Add(void* ptr) {
-        std::unique_lock<std::shared_mutex> lock(m_mutex);
+///////////////////////////////////////////////////////////////////////////////
+// 永久稳定块管理实现
+///////////////////////////////////////////////////////////////////////////////
+
+ThreadSafePermanentBlocks::ThreadSafePermanentBlocks() noexcept {
+    InitializeCriticalSection(&m_cs);
+}
+
+ThreadSafePermanentBlocks::~ThreadSafePermanentBlocks() noexcept {
+    Clear();
+    DeleteCriticalSection(&m_cs);
+}
+
+void ThreadSafePermanentBlocks::Add(void* ptr) noexcept {
+    if (!ptr) return;
+
+    SAFE_CALL_VOID("ThreadSafePermanentBlocks::Add", {
+        EnterCriticalSection(&m_cs);
         m_blocks.push_back(ptr);
-    }
+        LeaveCriticalSection(&m_cs);
+        });
+}
 
-    bool Contains(void* ptr) const {
-        std::shared_lock<std::shared_mutex> lock(m_mutex);
-        return std::find(m_blocks.begin(), m_blocks.end(), ptr) != m_blocks.end();
-    }
+bool ThreadSafePermanentBlocks::Contains(void* ptr) const noexcept {
+    if (!ptr) return false;
 
-    void Clear() {
-        std::unique_lock<std::shared_mutex> lock(m_mutex);
+    bool found = false;
+    SAFE_CALL_BOOL("ThreadSafePermanentBlocks::Contains", {
+        EnterCriticalSection(&m_cs);
+        for (void* block : m_blocks) {
+            if (block == ptr) {
+                found = true;
+                break;
+            }
+        }
+        LeaveCriticalSection(&m_cs);
+        return found;
+        });
+
+    return found;
+}
+
+void ThreadSafePermanentBlocks::Clear() noexcept {
+    SAFE_CALL_VOID("ThreadSafePermanentBlocks::Clear", {
+        EnterCriticalSection(&m_cs);
         m_blocks.clear();
-    }
+        LeaveCriticalSection(&m_cs);
+        });
+}
 
-    size_t Size() const {
-        std::shared_lock<std::shared_mutex> lock(m_mutex);
-        return m_blocks.size();
-    }
-};
+size_t ThreadSafePermanentBlocks::Size() const noexcept {
+    size_t size = 0;
+    SAFE_CALL_BOOL("ThreadSafePermanentBlocks::Size", {
+        EnterCriticalSection(&m_cs);
+        size = m_blocks.size();
+        LeaveCriticalSection(&m_cs);
+        return true;
+        });
+    return size;
+}
 
 ThreadSafePermanentBlocks g_permanentBlocks;
 
-// 日志相关
-std::mutex g_logMutex;
-FILE* g_logFile = nullptr;
-
 ///////////////////////////////////////////////////////////////////////////////
-// SEH异常安全包装
+// 工具函数实现
 ///////////////////////////////////////////////////////////////////////////////
 
-// SEH安全执行模板 - 这是最关键的兼容性保证
-template<typename Func>
-auto SafeExecute(Func&& func, const char* operation, auto defaultValue) noexcept -> decltype(func()) {
-    __try {
-        return func();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogMessage("[SEH异常] 操作 %s 发生异常: 0x%08X", operation, GetExceptionCode());
-
-        using ReturnType = decltype(func());
-        if constexpr (std::is_same_v<ReturnType, decltype(defaultValue)>) {
-            return defaultValue;
-        }
-        else {
-            return static_cast<ReturnType>(defaultValue);
-        }
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 工具函数
-///////////////////////////////////////////////////////////////////////////////
-
-// 线程安全的日志记录
 void LogMessage(const char* format, ...) noexcept {
-    if (!format) return;
+    if (!format || !g_logInitialized) return;
 
-    std::lock_guard<std::mutex> lock(g_logMutex);
+    SAFE_CALL_VOID("LogMessage", {
+        EnterCriticalSection(&g_logCs);
 
     // 获取时间戳
     SYSTEMTIME st;
@@ -145,60 +145,74 @@ void LogMessage(const char* format, ...) noexcept {
             fflush(g_logFile);
         }
     }
+
+    LeaveCriticalSection(&g_logCs);
+        });
 }
 
-// 检查是否为JassVM相关分配
+void LogError(const char* format, ...) noexcept {
+    if (!format) return;
+
+    char buffer[2048];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    LogMessage("[ERROR] %s", buffer);
+}
+
 bool IsJassVMAllocation(size_t size, const char* name) noexcept {
-    return SafeExecute([=]() -> bool {
-        return (size == JASSVM_BLOCK_SIZE &&
-            name &&
-            strstr(name, "Instance.cpp") != nullptr);
-        }, "IsJassVMAllocation", false);
+    bool result = false;
+    SAFE_CALL_BOOL("IsJassVMAllocation", {
+        result = (size == JASSVM_BLOCK_SIZE &&
+                 name &&
+                 strstr(name, "Instance.cpp") != nullptr);
+        return true;
+        });
+    return result;
 }
 
-// 检查指针是否为我们的永久块
 bool IsPermanentBlock(void* ptr) noexcept {
-    return SafeExecute([=]() -> bool {
-        return g_permanentBlocks.Contains(ptr);
-        }, "IsPermanentBlock", false);
+    return g_permanentBlocks.Contains(ptr);
 }
 
-// 获取当前进程虚拟内存使用量
 size_t GetProcessVirtualMemoryUsage() noexcept {
-    return SafeExecute([]() -> size_t {
+    size_t result = 0;
+    SAFE_CALL_BOOL("GetProcessVirtualMemoryUsage", {
         PROCESS_MEMORY_COUNTERS_EX pmc{};
         pmc.cb = sizeof(pmc);
 
         if (GetProcessMemoryInfo(GetCurrentProcess(),
             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
             sizeof(pmc))) {
-            return pmc.PrivateUsage;
+            result = pmc.PrivateUsage;
         }
-        return 0;
-        }, "GetProcessVirtualMemoryUsage", 0);
+        return true;
+        });
+    return result;
 }
 
-// 创建永久稳定块
 void CreatePermanentStabilizers(int count, const char* reason) noexcept {
-    SafeExecute([=]() -> void {
+    SAFE_CALL_VOID("CreatePermanentStabilizers", {
         LogMessage("[稳定化] 创建%d个永久稳定块 (%s)", count, reason);
 
-        // 创建不同大小的稳定块
-        std::vector<size_t> sizes = { 64, 128, 256, 512, 1024, 2048, 4096 };
+    // 创建不同大小的稳定块
+    size_t sizes[] = { 64, 128, 256, 512, 1024, 2048, 4096 };
+    int sizeCount = sizeof(sizes) / sizeof(sizes[0]);
 
-        for (int i = 0; i < count && i < sizes.size(); ++i) {
-            void* stabilizer = g_MemoryPool.AllocateSafe(sizes[i], "永久稳定块", 0);
-            if (stabilizer) {
-                g_permanentBlocks.Add(stabilizer);
-                LogMessage("[稳定化] 创建永久块: %p (大小: %zu)", stabilizer, sizes[i]);
-            }
+    for (int i = 0; i < count && i < sizeCount; ++i) {
+        void* stabilizer = g_MemoryPool.AllocateSafe(sizes[i], "永久稳定块", 0);
+        if (stabilizer) {
+            g_permanentBlocks.Add(stabilizer);
+            LogMessage("[稳定化] 创建永久块: %p (大小: %zu)", stabilizer, sizes[i]);
         }
-        }, "CreatePermanentStabilizers", );
+    }
+        });
 }
 
-// 创建临时稳定块
 void CreateTemporaryStabilizers(int cleanAllCount) noexcept {
-    SafeExecute([=]() -> void {
+    SAFE_CALL_VOID("CreateTemporaryStabilizers", {
         // 只在特定的CleanAll计数时创建
         if (cleanAllCount % 50 != 0) return;
 
@@ -212,60 +226,66 @@ void CreateTemporaryStabilizers(int cleanAllCount) noexcept {
                 LogMessage("[稳定化] 创建临时块: %p (大小: %zu)", stabilizer, size);
             }
         }
-        }, "CreateTemporaryStabilizers", );
+        });
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Hook函数实现
 ///////////////////////////////////////////////////////////////////////////////
 
-// Storm内存分配Hook
 size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
     const char* name, DWORD src_line, DWORD flag) {
-    return SafeExecute([=]() -> size_t {
+
+    size_t result = 0;
+    SAFE_CALL_BOOL("Hooked_Storm_MemAlloc", {
         g_hookAllocCount.fetch_add(1, std::memory_order_relaxed);
 
-        // 检查是否为JassVM特殊分配
-        if (IsJassVMAllocation(size, name)) {
-            // 使用JVM内存池
-            void* jvmPtr = JVM_MemPool::Allocate(size);
-            if (jvmPtr) {
-                g_totalAllocated.fetch_add(size, std::memory_order_relaxed);
-                LogMessage("[JassVM] 分配成功: %p, 大小: %zu", jvmPtr, size);
-                return reinterpret_cast<size_t>(jvmPtr);
-            }
-            LogMessage("[JassVM] 分配失败，回退到Storm");
+    // 检查是否为JassVM特殊分配
+    if (IsJassVMAllocation(size, name)) {
+        void* jvmPtr = JVM_MemPool::Allocate(size);
+        if (jvmPtr) {
+            g_totalAllocated.fetch_add(size, std::memory_order_relaxed);
+            LogMessage("[JassVM] 分配成功: %p, 大小: %zu", jvmPtr, size);
+            result = reinterpret_cast<size_t>(jvmPtr);
+            return true;
         }
+        LogMessage("[JassVM] 分配失败，回退到Storm");
+    }
 
-        // 检查是否使用我们的内存池
-        bool useManagedPool = (size >= g_bigThreshold.load(std::memory_order_relaxed));
+    // 检查是否使用我们的内存池
+    bool useManagedPool = (size >= g_bigThreshold.load(std::memory_order_relaxed));
 
-        if (useManagedPool && !g_shutdownRequested.load(std::memory_order_acquire)) {
-            // 使用MemoryPool分配
-            void* managedPtr = g_MemoryPool.AllocateSafe(size, name, src_line);
-            if (managedPtr) {
-                g_totalAllocated.fetch_add(size, std::memory_order_relaxed);
-                return reinterpret_cast<size_t>(managedPtr);
-            }
-            LogMessage("[MemoryPool] 分配失败，回退到Storm: 大小=%zu", size);
+    if (useManagedPool && !g_shutdownRequested.load(std::memory_order_acquire)) {
+        void* managedPtr = g_MemoryPool.AllocateSafe(size, name, src_line);
+        if (managedPtr) {
+            g_totalAllocated.fetch_add(size, std::memory_order_relaxed);
+            result = reinterpret_cast<size_t>(managedPtr);
+            return true;
         }
+        LogMessage("[MemoryPool] 分配失败，回退到Storm: 大小=%zu", size);
+    }
 
-        // 回退到Storm原始分配
-        size_t result = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
+    // 回退到Storm原始分配
+    if (s_origStormAlloc) {
+        result = s_origStormAlloc(ecx, edx, size, name, src_line, flag);
         if (result) {
             g_totalAllocated.fetch_add(size, std::memory_order_relaxed);
         }
-        return result;
+    }
+    return true;
+        });
 
-        }, "Hooked_Storm_MemAlloc", 0);
+    return result;
 }
 
-// Storm内存释放Hook
 int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
-    return SafeExecute([=]() -> int {
+    int result = 0;
+    SAFE_CALL_INT("Hooked_Storm_MemFree", {
         g_hookFreeCount.fetch_add(1, std::memory_order_relaxed);
 
-        if (!a1) return 1;  // 空指针认为成功
+        if (!a1) {
+            return 1;  // 空指针认为成功
+        }
 
         void* ptr = reinterpret_cast<void*>(a1);
 
@@ -293,19 +313,25 @@ int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
         }
 
         // 回退到Storm原始释放
-        return s_origStormFree(a1, name, argList, a4);
+        if (s_origStormFree) {
+            result = s_origStormFree(a1, name, argList, a4);
+        }
+        return result;
+        });
 
-        }, "Hooked_Storm_MemFree", 0);
+    return result;
 }
 
-// Storm内存重分配Hook
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
     const char* name, DWORD src_line, DWORD flag) {
-    return SafeExecute([=]() -> void* {
+
+    void* result = nullptr;
+    SAFE_CALL_PTR("Hooked_Storm_MemReAlloc", {
         // 边界情况处理
         if (!oldPtr) {
             size_t allocResult = Hooked_Storm_MemAlloc(ecx, edx, newSize, name, src_line, flag);
-            return reinterpret_cast<void*>(allocResult);
+            result = reinterpret_cast<void*>(allocResult);
+            return result;
         }
 
         if (newSize == 0) {
@@ -315,7 +341,8 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 
         // 检查是否为JVM内存池指针
         if (JVM_MemPool::IsFromPool(oldPtr)) {
-            return JVM_MemPool::Realloc(oldPtr, newSize);
+            result = JVM_MemPool::Realloc(oldPtr, newSize);
+            return result;
         }
 
         // 检查是否为永久块
@@ -334,27 +361,32 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
                     LogMessage("[重分配] 永久块数据复制失败: %p -> %p", oldPtr, newPtr);
                 }
             }
-            return newPtr;
+            result = newPtr;
+            return result;
         }
 
         // 检查是否为我们管理的块
         if (g_MemoryPool.IsFromPool(oldPtr)) {
             void* newPtr = g_MemoryPool.ReallocSafe(oldPtr, newSize, name, src_line);
             if (newPtr) {
-                return newPtr;
+                result = newPtr;
+                return result;
             }
             LogMessage("[MemoryPool] 重分配失败，回退到Storm: %p, 新大小=%zu", oldPtr, newSize);
         }
 
         // 回退到Storm原始重分配
-        return s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+        if (s_origStormReAlloc) {
+            result = s_origStormReAlloc(ecx, edx, oldPtr, newSize, name, src_line, flag);
+        }
+        return result;
+        });
 
-        }, "Hooked_Storm_MemReAlloc", nullptr);
+    return result;
 }
 
-// StormHeap CleanupAll Hook - 关键的稳定性保证
 void Hooked_StormHeap_CleanupAll() {
-    SafeExecute([]() -> void {
+    SAFE_CALL_VOID("Hooked_StormHeap_CleanupAll", {
         // 防止重入
         if (tls_inCleanAll) {
             return;
@@ -379,11 +411,13 @@ void Hooked_StormHeap_CleanupAll() {
         }
 
         // 调用Storm原始清理
-        __try {
-            s_origCleanupAll();
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            LogMessage("[CleanAll] Storm原始清理异常: 0x%08X", GetExceptionCode());
+        if (s_origCleanupAll) {
+            __try {
+                s_origCleanupAll();
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                LogMessage("[CleanAll] Storm原始清理异常: 0x%08X", GetExceptionCode());
+            }
         }
 
         // 创建稳定块（降低频率避免过度分配）
@@ -397,43 +431,47 @@ void Hooked_StormHeap_CleanupAll() {
         tls_inCleanAll = false;
 
         LogMessage("[CleanAll] 第%d次清理完成", currentCount);
-
-        }, "Hooked_StormHeap_CleanupAll", );
+        });
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// 初始化和清理
+// 初始化和清理函数
 ///////////////////////////////////////////////////////////////////////////////
 
-// 初始化日志系统
 bool InitializeLogging() noexcept {
-    return SafeExecute([]() -> bool {
+    bool result = false;
+    SAFE_CALL_BOOL("InitializeLogging", {
+        InitializeCriticalSection(&g_logCs);
+
         g_logFile = fopen("StormHook.log", "w");
         if (g_logFile) {
+            g_logInitialized = true;
             LogMessage("[初始化] 日志系统启动成功");
-            return true;
+            result = true;
         }
-        else {
-            printf("[错误] 无法创建日志文件\n");
-            return false;
-        }
-        }, "InitializeLogging", false);
+ else {
+  printf("[错误] 无法创建日志文件\n");
+  result = false;
+}
+return result;
+        });
+    return result;
 }
 
-// 查找Storm函数地址
 bool FindStormFunctions() noexcept {
-    return SafeExecute([]() -> bool {
+    bool result = false;
+    SAFE_CALL_BOOL("FindStormFunctions", {
         // 查找Storm.dll基址
         HMODULE stormDll = GetModuleHandleA("Storm.dll");
         if (!stormDll) {
-            LogMessage("[错误] 未找到Storm.dll模块");
+            LogError("[错误] 未找到Storm.dll模块");
             return false;
         }
 
         gStormDllBase = reinterpret_cast<uintptr_t>(stormDll);
         LogMessage("[初始化] Storm.dll基址: 0x%08X", gStormDllBase);
 
-        // 设置函数指针（基于逆向文档的偏移）
+        // 设置函数指针（基于IDA Pro确认的偏移）
         s_origStormAlloc = reinterpret_cast<Storm_MemAlloc_t>(gStormDllBase + 0x2B830);
         s_origStormFree = reinterpret_cast<Storm_MemFree_t>(gStormDllBase + 0x2BE40);
         s_origStormReAlloc = reinterpret_cast<Storm_MemReAlloc_t>(gStormDllBase + 0x2C8B0);
@@ -448,17 +486,19 @@ bool FindStormFunctions() noexcept {
         // 验证函数指针有效性
         if (!s_origStormAlloc || !s_origStormFree ||
             !s_origStormReAlloc || !s_origCleanupAll) {
-            LogMessage("[错误] Storm函数地址无效");
+            LogError("[错误] Storm函数地址无效");
             return false;
         }
 
-        return true;
-        }, "FindStormFunctions", false);
+        result = true;
+        return result;
+        });
+    return result;
 }
 
-// 安装Hook
 bool InstallHooks() noexcept {
-    return SafeExecute([]() -> bool {
+    bool result = false;
+    SAFE_CALL_BOOL("InstallHooks", {
         LogMessage("[初始化] 开始安装Hook...");
 
         DetourTransactionBegin();
@@ -470,20 +510,52 @@ bool InstallHooks() noexcept {
         DetourAttach(&(PVOID&)s_origStormReAlloc, Hooked_Storm_MemReAlloc);
         DetourAttach(&(PVOID&)s_origCleanupAll, Hooked_StormHeap_CleanupAll);
 
-        LONG result = DetourTransactionCommit();
-        if (result != NO_ERROR) {
-            LogMessage("[错误] Hook安装失败，错误代码: %ld", result);
+        LONG detourResult = DetourTransactionCommit();
+        if (detourResult != NO_ERROR) {
+            LogError("[错误] Hook安装失败，错误代码: %ld", detourResult);
             return false;
         }
 
         LogMessage("[初始化] Hook安装成功");
-        return true;
-        }, "InstallHooks", false);
+        result = true;
+        return result;
+        });
+    return result;
 }
 
-// 主初始化函数
-bool InitializeStormMemoryHooks() {
-    return SafeExecute([]() -> bool {
+void UninstallHooks() noexcept {
+    SAFE_CALL_VOID("UninstallHooks", {
+        LogMessage("[清理] 开始卸载Hook...");
+
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+
+        // 按相反顺序卸载
+        if (s_origCleanupAll) {
+            DetourDetach(&(PVOID&)s_origCleanupAll, Hooked_StormHeap_CleanupAll);
+        }
+        if (s_origStormReAlloc) {
+            DetourDetach(&(PVOID&)s_origStormReAlloc, Hooked_Storm_MemReAlloc);
+        }
+        if (s_origStormFree) {
+            DetourDetach(&(PVOID&)s_origStormFree, Hooked_Storm_MemFree);
+        }
+        if (s_origStormAlloc) {
+            DetourDetach(&(PVOID&)s_origStormAlloc, Hooked_Storm_MemAlloc);
+        }
+
+        LONG result = DetourTransactionCommit();
+        LogMessage("[清理] Hook卸载%s", (result == NO_ERROR) ? "成功" : "失败");
+        });
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// 主要接口函数实现
+///////////////////////////////////////////////////////////////////////////////
+
+bool InitializeStormMemoryHooks() noexcept {
+    bool result = false;
+    SAFE_CALL_BOOL("InitializeStormMemoryHooks", {
         bool expected = false;
         if (!g_hooksInitialized.compare_exchange_strong(expected, true)) {
             LogMessage("[警告] StormHook已经初始化");
@@ -503,7 +575,7 @@ bool InitializeStormMemoryHooks() {
         config.enableDetailedLogging = true;
 
         if (!g_MemoryPool.Initialize(config)) {
-            LogMessage("[错误] MemoryPool初始化失败");
+            LogError("[错误] MemoryPool初始化失败");
             return false;
         }
 
@@ -526,41 +598,14 @@ bool InitializeStormMemoryHooks() {
         LogMessage("[初始化] StormHook初始化完成");
         LogMessage("[状态] 大块阈值: %zu KB", g_bigThreshold.load() / 1024);
 
-        return true;
-        }, "InitializeStormMemoryHooks", false);
+        result = true;
+        return result;
+        });
+    return result;
 }
 
-// 卸载Hook
-void UninstallHooks() noexcept {
-    SafeExecute([]() -> void {
-        LogMessage("[清理] 开始卸载Hook...");
-
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-
-        // 按相反顺序卸载
-        if (s_origCleanupAll) {
-            DetourDetach(&(PVOID&)s_origCleanupAll, Hooked_StormHeap_CleanupAll);
-        }
-        if (s_origStormReAlloc) {
-            DetourDetach(&(PVOID&)s_origStormReAlloc, Hooked_Storm_MemReAlloc);
-        }
-        if (s_origStormFree) {
-            DetourDetach(&(PVOID&)s_origStormFree, Hooked_Storm_MemFree);
-        }
-        if (s_origStormAlloc) {
-            DetourDetach(&(PVOID&)s_origStormAlloc, Hooked_Storm_MemAlloc);
-        }
-
-        LONG result = DetourTransactionCommit();
-        LogMessage("[清理] Hook卸载%s", (result == NO_ERROR) ? "成功" : "失败");
-
-        }, "UninstallHooks", );
-}
-
-// 主清理函数
-void ShutdownStormMemoryHooks() {
-    SafeExecute([]() -> void {
+void ShutdownStormMemoryHooks() noexcept {
+    SAFE_CALL_VOID("ShutdownStormMemoryHooks", {
         bool expected = true;
         if (!g_hooksInitialized.compare_exchange_strong(expected, false)) {
             return;  // 已经关闭或未初始化
@@ -611,16 +656,19 @@ void ShutdownStormMemoryHooks() {
             g_logFile = nullptr;
         }
 
-        }, "ShutdownStormMemoryHooks", );
+        if (g_logInitialized) {
+            g_logInitialized = false;
+            DeleteCriticalSection(&g_logCs);
+        }
+        });
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// 配置和状态查询接口
-///////////////////////////////////////////////////////////////////////////////
+bool IsHooksInitialized() noexcept {
+    return g_hooksInitialized.load(std::memory_order_acquire);
+}
 
-// 设置大块阈值
-void SetBigBlockThreshold(size_t sizeInBytes) {
-    SafeExecute([=]() -> void {
+void SetBigBlockThreshold(size_t sizeInBytes) noexcept {
+    SAFE_CALL_VOID("SetBigBlockThreshold", {
         size_t oldThreshold = g_bigThreshold.exchange(sizeInBytes, std::memory_order_relaxed);
         LogMessage("[配置] 大块阈值: %zu -> %zu 字节", oldThreshold, sizeInBytes);
 
@@ -628,21 +676,18 @@ void SetBigBlockThreshold(size_t sizeInBytes) {
         MemoryPoolConfig config = g_MemoryPool.GetConfig();
         config.bigBlockThreshold = sizeInBytes;
         g_MemoryPool.UpdateConfig(config);
-
-        }, "SetBigBlockThreshold", );
+        });
 }
 
-// 获取内存统计
-void GetMemoryStatistics(size_t& allocated, size_t& freed, size_t& allocCount, size_t& freeCount) {
+void GetMemoryStatistics(size_t& allocated, size_t& freed, size_t& allocCount, size_t& freeCount) noexcept {
     allocated = g_totalAllocated.load(std::memory_order_relaxed);
     freed = g_totalFreed.load(std::memory_order_relaxed);
     allocCount = g_hookAllocCount.load(std::memory_order_relaxed);
     freeCount = g_hookFreeCount.load(std::memory_order_relaxed);
 }
 
-// 打印当前状态
-void PrintMemoryStatus() {
-    SafeExecute([]() -> void {
+void PrintMemoryStatus() noexcept {
+    SAFE_CALL_VOID("PrintMemoryStatus", {
         size_t allocated, freed, allocCount, freeCount;
         GetMemoryStatistics(allocated, freed, allocCount, freeCount);
 
@@ -654,23 +699,16 @@ void PrintMemoryStatus() {
         LogMessage("Hook分配: %zu MB (%zu 次)", allocated / (1024 * 1024), allocCount);
         LogMessage("Hook释放: %zu MB (%zu 次)", freed / (1024 * 1024), freeCount);
         LogMessage("MemoryPool统计: 分配=%zu次, 释放=%zu次",
-            poolStats.allocCount.load(), poolStats.freeCount.load());
+            poolStats.allocCount, poolStats.freeCount);
         LogMessage("CleanAll计数: %d", g_cleanAllCounter.load());
         LogMessage("永久块数量: %zu", g_permanentBlocks.Size());
         LogMessage("==============================\n");
-
-        }, "PrintMemoryStatus", );
+        });
 }
 
-// 强制触发内存清理
-void ForceMemoryCleanup() {
-    SafeExecute([]() -> void {
+void ForceMemoryCleanup() noexcept {
+    SAFE_CALL_VOID("ForceMemoryCleanup", {
         LogMessage("[手动] 触发内存清理...");
         g_MemoryPool.ForceCleanup();
-        }, "ForceMemoryCleanup", );
-}
-
-// 检查Hook状态
-bool IsHooksInitialized() {
-    return g_hooksInitialized.load(std::memory_order_acquire);
+        });
 }

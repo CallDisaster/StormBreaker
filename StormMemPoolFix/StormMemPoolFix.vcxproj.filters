@@ -108,6 +108,9 @@
     <ClInclude Include="Log\ReportViewer.h">
       <Filter>头文件\Log</Filter>
     </ClInclude>
+    <ClInclude Include="Base\SmartMemoryManager.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -131,9 +134,6 @@
     <ClCompile Include="Storm\tlsf.c">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
-    <ClCompile Include="Base\MemroySafety.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
     <ClCompile Include="Log\MemoryTracker.cpp">
       <Filter>源文件\Log</Filter>
     </ClCompile>
@@ -151,6 +151,12 @@
     </ClCompile>
     <ClCompile Include="Utils\Resource\WebResourceExtractor.cpp">
       <Filter>源文件\Utils\Resource</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\SmartMemoryManger.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\MemroySafety.cpp">
+      <Filter>源文件\Base</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

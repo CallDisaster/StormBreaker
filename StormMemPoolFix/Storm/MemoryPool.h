@@ -1,4 +1,5 @@
-﻿#pragma once
+﻿// MemoryPool.h - 修复后的内存池管理器
+#pragma once
 
 #include "pch.h"
 #include <Windows.h>
@@ -8,25 +9,57 @@
 #include <chrono>
 #include <functional>
 #include <vector>
-#include <unordered_map>
+#include <memory>
 #include "Base/MemorySafety.h"
 
 // 前向声明
 typedef void(*StormHeap_CleanupAll_t)();
 
-// 内存池统计信息
+// 内存池统计信息 - 修复拷贝构造问题
 struct MemoryPoolStats {
-    std::atomic<size_t> totalAllocated{ 0 };      // 总分配字节数
-    std::atomic<size_t> totalFreed{ 0 };          // 总释放字节数
-    std::atomic<size_t> currentInUse{ 0 };        // 当前使用中字节数
-    std::atomic<size_t> peakUsage{ 0 };           // 峰值使用量
-    std::atomic<size_t> allocCount{ 0 };          // 分配次数
-    std::atomic<size_t> freeCount{ 0 };           // 释放次数
-    std::atomic<size_t> reallocCount{ 0 };        // 重分配次数
-    std::atomic<size_t> cacheHits{ 0 };           // 缓存命中次数
-    std::atomic<size_t> cacheMisses{ 0 };         // 缓存未命中次数
-    std::atomic<size_t> stormCleanupTriggers{ 0 }; // Storm清理触发次数
-    std::atomic<size_t> pressureCleanups{ 0 };    // 压力清理次数
+    // 基础统计
+    size_t totalAllocated = 0;
+    size_t totalFreed = 0;
+    size_t currentInUse = 0;
+    size_t peakUsage = 0;
+    size_t allocCount = 0;
+    size_t freeCount = 0;
+    size_t reallocCount = 0;
+
+    // 缓存统计
+    size_t cacheHits = 0;
+    size_t cacheMisses = 0;
+    size_t stormCleanupTriggers = 0;
+    size_t pressureCleanups = 0;
+
+    // 从原子变量复制数据的辅助方法
+    static MemoryPoolStats FromAtomics(
+        const std::atomic<size_t>& alloc,
+        const std::atomic<size_t>& freed,
+        const std::atomic<size_t>& inUse,
+        const std::atomic<size_t>& peak,
+        const std::atomic<size_t>& allocCnt,
+        const std::atomic<size_t>& freeCnt,
+        const std::atomic<size_t>& reallocCnt,
+        const std::atomic<size_t>& hits,
+        const std::atomic<size_t>& misses,
+        const std::atomic<size_t>& stormCleanups,
+        const std::atomic<size_t>& pressureClnps
+    ) {
+        MemoryPoolStats stats;
+        stats.totalAllocated = alloc.load();
+        stats.totalFreed = freed.load();
+        stats.currentInUse = inUse.load();
+        stats.peakUsage = peak.load();
+        stats.allocCount = allocCnt.load();
+        stats.freeCount = freeCnt.load();
+        stats.reallocCount = reallocCnt.load();
+        stats.cacheHits = hits.load();
+        stats.cacheMisses = misses.load();
+        stats.stormCleanupTriggers = stormCleanups.load();
+        stats.pressureCleanups = pressureClnps.load();
+        return stats;
+    }
 
     void Reset() noexcept {
         totalAllocated = 0;
@@ -56,7 +89,7 @@ struct MemoryPoolConfig {
     bool enableDetailedLogging = false;           // 启用详细日志
 };
 
-// JassVM专用内存池（保持向后兼容）
+// JassVM专用内存池（简化实现）
 namespace JVM_MemPool {
     void Initialize();
     void* Allocate(std::size_t size);
@@ -66,7 +99,7 @@ namespace JVM_MemPool {
     void Cleanup();
 }
 
-// 小块内存池（保持向后兼容）  
+// 小块内存池（简化实现）  
 namespace SmallBlockPool {
     void Initialize();
     bool ShouldIntercept(std::size_t size);
@@ -74,7 +107,56 @@ namespace SmallBlockPool {
     bool Free(void* ptr, std::size_t size);
 }
 
-// 主内存池类 - 基于MemorySafety的高层封装
+// SEH安全包装函数（避免const问题）
+template<typename Func>
+auto SafeExecuteNonConst(Func&& func, const char* operation) noexcept -> decltype(func()) {
+    using ReturnType = decltype(func());
+
+    struct CallContext {
+        Func* function;
+        ReturnType result;
+        bool success;
+        const char* operation;
+    } context = { &func, {}, false, operation };
+
+    auto callback = [](void* ctx) -> int {
+        auto* callCtx = static_cast<CallContext*>(ctx);
+        __try {
+            callCtx->result = (*(callCtx->function))();
+            callCtx->success = true;
+            return 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            callCtx->success = false;
+            return 0;
+        }
+        };
+
+    int result = callback(&context);
+
+    if (result && context.success) {
+        return context.result;
+    }
+
+    // 异常时的默认值
+    if constexpr (std::is_pointer_v<ReturnType>) {
+        return nullptr;
+    }
+    else if constexpr (std::is_same_v<ReturnType, bool>) {
+        return false;
+    }
+    else if constexpr (std::is_arithmetic_v<ReturnType>) {
+        return static_cast<ReturnType>(0);
+    }
+    else if constexpr (std::is_same_v<ReturnType, void>) {
+        return;
+    }
+    else {
+        return ReturnType{};
+    }
+}
+
+// 主内存池类
 class MemoryPool {
 public:
     // 获取单例实例
@@ -148,10 +230,6 @@ private:
     void CheckAndTriggerCleanup() noexcept;
     bool IsMemoryUnderPressure() const noexcept;
 
-    // SEH安全包装
-    template<typename Func>
-    auto SafeExecute(Func&& func, const char* operation) noexcept -> decltype(func());
-
     // 日志记录
     void LogMessage(const char* format, ...) const noexcept;
     void LogError(const char* format, ...) const noexcept;
@@ -172,8 +250,18 @@ private:
     // Storm函数指针
     StormHeap_CleanupAll_t m_stormCleanupFunc{ nullptr };
 
-    // 统计信息
-    MemoryPoolStats m_stats;
+    // 统计信息（原子变量，避免拷贝构造问题）
+    std::atomic<size_t> m_totalAllocated{ 0 };
+    std::atomic<size_t> m_totalFreed{ 0 };
+    std::atomic<size_t> m_currentInUse{ 0 };
+    std::atomic<size_t> m_peakUsage{ 0 };
+    std::atomic<size_t> m_allocCount{ 0 };
+    std::atomic<size_t> m_freeCount{ 0 };
+    std::atomic<size_t> m_reallocCount{ 0 };
+    std::atomic<size_t> m_cacheHits{ 0 };
+    std::atomic<size_t> m_cacheMisses{ 0 };
+    std::atomic<size_t> m_stormCleanupTriggers{ 0 };
+    std::atomic<size_t> m_pressureCleanups{ 0 };
 
     // 后台任务
     std::unique_ptr<std::thread> m_backgroundThread;
@@ -191,7 +279,7 @@ private:
     HANDLE m_logFile{ INVALID_HANDLE_VALUE };
 };
 
-// 全局访问宏（保持与原代码兼容）
+// 全局访问宏
 #define g_MemoryPool MemoryPool::GetInstance()
 
 // 便利函数（保持与原MemPool命名空间兼容）
