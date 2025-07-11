@@ -17,18 +17,21 @@
 #include <Storm/StormHeap.h>
 #include "Game/GameHook.h"
 #include <Utils/Resource/WebResourceExtractor.h>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <atomic>
 
 void CreateConsole()
 {
     AllocConsole();
 
     FILE* fp;
-    freopen_s(&fp, "CONOUT$", "w", stdout);  // 绑定标准输出到控制台
-    freopen_s(&fp, "CONOUT$", "w", stderr);  // 绑定标准错误到控制台
-    freopen_s(&fp, "CONIN$", "r", stdin);    // 绑定标准输入到控制台
+    freopen_s(&fp, "CONOUT$", "w", stdout);
+    freopen_s(&fp, "CONOUT$", "w", stderr);
+    freopen_s(&fp, "CONIN$", "r", stdin);
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
@@ -36,13 +39,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         CreateConsole();
-        std::cout << "Version: 1.2.0 Power By TLSF" << std::endl; // 更新版本号
+        std::cout << "Version: 1.2.0 Power By TLSF" << std::endl;
 
         Sleep(500);
+
         // 初始化内存钩子
         if (InitializeStormMemoryHooks()) {
             std::cout << "StormMemPoolHook 初始化成功！" << std::endl;
-            // 打印初始内存报告到控制台
             PrintMemoryStatus();
             featureActivationCount++;
         }
@@ -58,17 +61,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         else {
             std::cout << "StormHeapHook 初始化失败！" << std::endl;
         }
-
-        TestHtmlExtraction();
-
-        //if (InitializeGameHook()) {
-        //    std::cout << "GameHook 初始化成功！" << std::endl;
-        //    featureActivationCount++;
-        //}
-        //else {
-        //    std::cout << "GameHook 初始化失败！" << std::endl;
-        //}
-        
 
         // 根据 featureActivationCount 输出最终状态
         if (featureActivationCount == 2) {
