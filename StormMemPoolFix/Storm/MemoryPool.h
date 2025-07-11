@@ -1,8 +1,9 @@
-﻿// MemoryPool.h - 修复后的内存池管理器
+﻿// MemoryPool.h - 修复SafeExecuteNonConst模板问题
 #pragma once
 
 #include "pch.h"
 #include <Windows.h>
+#include <psapi.h>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -107,52 +108,53 @@ namespace SmallBlockPool {
     bool Free(void* ptr, std::size_t size);
 }
 
-// SEH安全包装函数（避免const问题）
+// SEH安全包装函数 - 修复void返回类型问题
 template<typename Func>
-auto SafeExecuteNonConst(Func&& func, const char* operation) noexcept -> decltype(func()) {
+auto SafeExecuteNonConst(Func&& func, const char* operation) noexcept {
     using ReturnType = decltype(func());
 
-    struct CallContext {
-        Func* function;
-        ReturnType result;
-        bool success;
-        const char* operation;
-    } context = { &func, {}, false, operation };
-
-    auto callback = [](void* ctx) -> int {
-        auto* callCtx = static_cast<CallContext*>(ctx);
-        __try {
-            callCtx->result = (*(callCtx->function))();
-            callCtx->success = true;
-            return 1;
+    __try {
+        if constexpr (std::is_same_v<ReturnType, void>) {
+            func();
+            return;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            callCtx->success = false;
-            return 0;
+        else {
+            return func();
         }
-        };
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // 简单的printf输出，避免复杂的日志系统
+        printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation);
 
-    int result = callback(&context);
+        if constexpr (std::is_same_v<ReturnType, void>) {
+            return;
+        }
+        else if constexpr (std::is_pointer_v<ReturnType>) {
+            return nullptr;
+        }
+        else if constexpr (std::is_same_v<ReturnType, bool>) {
+            return false;
+        }
+        else if constexpr (std::is_arithmetic_v<ReturnType>) {
+            return static_cast<ReturnType>(0);
+        }
+        else {
+            return ReturnType{};
+        }
+    }
+}
 
-    if (result && context.success) {
-        return context.result;
-    }
+// 专门为需要默认值的情况提供的重载
+template<typename Func, typename DefaultType>
+auto SafeExecuteNonConstWithDefault(Func&& func, const char* operation, DefaultType defaultValue) noexcept {
+    using ReturnType = decltype(func());
 
-    // 异常时的默认值
-    if constexpr (std::is_pointer_v<ReturnType>) {
-        return nullptr;
+    __try {
+        return func();
     }
-    else if constexpr (std::is_same_v<ReturnType, bool>) {
-        return false;
-    }
-    else if constexpr (std::is_arithmetic_v<ReturnType>) {
-        return static_cast<ReturnType>(0);
-    }
-    else if constexpr (std::is_same_v<ReturnType, void>) {
-        return;
-    }
-    else {
-        return ReturnType{};
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation);
+        return defaultValue;
     }
 }
 

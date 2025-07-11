@@ -53,14 +53,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             std::cout << "StormMemPoolHook 初始化失败！" << std::endl;
         }
 
-        // 初始化小块优化
-        if (HookAllStormHeapFunctions()) {
-            std::cout << "StormHeapHook 初始化成功！" << std::endl;
-            featureActivationCount++;
-        }
-        else {
-            std::cout << "StormHeapHook 初始化失败！" << std::endl;
-        }
+        //// 初始化小块优化
+        //if (HookAllStormHeapFunctions()) {
+        //    std::cout << "StormHeapHook 初始化成功！" << std::endl;
+        //    featureActivationCount++;
+        //}
+        //else {
+        //    std::cout << "StormHeapHook 初始化失败！" << std::endl;
+        //}
 
         // 根据 featureActivationCount 输出最终状态
         if (featureActivationCount == 2) {
