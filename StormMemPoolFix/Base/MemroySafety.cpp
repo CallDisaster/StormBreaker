@@ -1,89 +1,70 @@
-﻿// MemorySafety.cpp - 修复SEH+RAII混用问题的实现
+﻿// MemorySafety.cpp - 完整重写的内存安全管理器实现
+// 基于GPT研究的"缓冲窗口+大小分档+内存压力监控"方案
 #include "pch.h"
 #include "MemorySafety.h"
-#include <psapi.h>
 #include <algorithm>
-#include <cstdarg>
-
-#pragma comment(lib, "psapi.lib")
+#include <cassert>
 
 ///////////////////////////////////////////////////////////////////////////////
-// 纯C SEH包装函数 - 避免C++对象构造
+// 独立的Storm兼容头部设置函数
 ///////////////////////////////////////////////////////////////////////////////
 
-extern "C" int __stdcall SafeWrapper(void* context, SafeCallbackFn callback) {
-    __try {
-        return callback(context);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // 记录异常代码到全局变量或简单输出
-        DWORD exceptionCode = GetExceptionCode();
-        char buffer[256];
-        wsprintfA(buffer, "[SEH] Exception 0x%08X in SafeWrapper\n", exceptionCode);
-        OutputDebugStringA(buffer);
-        return 0;
-    }
+void SetupCompatibleHeader(void* userPtr, size_t userSize) noexcept {
+    if (!userPtr || userSize == 0) return;
+
+    SafeExecute([=]() -> void {
+        // 获取Storm兼容头部的位置（用户指针前面）
+        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
+            static_cast<char*>(userPtr) - sizeof(StormAllocHeader));
+
+        // 设置Storm兼容的头部信息（基于逆向文档）
+        header->HeapPtr = STORM_SPECIAL_HEAP;  // 特殊堆标记
+        header->Size = static_cast<DWORD>(userSize);
+        header->AlignPadding = 0;
+        header->Flags = 0x1 | 0x4;  // 魔数校验 + 大块标记
+        header->Magic = STORM_FRONT_MAGIC;
+
+        // 如果启用了尾魔数，设置尾部魔数
+        if (header->Flags & 0x1) {
+            WORD* tailMagic = reinterpret_cast<WORD*>(
+                static_cast<char*>(userPtr) + userSize);
+            *tailMagic = STORM_TAIL_MAGIC;
+        }
+        }, "SetupCompatibleHeader");
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// MemorySafety实现
+// MemorySafety类实现
 ///////////////////////////////////////////////////////////////////////////////
-
-MemorySafety& MemorySafety::GetInstance() noexcept {
-    static MemorySafety instance;
-    return instance;
-}
-
-MemorySafety::MemorySafety() noexcept {
-    // 初始化临界区
-    InitializeCriticalSection(&m_hashTableCs);
-    InitializeCriticalSection(&m_holdQueueCs);
-    InitializeCriticalSection(&m_logCs);
-
-    for (int i = 0; i < MemorySafetyConst::SIZE_CLASS_COUNT; ++i) {
-        InitializeCriticalSection(&m_cacheCs[i]);
-    }
-}
-
-MemorySafety::~MemorySafety() noexcept {
-    if (m_initialized.load()) {
-        Shutdown();
-    }
-
-    // 清理临界区
-    DeleteCriticalSection(&m_hashTableCs);
-    DeleteCriticalSection(&m_holdQueueCs);
-    DeleteCriticalSection(&m_logCs);
-
-    for (int i = 0; i < MemorySafetyConst::SIZE_CLASS_COUNT; ++i) {
-        DeleteCriticalSection(&m_cacheCs[i]);
-    }
-}
 
 bool MemorySafety::Initialize() noexcept {
     return SafeExecute([this]() -> bool {
         bool expected = false;
         if (!m_initialized.compare_exchange_strong(expected, true)) {
-            return true; // 已初始化
+            return true; // 已经初始化
         }
 
-        // 初始化日志文件
-        m_logFile = CreateFileA(
-            "MemorySafety.log",
-            GENERIC_WRITE,
-            FILE_SHARE_READ,
-            nullptr,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr
-        );
+        printf("[MemorySafety] 初始化开始\n");
+        printf("[MemorySafety] 配置: Hold时间=%dms, 水位=%zuMB, 最大缓存=%zuMB\n",
+            m_holdTimeMs.load(), m_watermarkMB.load(), m_maxCacheSizeMB.load());
+        printf("[MemorySafety] Size Class: %zu档, 每档%zuKB\n",
+            MAX_SIZE_CLASSES, SIZE_CLASS_UNIT / 1024);
 
-        LogMessage("[MemorySafety] 初始化完成");
-        LogMessage("[MemorySafety] 配置 - 缓冲时间:%ums, 内存水位:%zuMB, 最大缓存:%zuMB",
-            m_holdTimeMs.load(),
-            m_memoryWatermark.load() / (1024 * 1024),
-            m_maxCacheSize.load() / (1024 * 1024));
+        // 初始化所有Size Class缓存
+        for (size_t i = 0; i < MAX_SIZE_CLASSES; ++i) {
+            m_sizeClassCaches[i].totalSize.store(0);
+            m_sizeClassCaches[i].items.reserve(32); // 预分配避免频繁重分配
+        }
 
+        // 重置统计
+        m_cacheHits.store(0);
+        m_cacheMisses.store(0);
+        m_totalAllocated.store(0);
+        m_totalFreed.store(0);
+        m_currentCached.store(0);
+        m_lastCleanupTime.store(MemorySafetyUtils::GetTickCount());
+
+        printf("[MemorySafety] 初始化完成\n");
         return true;
         }, "Initialize");
 }
@@ -92,646 +73,555 @@ void MemorySafety::Shutdown() noexcept {
     SafeExecute([this]() -> void {
         bool expected = true;
         if (!m_initialized.compare_exchange_strong(expected, false)) {
-            return; // 已关闭
+            return; // 已经关闭
         }
 
+        printf("[MemorySafety] 开始关闭\n");
         m_shutdownRequested.store(true);
 
-        LogMessage("[MemorySafety] 开始关闭");
-
-        // 强制清空Hold队列
+        // 强制处理所有Hold队列项
         DrainHoldQueue();
 
-        // 清空所有缓存
-        for (size_t i = 0; i < MemorySafetyConst::SIZE_CLASS_COUNT; ++i) {
-            CleanupSizeClass(i, SIZE_MAX);
+        // 清理所有Size Class缓存
+        size_t totalFreed = 0;
+        for (size_t i = 0; i < MAX_SIZE_CLASSES; ++i) {
+            std::lock_guard<std::mutex> lock(m_sizeClassCaches[i].mutex);
+            for (const auto& item : m_sizeClassCaches[i].items) {
+                VirtualFree(item.rawPtr, 0, MEM_RELEASE);
+                totalFreed += item.totalSize;
+            }
+            m_sizeClassCaches[i].items.clear();
+            m_sizeClassCaches[i].totalSize.store(0);
         }
 
-        // 释放剩余的哈希表条目
-        EnterCriticalSection(&m_hashTableCs);
-        for (const auto& pair : m_blockHashTable) {
-            VirtualFree(pair.second.rawPtr, 0, MEM_RELEASE);
-            LogMessage("[MemorySafety] 清理遗留块: %p", pair.first);
+        // 清理块追踪
+        {
+            std::lock_guard<std::mutex> lock(m_blockMapMutex);
+            m_blockMap.clear();
         }
-        m_blockHashTable.clear();
-        LeaveCriticalSection(&m_hashTableCs);
 
-        LogMessage("[MemorySafety] 关闭完成");
+        // 打印最终统计
+        printf("[MemorySafety] 关闭统计:\n");
+        printf("  - 总分配: %zu MB\n", m_totalAllocated.load() / (1024 * 1024));
+        printf("  - 总释放: %zu MB\n", m_totalFreed.load() / (1024 * 1024));
+        printf("  - 缓存命中: %zu 次\n", m_cacheHits.load());
+        printf("  - 缓存未命中: %zu 次\n", m_cacheMisses.load());
+        printf("  - 关闭时清理: %zu MB\n", totalFreed / (1024 * 1024));
 
-        if (m_logFile != INVALID_HANDLE_VALUE) {
-            CloseHandle(m_logFile);
-            m_logFile = INVALID_HANDLE_VALUE;
+        double hitRate = 0.0;
+        size_t totalTries = m_cacheHits.load() + m_cacheMisses.load();
+        if (totalTries > 0) {
+            hitRate = (m_cacheHits.load() * 100.0) / totalTries;
         }
+        printf("  - 缓存命中率: %.1f%%\n", hitRate);
+
+        printf("[MemorySafety] 关闭完成\n");
         }, "Shutdown");
 }
 
-bool MemorySafety::IsInitialized() const noexcept {
-    return m_initialized.load();
-}
-
 void* MemorySafety::AllocateBlock(size_t size, const char* sourceName, DWORD sourceLine) noexcept {
-    return SafeExecute([=]() -> void* {
-        if (!m_initialized.load() || m_shutdownRequested.load()) {
-            return nullptr;
-        }
+    if (!m_initialized.load() || size == 0) {
+        return nullptr;
+    }
 
-        stats.totalAllocated.fetch_add(1);
+    return SafeExecute([=]() -> void* {
         return InternalAllocate(size, sourceName, sourceLine);
         }, "AllocateBlock");
 }
 
-bool MemorySafety::FreeBlock(void* ptr) noexcept {
-    return SafeExecute([=]() -> bool {
-        if (!ptr || !m_initialized.load()) {
-            return false;
-        }
+bool MemorySafety::FreeBlock(void* userPtr) noexcept {
+    if (!m_initialized.load() || !userPtr) {
+        return false;
+    }
 
-        stats.totalFreed.fetch_add(1);
-        return InternalFree(ptr);
+    return SafeExecute([=]() -> bool {
+        return InternalFree(userPtr);
         }, "FreeBlock");
 }
 
-void* MemorySafety::ReallocateBlock(void* oldPtr, size_t newSize, const char* sourceName, DWORD sourceLine) noexcept {
-    return SafeExecute([=]() -> void* {
-        if (!m_initialized.load()) {
-            return nullptr;
-        }
+void* MemorySafety::ReallocateBlock(void* oldUserPtr, size_t newSize, const char* sourceName, DWORD sourceLine) noexcept {
+    if (!m_initialized.load()) {
+        return nullptr;
+    }
 
-        return InternalReallocate(oldPtr, newSize, sourceName, sourceLine);
+    return SafeExecute([=]() -> void* {
+        return InternalRealloc(oldUserPtr, newSize, sourceName, sourceLine);
         }, "ReallocateBlock");
 }
 
-bool MemorySafety::IsOurBlock(void* ptr) const noexcept {
+bool MemorySafety::IsOurBlock(void* userPtr) const noexcept {
+    if (!userPtr || !m_initialized.load()) {
+        return false;
+    }
+
     return SafeExecute([=]() -> bool {
-        if (!ptr || !m_initialized.load()) {
-            return false;
-        }
-
-        EnterCriticalSection(&m_hashTableCs);
-        bool found = m_blockHashTable.find(ptr) != m_blockHashTable.end();
-        LeaveCriticalSection(&m_hashTableCs);
-
-        return found;
+        std::lock_guard<std::mutex> lock(m_blockMapMutex);
+        return m_blockMap.find(userPtr) != m_blockMap.end();
         }, "IsOurBlock");
 }
 
-size_t MemorySafety::GetBlockSize(void* ptr) const noexcept {
-    return SafeExecute([=]() -> size_t {
-        if (!ptr || !m_initialized.load()) {
-            return 0;
-        }
-
-        BlockInfo info;
-        if (FindInHashTable(ptr, &info)) {
-            return info.userSize;
-        }
-
+size_t MemorySafety::GetBlockSize(void* userPtr) const noexcept {
+    if (!userPtr || !m_initialized.load()) {
         return 0;
+    }
+
+    return SafeExecute([=]() -> size_t {
+        std::lock_guard<std::mutex> lock(m_blockMapMutex);
+        auto it = m_blockMap.find(userPtr);
+        return (it != m_blockMap.end()) ? it->second.userSize : 0;
         }, "GetBlockSize");
 }
 
-void* MemorySafety::InternalAllocate(size_t size, const char* sourceName, DWORD sourceLine) noexcept {
-    // 先尝试从缓存获取
-    size_t sizeClass = GetSizeClass(size);
-    size_t alignedSize = AlignSize(size + MemorySafetyConst::STANDARD_HEADER_SIZE + MemorySafetyConst::TAIL_MAGIC_SIZE, 16);
-
-    void* rawPtr = TryGetFromCache(sizeClass, alignedSize);
-    if (rawPtr) {
-        stats.cacheHits.fetch_add(1);
-
-        // 重新设置头部信息
-        void* userPtr = static_cast<char*>(rawPtr) + MemorySafetyConst::STANDARD_HEADER_SIZE;
-        SetupStormHeader(userPtr, size, alignedSize);
-
-        // 更新哈希表
-        BlockInfo info = {
-            rawPtr, alignedSize, size,
-            MemorySafetyUtils::GetTickCount(),
-            sourceName, sourceLine
-        };
-        AddToHashTable(userPtr, info);
-
-        return userPtr;
+BlockInfo MemorySafety::GetBlockInfo(void* userPtr) const noexcept {
+    if (!userPtr || !m_initialized.load()) {
+        return BlockInfo();
     }
 
-    stats.cacheMisses.fetch_add(1);
-
-    // 创建新块
-    return CreateBlock(size, sourceName, sourceLine);
+    return SafeExecute([=]() -> BlockInfo {
+        std::lock_guard<std::mutex> lock(m_blockMapMutex);
+        auto it = m_blockMap.find(userPtr);
+        return (it != m_blockMap.end()) ? it->second : BlockInfo();
+        }, "GetBlockInfo");
 }
 
-bool MemorySafety::InternalFree(void* ptr) noexcept {
-    // 验证指针
-    if (!ValidateStormHeader(ptr)) {
-        LogError("[MemorySafety] 无效指针或损坏的头部: %p", ptr);
-        return false;
+///////////////////////////////////////////////////////////////////////////////
+// 内部实现函数
+///////////////////////////////////////////////////////////////////////////////
+
+void* MemorySafety::InternalAllocate(size_t size, const char* sourceName, DWORD sourceLine) noexcept {
+    // 1. 尝试从缓存获取
+    void* rawPtr = TryGetFromCache(size);
+    if (rawPtr) {
+        // 从缓存命中，重新设置用户区
+        void* userPtr = GetUserPtrFromRaw(rawPtr, size);
+        if (userPtr) {
+            SetupStormHeader(userPtr, size);
+
+            // 更新块追踪
+            {
+                std::lock_guard<std::mutex> lock(m_blockMapMutex);
+                m_blockMap[userPtr] = BlockInfo(rawPtr, userPtr, CalculateTotalSize(size),
+                    size, sourceName, sourceLine);
+            }
+
+            m_totalAllocated.fetch_add(size);
+            return userPtr;
+        }
     }
 
-    // 从哈希表移除
-    BlockInfo info;
-    if (!RemoveFromHashTable(ptr, &info)) {
-        LogError("[MemorySafety] 指针不在哈希表中: %p", ptr);
-        return false;
+    // 2. 缓存未命中，分配新块
+    size_t totalSize = CalculateTotalSize(size);
+    rawPtr = VirtualAlloc(nullptr, totalSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    if (!rawPtr) {
+        return nullptr;
     }
 
-    // 添加到Hold队列而不是立即释放
-    AddToHoldQueue(info.rawPtr, info.totalSize);
+    void* userPtr = GetUserPtrFromRaw(rawPtr, size);
+    if (!userPtr) {
+        VirtualFree(rawPtr, 0, MEM_RELEASE);
+        return nullptr;
+    }
 
+    // 3. 设置Storm兼容头部
+    SetupStormHeader(userPtr, size);
+
+    // 4. 记录块信息
+    {
+        std::lock_guard<std::mutex> lock(m_blockMapMutex);
+        m_blockMap[userPtr] = BlockInfo(rawPtr, userPtr, totalSize, size, sourceName, sourceLine);
+    }
+
+    m_totalAllocated.fetch_add(size);
+    return userPtr;
+}
+
+bool MemorySafety::InternalFree(void* userPtr) noexcept {
+    // 1. 验证并获取块信息
+    BlockInfo blockInfo;
+    {
+        std::lock_guard<std::mutex> lock(m_blockMapMutex);
+        auto it = m_blockMap.find(userPtr);
+        if (it == m_blockMap.end()) {
+            return false; // 不是我们管理的块
+        }
+        blockInfo = it->second;
+        m_blockMap.erase(it);
+    }
+
+    // 2. 验证Storm头部
+    if (!ValidateStormHeader(userPtr)) {
+        printf("[MemorySafety] 警告: Storm头部校验失败 %p\n", userPtr);
+        // 继续处理，但记录警告
+    }
+
+    // 3. 加入Hold队列（缓冲窗口机制）
+    AddToHoldQueue(blockInfo.rawPtr, blockInfo.totalSize);
+
+    m_totalFreed.fetch_add(blockInfo.userSize);
     return true;
 }
 
-void* MemorySafety::InternalReallocate(void* oldPtr, size_t newSize, const char* sourceName, DWORD sourceLine) noexcept {
-    if (!oldPtr) {
+void* MemorySafety::InternalRealloc(void* oldUserPtr, size_t newSize, const char* sourceName, DWORD sourceLine) noexcept {
+    if (!oldUserPtr) {
         return InternalAllocate(newSize, sourceName, sourceLine);
     }
 
     if (newSize == 0) {
-        InternalFree(oldPtr);
+        InternalFree(oldUserPtr);
         return nullptr;
     }
 
     // 获取旧块信息
     BlockInfo oldInfo;
-    if (!FindInHashTable(oldPtr, &oldInfo)) {
-        return nullptr;
-    }
-
-    // 如果新大小足够小，就地重用
-    size_t newAlignedSize = AlignSize(newSize + MemorySafetyConst::STANDARD_HEADER_SIZE + MemorySafetyConst::TAIL_MAGIC_SIZE, 16);
-    if (newAlignedSize <= oldInfo.totalSize) {
-        // 更新头部信息
-        SetupStormHeader(oldPtr, newSize, oldInfo.totalSize);
-
-        // 更新哈希表中的用户大小
-        EnterCriticalSection(&m_hashTableCs);
-        auto it = m_blockHashTable.find(oldPtr);
-        if (it != m_blockHashTable.end()) {
-            it->second.userSize = newSize;
+    {
+        std::lock_guard<std::mutex> lock(m_blockMapMutex);
+        auto it = m_blockMap.find(oldUserPtr);
+        if (it == m_blockMap.end()) {
+            return nullptr; // 不是我们管理的块
         }
-        LeaveCriticalSection(&m_hashTableCs);
-
-        return oldPtr;
+        oldInfo = it->second;
     }
 
-    // 分配新块
-    void* newPtr = InternalAllocate(newSize, sourceName, sourceLine);
-    if (newPtr) {
-        // 复制数据
-        size_t copySize = min(oldInfo.userSize, newSize);
-        memcpy(newPtr, oldPtr, copySize);
+    // 如果新大小小于等于旧大小，可以原地复用
+    if (newSize <= oldInfo.userSize) {
+        // 更新头部信息
+        SetupStormHeader(oldUserPtr, newSize);
 
-        // 释放旧块
-        InternalFree(oldPtr);
+        // 更新块追踪
+        {
+            std::lock_guard<std::mutex> lock(m_blockMapMutex);
+            auto& info = m_blockMap[oldUserPtr];
+            info.userSize = newSize;
+            info.sourceName = sourceName;
+            info.sourceLine = sourceLine;
+            info.allocTime = MemorySafetyUtils::GetTickCount();
+        }
+
+        return oldUserPtr;
     }
 
-    return newPtr;
-}
-
-void* MemorySafety::CreateBlock(size_t userSize, const char* sourceName, DWORD sourceLine) noexcept {
-    // 计算总大小：头部 + 用户数据 + 尾魔数
-    size_t totalSize = AlignSize(userSize + MemorySafetyConst::STANDARD_HEADER_SIZE + MemorySafetyConst::TAIL_MAGIC_SIZE, 16);
-
-    // VirtualAlloc分配
-    void* rawPtr = VirtualAlloc(nullptr, totalSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!rawPtr) {
-        LogError("[MemorySafety] VirtualAlloc失败: 大小=%zu", totalSize);
+    // 需要分配新块
+    void* newUserPtr = InternalAllocate(newSize, sourceName, sourceLine);
+    if (!newUserPtr) {
         return nullptr;
     }
 
-    // 计算用户指针
-    void* userPtr = static_cast<char*>(rawPtr) + MemorySafetyConst::STANDARD_HEADER_SIZE;
+    // 复制数据
+    size_t copySize = min(newSize, oldInfo.userSize);
+    memcpy(newUserPtr, oldUserPtr, copySize);
 
-    // 设置Storm兼容头部
-    SetupStormHeader(userPtr, userSize, totalSize);
+    // 释放旧块
+    InternalFree(oldUserPtr);
 
-    // 添加到哈希表
-    BlockInfo info = {
-        rawPtr, totalSize, userSize,
-        MemorySafetyUtils::GetTickCount(),
-        sourceName, sourceLine
-    };
-    AddToHashTable(userPtr, info);
-
-    return userPtr;
+    return newUserPtr;
 }
 
-bool MemorySafety::DestroyBlock(void* rawPtr) noexcept {
-    if (!rawPtr) return false;
+///////////////////////////////////////////////////////////////////////////////
+// Storm兼容头部管理
+///////////////////////////////////////////////////////////////////////////////
 
-    BOOL result = VirtualFree(rawPtr, 0, MEM_RELEASE);
-    if (!result) {
-        LogError("[MemorySafety] VirtualFree失败: %p, 错误=%u", rawPtr, GetLastError());
-        return false;
-    }
-
-    return true;
-}
-
-void MemorySafety::SetupStormHeader(void* userPtr, size_t userSize, size_t totalSize) noexcept {
-    if (!userPtr) return;
-
-    // 获取头部指针
-    StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
-        static_cast<char*>(userPtr) - MemorySafetyConst::STANDARD_HEADER_SIZE
-        );
-
-    // 设置头部字段
-    header->HeapPtr = MemorySafetyConst::STORM_SPECIAL_HEAP;
-    header->Size = static_cast<DWORD>(min(totalSize, 0xFFFFFFFFUL)); // 32位大小
-    header->AlignPadding = 0;
-    header->Flags = 0x1; // 启用尾魔数
-    header->Magic = MemorySafetyConst::STORM_FRONT_MAGIC;
-
-    // 设置尾魔数
-    WORD* tailMagic = reinterpret_cast<WORD*>(
-        static_cast<char*>(userPtr) + userSize
-        );
-    *tailMagic = MemorySafetyConst::STORM_TAIL_MAGIC;
+void MemorySafety::SetupStormHeader(void* userPtr, size_t userSize) noexcept {
+    SetupCompatibleHeader(userPtr, userSize);
 }
 
 bool MemorySafety::ValidateStormHeader(void* userPtr) const noexcept {
     if (!userPtr) return false;
 
-    // 检查头部魔数
-    StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
-        static_cast<char*>(userPtr) - MemorySafetyConst::STANDARD_HEADER_SIZE
-        );
+    return SafeExecute([=]() -> bool {
+        const StormAllocHeader* header = reinterpret_cast<const StormAllocHeader*>(
+            static_cast<const char*>(userPtr) - sizeof(StormAllocHeader));
 
-    if (header->Magic != MemorySafetyConst::STORM_FRONT_MAGIC) {
-        return false;
-    }
+        // 检查魔数
+        if (header->Magic != STORM_FRONT_MAGIC) {
+            return false;
+        }
 
-    if (header->HeapPtr != MemorySafetyConst::STORM_SPECIAL_HEAP) {
-        return false;
-    }
+        // 检查特殊堆标记
+        if (header->HeapPtr != STORM_SPECIAL_HEAP) {
+            return false;
+        }
 
-    return true;
+        // 检查尾魔数（如果启用）
+        if (header->Flags & 0x1) {
+            const WORD* tailMagic = reinterpret_cast<const WORD*>(
+                static_cast<const char*>(userPtr) + header->Size);
+            if (*tailMagic != STORM_TAIL_MAGIC) {
+                return false;
+            }
+        }
+
+        return true;
+        }, "ValidateStormHeader");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Size Class缓存管理
+///////////////////////////////////////////////////////////////////////////////
+
+void* MemorySafety::TryGetFromCache(size_t size) noexcept {
+    size_t sizeClass = GetSizeClass(size);
+    auto& cache = m_sizeClassCaches[sizeClass];
+
+    return SafeExecute([&]() -> void* {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+
+        for (auto it = cache.items.begin(); it != cache.items.end(); ++it) {
+            size_t requiredTotal = CalculateTotalSize(size);
+            if (it->totalSize >= requiredTotal) {
+                // 找到合适的块
+                void* rawPtr = it->rawPtr;
+                size_t totalSize = it->totalSize;
+
+                cache.items.erase(it);
+                cache.totalSize.fetch_sub(totalSize);
+                m_currentCached.fetch_sub(totalSize);
+
+                m_cacheHits.fetch_add(1);
+                return rawPtr;
+            }
+        }
+
+        // 尝试其他Size Class
+        for (size_t i = sizeClass + 1; i < MAX_SIZE_CLASSES; ++i) {
+            auto& otherCache = m_sizeClassCaches[i];
+            std::lock_guard<std::mutex> otherLock(otherCache.mutex);
+
+            if (!otherCache.items.empty()) {
+                auto& item = otherCache.items.front();
+                size_t requiredTotal = CalculateTotalSize(size);
+                if (item.totalSize >= requiredTotal) {
+                    void* rawPtr = item.rawPtr;
+                    size_t totalSize = item.totalSize;
+
+                    otherCache.items.erase(otherCache.items.begin());
+                    otherCache.totalSize.fetch_sub(totalSize);
+                    m_currentCached.fetch_sub(totalSize);
+
+                    m_cacheHits.fetch_add(1);
+                    return rawPtr;
+                }
+            }
+        }
+
+        m_cacheMisses.fetch_add(1);
+        return nullptr;
+        }, "TryGetFromCache");
+}
+
+void MemorySafety::AddToCache(void* rawPtr, size_t totalSize) noexcept {
+    if (!rawPtr || totalSize == 0) return;
+
+    size_t sizeClass = GetSizeClass(totalSize);
+    auto& cache = m_sizeClassCaches[sizeClass];
+
+    SafeExecute([&]() -> void {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+
+        // 检查缓存大小限制
+        size_t maxCacheBytes = m_maxCacheSizeMB.load() * 1024 * 1024;
+        if (GetTotalCached() + totalSize > maxCacheBytes) {
+            // 缓存已满，直接释放
+            VirtualFree(rawPtr, 0, MEM_RELEASE);
+            return;
+        }
+
+        // 添加到缓存
+        cache.items.emplace_back(rawPtr, totalSize);
+        cache.totalSize.fetch_add(totalSize);
+        m_currentCached.fetch_add(totalSize);
+        }, "AddToCache");
 }
 
 size_t MemorySafety::GetSizeClass(size_t size) const noexcept {
-    // 64KB为单位分档
-    size_t sizeClass = size >> MemorySafetyConst::SIZE_CLASS_SHIFT;
-    return min(sizeClass, MemorySafetyConst::SIZE_CLASS_COUNT - 1);
+    // 按64KB为单位分档
+    size_t sizeClass = (size + SIZE_CLASS_UNIT - 1) / SIZE_CLASS_UNIT;
+    if (sizeClass == 0) sizeClass = 1;
+    if (sizeClass > MAX_SIZE_CLASSES) sizeClass = MAX_SIZE_CLASSES;
+    return sizeClass - 1;  // 转换为0-based索引
 }
 
-void* MemorySafety::TryGetFromCache(size_t sizeClass, size_t minSize) noexcept {
-    EnterCriticalSection(&m_cacheCs[sizeClass]);
-
-    auto& cache = m_sizeClassCaches[sizeClass];
-    void* result = nullptr;
-
-    // 查找足够大的块
-    for (auto it = cache.freeBlocks.begin(); it != cache.freeBlocks.end(); ++it) {
-        if (it->totalSize >= minSize) {
-            result = it->rawPtr;
-            cache.totalCached -= it->totalSize;
-            cache.freeBlocks.erase(it);
-            break;
-        }
-    }
-
-    LeaveCriticalSection(&m_cacheCs[sizeClass]);
-    return result;
-}
-
-void MemorySafety::AddToCache(size_t sizeClass, void* rawPtr, size_t totalSize) noexcept {
-    EnterCriticalSection(&m_cacheCs[sizeClass]);
-
-    auto& cache = m_sizeClassCaches[sizeClass];
-
-    // 检查缓存是否已满
-    if (cache.freeBlocks.size() >= MemorySafetyConst::MAX_CACHE_PER_CLASS) {
-        // 释放最老的块
-        if (!cache.freeBlocks.empty()) {
-            auto& oldest = cache.freeBlocks[0];
-            DestroyBlock(oldest.rawPtr);
-            cache.totalCached -= oldest.totalSize;
-            cache.freeBlocks.erase(cache.freeBlocks.begin());
-        }
-    }
-
-    // 添加到缓存
-    cache.freeBlocks.push_back({ rawPtr, totalSize, MemorySafetyUtils::GetTickCount() });
-    cache.totalCached += totalSize;
-
-    LeaveCriticalSection(&m_cacheCs[sizeClass]);
-}
-
-void MemorySafety::CleanupSizeClass(size_t sizeClass, size_t maxRemove) noexcept {
-    if (sizeClass >= MemorySafetyConst::SIZE_CLASS_COUNT) return;
-
-    EnterCriticalSection(&m_cacheCs[sizeClass]);
-
-    auto& cache = m_sizeClassCaches[sizeClass];
-    size_t removed = 0;
-
-    while (!cache.freeBlocks.empty() && removed < maxRemove) {
-        auto& entry = cache.freeBlocks.back();
-        DestroyBlock(entry.rawPtr);
-        cache.totalCached -= entry.totalSize;
-        cache.freeBlocks.pop_back();
-        removed++;
-    }
-
-    LeaveCriticalSection(&m_cacheCs[sizeClass]);
-}
+///////////////////////////////////////////////////////////////////////////////
+// Hold队列管理
+///////////////////////////////////////////////////////////////////////////////
 
 void MemorySafety::AddToHoldQueue(void* rawPtr, size_t totalSize) noexcept {
-    EnterCriticalSection(&m_holdQueueCs);
+    if (!rawPtr) return;
 
-    m_holdQueue.push_back({ rawPtr, totalSize, MemorySafetyUtils::GetTickCount() });
-    stats.holdQueueSize.store(m_holdQueue.size());
-
-    LeaveCriticalSection(&m_holdQueueCs);
+    SafeExecute([=]() -> void {
+        std::lock_guard<std::mutex> lock(m_holdQueueMutex);
+        m_holdQueue.emplace(rawPtr, totalSize);
+        }, "AddToHoldQueue");
 }
 
 void MemorySafety::ProcessHoldQueue() noexcept {
-    SafeExecute([this]() -> void {
-        ProcessExpiredEntries();
-
-        // 检查内存压力
-        if (ShouldTriggerCleanup()) {
-            ForceCleanup();
-        }
-        }, "ProcessHoldQueue");
+    ProcessExpiredItems();
 }
 
-void MemorySafety::ProcessExpiredEntries() noexcept {
-    DWORD currentTime = MemorySafetyUtils::GetTickCount();
-    DWORD holdTime = m_holdTimeMs.load();
+void MemorySafety::ProcessExpiredItems() noexcept {
+    SafeExecute([this]() -> void {
+        std::lock_guard<std::mutex> lock(m_holdQueueMutex);
 
-    EnterCriticalSection(&m_holdQueueCs);
+        DWORD currentTime = MemorySafetyUtils::GetTickCount();
+        DWORD holdTime = m_holdTimeMs.load();
 
-    auto it = m_holdQueue.begin();
-    while (it != m_holdQueue.end()) {
-        DWORD entryAge = currentTime - it->queueTime;
+        while (!m_holdQueue.empty()) {
+            const auto& item = m_holdQueue.front();
 
-        if (entryAge >= holdTime) {
-            // 过期，尝试加入缓存或释放
-            size_t sizeClass = GetSizeClass(it->totalSize);
-
-            // 先尝试加入缓存
-            bool addedToCache = false;
-            EnterCriticalSection(&m_cacheCs[sizeClass]);
-
-            auto& cache = m_sizeClassCaches[sizeClass];
-            if (cache.freeBlocks.size() < MemorySafetyConst::MAX_CACHE_PER_CLASS &&
-                cache.totalCached + it->totalSize <= m_maxCacheSize.load()) {
-
-                cache.freeBlocks.push_back({ it->rawPtr, it->totalSize, currentTime });
-                cache.totalCached += it->totalSize;
-                addedToCache = true;
+            if (MemorySafetyUtils::HasTimeElapsed(item.releaseTime, holdTime)) {
+                // 过期了，尝试加入缓存或直接释放
+                AddToCache(item.rawPtr, item.totalSize);
+                m_holdQueue.pop();
             }
-
-            LeaveCriticalSection(&m_cacheCs[sizeClass]);
-
-            if (!addedToCache) {
-                // 直接释放
-                DestroyBlock(it->rawPtr);
+            else {
+                // 还没过期，后面的也不会过期（队列是按时间顺序的）
+                break;
             }
-
-            it = m_holdQueue.erase(it);
         }
-        else {
-            ++it;
-        }
-    }
-
-    stats.holdQueueSize.store(m_holdQueue.size());
-    LeaveCriticalSection(&m_holdQueueCs);
+        }, "ProcessExpiredItems");
 }
 
 void MemorySafety::DrainHoldQueue() noexcept {
     SafeExecute([this]() -> void {
-        EnterCriticalSection(&m_holdQueueCs);
+        std::lock_guard<std::mutex> lock(m_holdQueueMutex);
 
-        for (const auto& entry : m_holdQueue) {
-            DestroyBlock(entry.rawPtr);
+        size_t count = 0;
+        while (!m_holdQueue.empty()) {
+            const auto& item = m_holdQueue.front();
+            VirtualFree(item.rawPtr, 0, MEM_RELEASE);
+            m_holdQueue.pop();
+            count++;
         }
 
-        m_holdQueue.clear();
-        stats.holdQueueSize.store(0);
-
-        LeaveCriticalSection(&m_holdQueueCs);
-
-        LogMessage("[MemorySafety] Hold队列已清空");
+        if (count > 0) {
+            printf("[MemorySafety] DrainHoldQueue: 释放 %zu 个项目\n", count);
+        }
         }, "DrainHoldQueue");
 }
 
 size_t MemorySafety::GetHoldQueueSize() const noexcept {
-    return stats.holdQueueSize.load();
+    return SafeExecute([this]() -> size_t {
+        std::lock_guard<std::mutex> lock(m_holdQueueMutex);
+        return m_holdQueue.size();
+        }, "GetHoldQueueSize");
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// 压力清理
+///////////////////////////////////////////////////////////////////////////////
 
 void MemorySafety::ForceCleanup() noexcept {
     SafeExecute([this]() -> void {
-        LogMessage("[MemorySafety] 开始强制清理");
+        printf("[MemorySafety] 开始强制清理\n");
 
-        // 清空Hold队列
-        DrainHoldQueue();
+        // 1. 处理Hold队列
+        ProcessExpiredItems();
 
-        // 清理所有缓存的一半
-        for (size_t i = 0; i < MemorySafetyConst::SIZE_CLASS_COUNT; ++i) {
-            EnterCriticalSection(&m_cacheCs[i]);
-            size_t removeCount = m_sizeClassCaches[i].freeBlocks.size() / 2;
-            LeaveCriticalSection(&m_cacheCs[i]);
-
-            if (removeCount > 0) {
-                CleanupSizeClass(i, removeCount);
-            }
+        // 2. 检查内存压力并清理缓存
+        if (IsMemoryUnderPressure()) {
+            size_t freedSize = FlushCacheByPressure(2); // 中等压力
+            printf("[MemorySafety] 压力清理释放: %zu MB\n", freedSize / (1024 * 1024));
         }
 
         m_lastCleanupTime.store(MemorySafetyUtils::GetTickCount());
-        stats.forceCleanups.fetch_add(1);
-
-        LogMessage("[MemorySafety] 强制清理完成");
+        printf("[MemorySafety] 强制清理完成\n");
         }, "ForceCleanup");
 }
 
+size_t MemorySafety::FlushCacheByPressure(int pressureLevel) noexcept {
+    size_t totalFreed = 0;
+
+    SafeExecute([&]() -> void {
+        for (size_t i = 0; i < MAX_SIZE_CLASSES; ++i) {
+            auto& cache = m_sizeClassCaches[i];
+            std::lock_guard<std::mutex> lock(cache.mutex);
+
+            if (cache.items.empty()) continue;
+
+            // 根据压力级别决定清理比例
+            size_t targetRemove = 0;
+            switch (pressureLevel) {
+            case 1: targetRemove = cache.items.size() / 4; break; // 清理25%
+            case 2: targetRemove = cache.items.size() / 2; break; // 清理50%  
+            case 3: targetRemove = cache.items.size(); break;     // 清理100%
+            default: continue;
+            }
+
+            if (targetRemove == 0) continue;
+
+            // 按时间排序，清理最老的项
+            std::sort(cache.items.begin(), cache.items.end(),
+                [](const CacheItem& a, const CacheItem& b) {
+                    return a.cacheTime < b.cacheTime;
+                });
+
+            size_t actualRemove = min(targetRemove, cache.items.size());
+            for (size_t j = 0; j < actualRemove; ++j) {
+                VirtualFree(cache.items[j].rawPtr, 0, MEM_RELEASE);
+                totalFreed += cache.items[j].totalSize;
+                cache.totalSize.fetch_sub(cache.items[j].totalSize);
+                m_currentCached.fetch_sub(cache.items[j].totalSize);
+            }
+
+            cache.items.erase(cache.items.begin(), cache.items.begin() + actualRemove);
+        }
+        }, "FlushCacheByPressure");
+
+    return totalFreed;
+}
+
 bool MemorySafety::IsMemoryUnderPressure() const noexcept {
-    size_t vmUsage = GetProcessVirtualMemoryUsage();
-    return vmUsage > m_memoryWatermark.load();
+    size_t vmUsage = MemorySafetyUtils::GetProcessVirtualMemoryUsage();
+    size_t watermarkBytes = m_watermarkMB.load() * 1024 * 1024;
+    return vmUsage > watermarkBytes;
+}
+
+void MemorySafety::TriggerPressureCleanup() noexcept {
+    DWORD currentTime = MemorySafetyUtils::GetTickCount();
+    DWORD lastCleanup = m_lastCleanupTime.load();
+
+    // 避免过于频繁的清理
+    if (!MemorySafetyUtils::HasTimeElapsed(lastCleanup, MIN_CLEANUP_INTERVAL_MS)) {
+        return;
+    }
+
+    m_lastCleanupTime.store(currentTime);
+
+    SafeExecute([this]() -> void {
+        printf("[MemorySafety] 触发压力清理\n");
+
+        // 清理Hold队列中的过期项
+        ProcessExpiredItems();
+
+        // 根据压力级别清理缓存
+        FlushCacheByPressure(2);  // 中等压力清理
+        }, "TriggerPressureCleanup");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// 工具函数
+///////////////////////////////////////////////////////////////////////////////
+
+size_t MemorySafety::CalculateTotalSize(size_t userSize) const noexcept {
+    // 计算总需要的大小：StormHeader + 用户数据 + 尾魔数 + 对齐
+    size_t totalSize = sizeof(StormAllocHeader) + userSize + sizeof(WORD);
+    return AlignSize(totalSize, 16); // 16字节对齐
+}
+
+void* MemorySafety::GetRawPtrFromUser(void* userPtr) const noexcept {
+    if (!userPtr) return nullptr;
+    return static_cast<char*>(userPtr) - sizeof(StormAllocHeader);
+}
+
+void* MemorySafety::GetUserPtrFromRaw(void* rawPtr, size_t userSize) const noexcept {
+    if (!rawPtr) return nullptr;
+    return static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
 }
 
 size_t MemorySafety::GetTotalCached() const noexcept {
     size_t total = 0;
-
-    for (size_t i = 0; i < MemorySafetyConst::SIZE_CLASS_COUNT; ++i) {
-        EnterCriticalSection(&m_cacheCs[i]);
-        total += m_sizeClassCaches[i].totalCached;
-        LeaveCriticalSection(&m_cacheCs[i]);
+    for (size_t i = 0; i < MAX_SIZE_CLASSES; ++i) {
+        total += m_sizeClassCaches[i].totalSize.load();
     }
-
     return total;
-}
-
-bool MemorySafety::ShouldTriggerCleanup() const noexcept {
-    DWORD currentTime = MemorySafetyUtils::GetTickCount();
-    DWORD lastCleanup = m_lastCleanupTime.load();
-
-    if (currentTime - lastCleanup < MemorySafetyConst::MIN_CLEANUP_INTERVAL_MS) {
-        return false;
-    }
-
-    return IsMemoryUnderPressure() || GetTotalCached() > m_maxCacheSize.load();
-}
-
-void MemorySafety::AddToHashTable(void* userPtr, const BlockInfo& info) noexcept {
-    EnterCriticalSection(&m_hashTableCs);
-    m_blockHashTable[userPtr] = info;
-    LeaveCriticalSection(&m_hashTableCs);
-}
-
-bool MemorySafety::RemoveFromHashTable(void* userPtr, BlockInfo* outInfo) noexcept {
-    EnterCriticalSection(&m_hashTableCs);
-
-    auto it = m_blockHashTable.find(userPtr);
-    if (it == m_blockHashTable.end()) {
-        LeaveCriticalSection(&m_hashTableCs);
-        return false;
-    }
-
-    if (outInfo) {
-        *outInfo = it->second;
-    }
-
-    m_blockHashTable.erase(it);
-    LeaveCriticalSection(&m_hashTableCs);
-
-    return true;
-}
-
-bool MemorySafety::FindInHashTable(void* userPtr, BlockInfo* outInfo) const noexcept {
-    EnterCriticalSection(&m_hashTableCs);
-
-    auto it = m_blockHashTable.find(userPtr);
-    if (it == m_blockHashTable.end()) {
-        LeaveCriticalSection(&m_hashTableCs);
-        return false;
-    }
-
-    if (outInfo) {
-        *outInfo = it->second;
-    }
-
-    LeaveCriticalSection(&m_hashTableCs);
-    return true;
-}
-
-size_t MemorySafety::GetProcessVirtualMemoryUsage() const noexcept {
-    PROCESS_MEMORY_COUNTERS_EX pmc = { sizeof(pmc) };
-    if (GetProcessMemoryInfo(GetCurrentProcess(),
-        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
-        return pmc.PrivateUsage;
-    }
-    return 0;
-}
-
-void MemorySafety::SetHoldTimeMs(DWORD timeMs) noexcept {
-    m_holdTimeMs.store(timeMs);
-    LogMessage("[MemorySafety] 缓冲时间设置为 %u ms", timeMs);
-}
-
-void MemorySafety::SetWatermarkMB(size_t watermarkMB) noexcept {
-    m_memoryWatermark.store(watermarkMB * 1024 * 1024);
-    LogMessage("[MemorySafety] 内存水位设置为 %zu MB", watermarkMB);
-}
-
-void MemorySafety::SetMaxCacheSize(size_t maxCacheMB) noexcept {
-    m_maxCacheSize.store(maxCacheMB * 1024 * 1024);
-    LogMessage("[MemorySafety] 最大缓存设置为 %zu MB", maxCacheMB);
-}
-
-void MemorySafety::LogMessage(const char* format, ...) const noexcept {
-    EnterCriticalSection(&m_logCs);
-
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-
-    // 控制台输出
-    printf("%s\n", buffer);
-
-    // 文件输出
-    if (m_logFile != INVALID_HANDLE_VALUE) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-
-        char timeBuffer[64];
-        sprintf_s(timeBuffer, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
-
-        DWORD written;
-        WriteFile(m_logFile, timeBuffer, static_cast<DWORD>(strlen(timeBuffer)), &written, nullptr);
-        WriteFile(m_logFile, buffer, static_cast<DWORD>(strlen(buffer)), &written, nullptr);
-        WriteFile(m_logFile, "\r\n", 2, &written, nullptr);
-        FlushFileBuffers(m_logFile);
-    }
-
-    LeaveCriticalSection(&m_logCs);
-}
-
-void MemorySafety::LogError(const char* format, ...) const noexcept {
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-
-    LogMessage("[ERROR] %s", buffer);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 工具函数实现
-///////////////////////////////////////////////////////////////////////////////
-
-namespace MemorySafetyUtils {
-    DWORD GetTickCount() noexcept {
-        return ::GetTickCount64() & 0xFFFFFFFF; // 防止64位回绕问题
-    }
-
-    bool HasTimeElapsed(DWORD startTime, DWORD intervalMs) noexcept {
-        DWORD currentTime = GetTickCount();
-        return (currentTime - startTime) >= intervalMs;
-    }
-
-    size_t AlignSize(size_t size, size_t alignment) noexcept {
-        return (size + alignment - 1) & ~(alignment - 1);
-    }
-
-    size_t GetPageAlignedSize(size_t size) noexcept {
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        return AlignSize(size, si.dwPageSize);
-    }
-
-    bool IsValidPointer(void* ptr) noexcept {
-        if (!ptr) return false;
-
-        __try {
-            volatile char test = *static_cast<char*>(ptr);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
-        }
-    }
-
-    bool IsValidMemoryRange(void* ptr, size_t size) noexcept {
-        if (!ptr || size == 0) return false;
-
-        __try {
-            MEMORY_BASIC_INFORMATION mbi;
-            if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) {
-                return false;
-            }
-
-            return (mbi.State & MEM_COMMIT) &&
-                !(mbi.Protect & PAGE_NOACCESS) &&
-                !(mbi.Protect & PAGE_GUARD);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
-        }
-    }
 }

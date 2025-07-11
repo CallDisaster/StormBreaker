@@ -50,53 +50,65 @@ typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, s
 typedef void(*StormHeap_CleanupAll_t)();
 
 ///////////////////////////////////////////////////////////////////////////////
-// SEH安全包装 - 修复语法问题的版本
+// C风格SEH安全包装 - 避免RAII混用问题
 ///////////////////////////////////////////////////////////////////////////////
 
-// 简单的SEH包装宏，接受代码块
-#define SAFE_CALL_BOOL(operation, code_block) \
-    do { \
-        __try { \
-            code_block \
-        } \
-        __except (EXCEPTION_EXECUTE_HANDLER) { \
-            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
-            return false; \
-        } \
-    } while(0)
+extern "C" {
+    // C风格操作函数指针类型
+    typedef int(__stdcall* SafeOperationFunc)(void* context);
 
-#define SAFE_CALL_PTR(operation, code_block) \
-    do { \
-        __try { \
-            code_block \
-        } \
-        __except (EXCEPTION_EXECUTE_HANDLER) { \
-            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
-            return nullptr; \
-        } \
-    } while(0)
+    // SEH安全执行函数 - 纯C实现，无RAII
+    int __stdcall SafeExecuteVoid(SafeOperationFunc func, void* context, const char* operation);
+    int __stdcall SafeExecuteInt(SafeOperationFunc func, void* context, const char* operation);
+    void* __stdcall SafeExecutePtr(SafeOperationFunc func, void* context, const char* operation);
+}
 
-#define SAFE_CALL_VOID(operation, code_block) \
-    do { \
-        __try { \
-            code_block \
-        } \
-        __except (EXCEPTION_EXECUTE_HANDLER) { \
-            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
-            return; \
-        } \
-    } while(0)
+// C++包装宏 - 简化使用
+#define SAFE_CALL_VOID(operation, func, context) \
+    SafeExecuteVoid(func, context, operation)
 
-#define SAFE_CALL_INT(operation, code_block) \
-    do { \
-        __try { \
-            code_block \
-        } \
-        __except (EXCEPTION_EXECUTE_HANDLER) { \
-            LogError("[SEH] Exception 0x%08X in " operation, GetExceptionCode()); \
-            return 0; \
-        } \
-    } while(0)
+#define SAFE_CALL_INT(operation, func, context) \
+    SafeExecuteInt(func, context, operation)
+
+#define SAFE_CALL_PTR(operation, func, context) \
+    SafeExecutePtr(func, context, operation)
+
+///////////////////////////////////////////////////////////////////////////////
+// 操作上下文结构体定义
+///////////////////////////////////////////////////////////////////////////////
+
+struct AllocContext {
+    int ecx, edx;
+    size_t size;
+    const char* name;
+    DWORD src_line;
+    DWORD flag;
+    size_t result;
+};
+
+struct FreeContext {
+    int a1;
+    char* name;
+    int argList;
+    int a4;
+    int result;
+};
+
+struct ReallocContext {
+    int ecx, edx;
+    void* oldPtr;
+    size_t newSize;
+    const char* name;
+    DWORD src_line;
+    DWORD flag;
+    void* result;
+};
+
+struct StabilizerContext {
+    int count;
+    const char* reason;
+    int cleanAllCount;
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 // 全局状态变量声明
@@ -290,29 +302,3 @@ bool InstallHooks() noexcept;
  * 卸载Hook
  */
 void UninstallHooks() noexcept;
-
-///////////////////////////////////////////////////////////////////////////////
-// 兼容性说明
-///////////////////////////////////////////////////////////////////////////////
-
-/*
- * 本Hook系统基于以下架构：
- *
- * 应用层: StormHook.cpp/h (Hook安装、分配路由、异常处理)
- *    ↓
- * 业务层: MemoryPool.cpp/h (策略管理、后台任务、Storm集成)
- *    ↓
- * 安全层: MemorySafety.cpp/h (缓冲队列、分档缓存、压力监控)
- *
- * 设计原则：
- * 1. 每个操作都有SEH异常保护，确保游戏不会因我们的代码崩溃
- * 2. 总是提供回退路径：我们的实现失败时使用Storm原生函数
- * 3. 最小化对游戏的影响：只hook必要的函数，其他保持原样
- * 4. 内存安全第一：宁可泄漏也不要野指针，通过缓冲机制避免Race Condition
- *
- * 故障恢复：
- * - 如果MemoryPool分配失败 → 回退到Storm原生分配
- * - 如果释放时发生异常 → 记录日志但不崩溃
- * - 如果CleanAll时异常 → 仍然调用Storm原生清理
- * - 如果内存压力过高 → 自动触发清理和Storm CleanupAll
- */
