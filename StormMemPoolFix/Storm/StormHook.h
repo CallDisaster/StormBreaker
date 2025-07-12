@@ -1,18 +1,30 @@
-﻿// StormHook.h - 修复重定义问题的版本
+﻿// StormHook.h - 配合修复后内存系统的版本
 #pragma once
 
 #include "pch.h"
-#include "StormCommon.h"      // 使用共享定义，包含LogMessage/LogError声明
+#include "StormCommon.h"
 #include "StormOffsets.h"
+#include "MemoryPool.h"
 #include "../Base/SafeExecute.h"
 #include <Windows.h>
 #include <atomic>
-#include <cstddef>
 #include <vector>
-#include <mutex>
 
 ///////////////////////////////////////////////////////////////////////////////
-// C风格SEH安全包装实现 - 避免RAII混用问题
+// 常量定义
+///////////////////////////////////////////////////////////////////////////////
+
+// 默认大块阈值：8KB（降低以减少虚拟内存使用）
+constexpr size_t DEFAULT_BIG_BLOCK_THRESHOLD = 8192;
+
+// JassVM特殊分配大小
+constexpr size_t JASSVM_BLOCK_SIZE = 0x28A8;
+
+// Storm清理间隔
+constexpr DWORD MIN_STORM_CLEANUP_INTERVAL = 20000;  // 20秒最小间隔
+
+///////////////////////////////////////////////////////////////////////////////
+// C风格SEH安全包装（避免C++对象和SEH混用）
 ///////////////////////////////////////////////////////////////////////////////
 
 extern "C" {
@@ -66,6 +78,13 @@ struct ReallocContext {
     void* result;
 };
 
+struct CleanupContext {
+    int cleanAllCount;
+    size_t workingSetMB;
+    size_t commitMB;
+    bool forceTrigger;
+};
+
 struct StabilizerContext {
     int count;
     const char* reason;
@@ -84,6 +103,8 @@ extern std::atomic<bool> g_insideUnsafePeriod;
 
 // 配置参数
 extern std::atomic<size_t> g_bigThreshold;
+extern std::atomic<size_t> g_workingSetLimit;
+extern std::atomic<size_t> g_commitLimit;
 
 // 统计数据
 extern std::atomic<size_t> g_totalAllocated;
@@ -101,26 +122,24 @@ extern StormHeap_CleanupAll_t s_origCleanupAll;
 extern std::atomic<int> g_cleanAllCounter;
 extern thread_local bool tls_inCleanAll;
 
-///////////////////////////////////////////////////////////////////////////////
-// 永久块管理
-///////////////////////////////////////////////////////////////////////////////
-
-class ThreadSafePermanentBlocks {
+// 永久稳定块管理（简化版本）
+class PermanentBlockManager {
 private:
     mutable CRITICAL_SECTION m_cs;
     std::vector<void*> m_blocks;
+    std::atomic<size_t> m_blockCount{ 0 };
 
 public:
-    ThreadSafePermanentBlocks() noexcept;
-    ~ThreadSafePermanentBlocks() noexcept;
+    PermanentBlockManager() noexcept;
+    ~PermanentBlockManager() noexcept;
 
     void Add(void* ptr) noexcept;
     bool Contains(void* ptr) const noexcept;
     void Clear() noexcept;
-    size_t Size() const noexcept;
+    size_t Size() const noexcept { return m_blockCount.load(); }
 };
 
-extern ThreadSafePermanentBlocks g_permanentBlocks;
+extern PermanentBlockManager g_permanentBlocks;
 
 ///////////////////////////////////////////////////////////////////////////////
 // 主要接口函数
@@ -156,6 +175,18 @@ bool IsHooksInitialized() noexcept;
 void SetBigBlockThreshold(size_t sizeInBytes) noexcept;
 
 /**
+ * 设置工作集内存限制
+ * @param limitMB 限制大小（MB）
+ */
+void SetWorkingSetLimit(size_t limitMB) noexcept;
+
+/**
+ * 设置提交内存限制
+ * @param limitMB 限制大小（MB）
+ */
+void SetCommitLimit(size_t limitMB) noexcept;
+
+/**
  * 获取内存统计信息
  * @param allocated 总分配字节数
  * @param freed 总释放字节数
@@ -175,6 +206,11 @@ void PrintMemoryStatus() noexcept;
  */
 void ForceMemoryCleanup() noexcept;
 
+/**
+ * 检查内存压力并根据需要触发清理
+ */
+void CheckMemoryPressureAndCleanup() noexcept;
+
 ///////////////////////////////////////////////////////////////////////////////
 // Hook函数声明 - 内部使用
 ///////////////////////////////////////////////////////////////////////////////
@@ -187,7 +223,7 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 void Hooked_StormHeap_CleanupAll();
 
 ///////////////////////////////////////////////////////////////////////////////
-// 工具函数声明 - 除了LogMessage/LogError（已在StormCommon.h中声明）
+// 工具函数声明
 ///////////////////////////////////////////////////////////////////////////////
 
 /**
@@ -206,23 +242,56 @@ bool IsPermanentBlock(void* ptr) noexcept;
 bool IsJassVMAllocation(size_t size, const char* name) noexcept;
 
 /**
- * 获取当前进程虚拟内存使用量
- * @return 虚拟内存使用字节数
+ * 获取当前进程工作集大小
+ * @return 工作集大小（字节）
  */
-size_t GetProcessVirtualMemoryUsage() noexcept;
+size_t GetProcessWorkingSetSize() noexcept;
 
 /**
- * 创建永久稳定块
+ * 获取当前进程提交内存大小
+ * @return 提交内存大小（字节）
+ */
+size_t GetProcessCommittedSize() noexcept;
+
+/**
+ * 检查是否需要触发Storm清理
+ * @return 需要清理返回true
+ */
+bool ShouldTriggerStormCleanup() noexcept;
+
+/**
+ * 创建少量永久稳定块（降低频率）
  * @param count 创建数量
  * @param reason 创建原因
  */
 void CreatePermanentStabilizers(int count, const char* reason) noexcept;
 
 /**
- * 创建临时稳定块
+ * 创建临时稳定块（大幅降低频率）
  * @param cleanAllCount CleanAll计数
  */
 void CreateTemporaryStabilizers(int cleanAllCount) noexcept;
+
+///////////////////////////////////////////////////////////////////////////////
+// 内存压力检测和管理
+///////////////////////////////////////////////////////////////////////////////
+
+/**
+ * 检查工作集内存压力
+ * @return 有压力返回true
+ */
+bool IsWorkingSetUnderPressure() noexcept;
+
+/**
+ * 检查提交内存压力
+ * @return 有压力返回true
+ */
+bool IsCommittedMemoryUnderPressure() noexcept;
+
+/**
+ * 智能内存清理（基于真实内存使用情况）
+ */
+void SmartMemoryCleanup() noexcept;
 
 ///////////////////////////////////////////////////////////////////////////////
 // 初始化相关函数
@@ -250,3 +319,17 @@ bool InstallHooks() noexcept;
  * 卸载Hook
  */
 void UninstallHooks() noexcept;
+
+///////////////////////////////////////////////////////////////////////////////
+// 操作函数声明（C风格，用于SEH安全调用）
+///////////////////////////////////////////////////////////////////////////////
+
+extern "C" {
+    int __stdcall AllocOperation(void* ctx);
+    int __stdcall FreeOperation(void* ctx);
+    int __stdcall ReallocOperation(void* ctx);
+    int __stdcall CleanAllOperation(void* ctx);
+    int __stdcall CreatePermanentStabilizersOperation(void* ctx);
+    int __stdcall CreateTemporaryStabilizersOperation(void* ctx);
+    int __stdcall SmartCleanupOperation(void* ctx);
+}

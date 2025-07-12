@@ -16,9 +16,9 @@ extern const WORD STORM_FRONT_MAGIC;
 extern const WORD STORM_TAIL_MAGIC;
 extern const DWORD STORM_SPECIAL_HEAP;
 
-// 默认配置
-extern const size_t DEFAULT_BIG_BLOCK_THRESHOLD;
-extern const size_t JASSVM_BLOCK_SIZE;
+// 内存压力阈值（基于工作集，不是虚拟内存）
+constexpr size_t DEFAULT_WORKING_SET_LIMIT = 1500 * 1024 * 1024;  // 1.2GB工作集
+constexpr size_t DEFAULT_COMMIT_LIMIT = 1500 * 1024 * 1024;       // 1GB提交内存
 
 ///////////////////////////////////////////////////////////////////////////////
 // Storm结构体定义 - 只在此处定义一次
