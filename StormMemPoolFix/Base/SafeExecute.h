@@ -1,13 +1,13 @@
-// SafeExecute.h - ĞŞ¸´µÄSEH°²È«°ü×°£¬±ÜÃâC++¶ÔÏóºÍSEH»ìÓÃ
+ï»¿// SafeExecute.h - ä¿®å¤çš„SEHå®‰å…¨åŒ…è£…ï¼Œé¿å…C++å¯¹è±¡å’ŒSEHæ··ç”¨
 #pragma once
 
 #include "pch.h"
 
 ///////////////////////////////////////////////////////////////////////////////
-// SEH°²È«°ü×° - ĞŞ¸´·µ»ØÀàĞÍÍÆµ¼ÎÊÌâ
+// SEHå®‰å…¨åŒ…è£… - ä¿®å¤è¿”å›ç±»å‹æ¨å¯¼é—®é¢˜
 ///////////////////////////////////////////////////////////////////////////////
 
-// ×¨ÃÅÎªvoid·µ»ØÀàĞÍÉè¼ÆµÄÄ£°åÌØ»¯
+// ä¸“é—¨ä¸ºvoidè¿”å›ç±»å‹è®¾è®¡çš„æ¨¡æ¿ç‰¹åŒ–
 template<typename Func>
 void SafeExecuteVoid(Func&& func, const char* operation) noexcept {
     __try {
@@ -18,7 +18,7 @@ void SafeExecuteVoid(Func&& func, const char* operation) noexcept {
     }
 }
 
-// ×¨ÃÅÎªÖ¸Õë·µ»ØÀàĞÍÉè¼ÆµÄÄ£°å
+// ä¸“é—¨ä¸ºæŒ‡é’ˆè¿”å›ç±»å‹è®¾è®¡çš„æ¨¡æ¿
 template<typename Func>
 auto SafeExecutePtr(Func&& func, const char* operation) noexcept -> decltype(func()) {
     using ReturnType = decltype(func());
@@ -33,7 +33,7 @@ auto SafeExecutePtr(Func&& func, const char* operation) noexcept -> decltype(fun
     }
 }
 
-// ×¨ÃÅÎªbool·µ»ØÀàĞÍÉè¼ÆµÄÄ£°å
+// ä¸“é—¨ä¸ºboolè¿”å›ç±»å‹è®¾è®¡çš„æ¨¡æ¿
 template<typename Func>
 bool SafeExecuteBool(Func&& func, const char* operation) noexcept {
     __try {
@@ -45,7 +45,7 @@ bool SafeExecuteBool(Func&& func, const char* operation) noexcept {
     }
 }
 
-// ×¨ÃÅÎªÊıÖµ·µ»ØÀàĞÍÉè¼ÆµÄÄ£°å
+// ä¸“é—¨ä¸ºæ•°å€¼è¿”å›ç±»å‹è®¾è®¡çš„æ¨¡æ¿
 template<typename Func>
 auto SafeExecuteValue(Func&& func, const char* operation) noexcept -> decltype(func()) {
     using ReturnType = decltype(func());
@@ -60,7 +60,7 @@ auto SafeExecuteValue(Func&& func, const char* operation) noexcept -> decltype(f
     }
 }
 
-// Í¨ÓÃµÄSafeExecute£¬´øÄ¬ÈÏÖµ²ÎÊı
+// é€šç”¨çš„SafeExecuteï¼Œå¸¦é»˜è®¤å€¼å‚æ•°
 template<typename Func, typename DefaultType>
 auto SafeExecuteWithDefault(Func&& func, const char* operation, DefaultType&& defaultValue) noexcept -> decltype(func()) {
     __try {
@@ -72,7 +72,7 @@ auto SafeExecuteWithDefault(Func&& func, const char* operation, DefaultType&& de
     }
 }
 
-// ¼æÈİ¾É´úÂëµÄSafeExecuteºÍSafeExecuteNonConst
+// å…¼å®¹æ—§ä»£ç çš„SafeExecuteå’ŒSafeExecuteNonConst
 template<typename Func>
 auto SafeExecute(Func&& func, const char* operation) noexcept -> decltype(func()) {
     using ReturnType = decltype(func());
@@ -101,25 +101,25 @@ auto SafeExecute(Func&& func, const char* operation) noexcept -> decltype(func()
     }
 }
 
-// SafeExecuteNonConst±ğÃû£¨Ïòºó¼æÈİ£©
+// SafeExecuteNonConståˆ«åï¼ˆå‘åå…¼å®¹ï¼‰
 template<typename Func>
 auto SafeExecuteNonConst(Func&& func, const char* operation) noexcept -> decltype(func()) {
     return SafeExecute(std::forward<Func>(func), operation);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// C·ç¸ñSEH°ü×° - ÓÃÓÚ¸ü¸´ÔÓµÄ³¡¾°
+// Cé£æ ¼SEHåŒ…è£… - ç”¨äºæ›´å¤æ‚çš„åœºæ™¯
 ///////////////////////////////////////////////////////////////////////////////
 
 extern "C" {
     typedef int(__stdcall* SafeOperationFunc)(void* context);
 
-    // C·ç¸ñSEH°ü×°º¯Êı
+    // Cé£æ ¼SEHåŒ…è£…å‡½æ•°
     int __stdcall SafeExecuteOperation(SafeOperationFunc func, void* context, const char* operation);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// ±ãÀûºê¶¨Òå
+// ä¾¿åˆ©å®å®šä¹‰
 ///////////////////////////////////////////////////////////////////////////////
 
 #define SAFE_VOID(operation, func) \
