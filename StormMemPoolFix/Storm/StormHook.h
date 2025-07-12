@@ -1,8 +1,10 @@
-﻿// StormHook.h - 修复后的Storm Hook系统
+﻿// StormHook.h - 修复重定义问题的版本
 #pragma once
 
 #include "pch.h"
+#include "StormCommon.h"      // 使用共享定义，包含LogMessage/LogError声明
 #include "StormOffsets.h"
+#include "../Base/SafeExecute.h"
 #include <Windows.h>
 #include <atomic>
 #include <cstddef>
@@ -10,47 +12,7 @@
 #include <mutex>
 
 ///////////////////////////////////////////////////////////////////////////////
-// Storm结构体定义 - 基于IDA Pro逆向分析
-///////////////////////////////////////////////////////////////////////////////
-
-#pragma pack(push, 1)
-struct StormAllocHeader {
-    DWORD HeapPtr;      // 指向所属堆结构 (我们使用0xC0DEFEED特殊标记)
-    DWORD Size;         // 用户数据区大小
-    BYTE  AlignPadding; // 对齐填充字节数
-    BYTE  Flags;        // 标志位: 0x1=魔数校验, 0x2=已释放, 0x4=大块VirtualAlloc, 0x8=特殊指针
-    WORD  Magic;        // 前魔数 (0x6F6D)
-    // 用户数据从这里开始
-    // 如果 Flags & 1，则在用户数据末尾还有 WORD tailMagic = 0x12B1
-};
-#pragma pack(pop)
-
-///////////////////////////////////////////////////////////////////////////////
-// 常量定义
-///////////////////////////////////////////////////////////////////////////////
-
-// Storm魔数常量
-constexpr WORD STORM_FRONT_MAGIC = 0x6F6D;
-constexpr WORD STORM_TAIL_MAGIC = 0x12B1;
-constexpr DWORD STORM_SPECIAL_HEAP = 0xC0DEFEED;
-
-// 默认配置
-constexpr size_t DEFAULT_BIG_BLOCK_THRESHOLD = 128 * 1024;  // 128KB
-constexpr size_t JASSVM_BLOCK_SIZE = 0x28A8;                // JassVM特殊块大小
-
-///////////////////////////////////////////////////////////////////////////////
-// Storm函数类型定义 - 基于IDA Pro确认的地址
-///////////////////////////////////////////////////////////////////////////////
-
-typedef size_t(__fastcall* Storm_MemAlloc_t)(int ecx, int edx, size_t size,
-    const char* name, DWORD src_line, DWORD flag);
-typedef int(__stdcall* Storm_MemFree_t)(int a1, char* name, int argList, int a4);
-typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, size_t newSize,
-    const char* name, DWORD src_line, DWORD flag);
-typedef void(*StormHeap_CleanupAll_t)();
-
-///////////////////////////////////////////////////////////////////////////////
-// C风格SEH安全包装 - 避免RAII混用问题
+// C风格SEH安全包装实现 - 避免RAII混用问题
 ///////////////////////////////////////////////////////////////////////////////
 
 extern "C" {
@@ -225,22 +187,8 @@ void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t 
 void Hooked_StormHeap_CleanupAll();
 
 ///////////////////////////////////////////////////////////////////////////////
-// 工具函数声明
+// 工具函数声明 - 除了LogMessage/LogError（已在StormCommon.h中声明）
 ///////////////////////////////////////////////////////////////////////////////
-
-/**
- * 线程安全的日志记录函数
- * @param format 格式字符串
- * @param ... 参数
- */
-void LogMessage(const char* format, ...) noexcept;
-
-/**
- * 错误日志记录函数
- * @param format 格式字符串
- * @param ... 参数
- */
-void LogError(const char* format, ...) noexcept;
 
 /**
  * 检查指针是否为永久稳定块

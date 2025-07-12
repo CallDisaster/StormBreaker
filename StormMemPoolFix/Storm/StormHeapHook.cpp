@@ -14,6 +14,7 @@
 #include "StormHook.h" // Include after StormOffsets.h
 #include "MemoryPool.h"
 #include <shared_mutex>
+#include <Log/LogSystem.h>
 
 // 当块被 free 后, Storm 通常把头4字节改成 size(WORD) + AlignPadding(BYTE) + Flags(BYTE=2) + pNext
 #pragma pack(push,1)

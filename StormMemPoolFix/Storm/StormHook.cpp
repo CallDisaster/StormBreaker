@@ -11,6 +11,7 @@
 #include <thread>
 #include <condition_variable>
 #include <Psapi.h>
+#include <Log/LogSystem.h>
 
 #pragma comment(lib, "detours.lib")
 #pragma comment(lib, "psapi.lib")
@@ -415,54 +416,6 @@ void Hooked_StormHeap_CleanupAll() {
     SAFE_CALL_VOID("Hooked_StormHeap_CleanupAll", CleanAllOperation, nullptr);
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// 工具函数实现
-///////////////////////////////////////////////////////////////////////////////
-
-void LogMessage(const char* format, ...) noexcept {
-    if (!format || !g_logInitialized) return;
-
-    EnterCriticalSection(&g_logCs);
-
-    // 获取时间戳
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-
-    // 格式化消息
-    char buffer[2048];
-    va_list args;
-    va_start(args, format);
-    int len = vsnprintf(buffer, sizeof(buffer) - 1, format, args);
-    va_end(args);
-
-    if (len > 0) {
-        buffer[len] = '\0';
-
-        // 控制台输出
-        printf("[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buffer);
-
-        // 文件输出
-        if (g_logFile) {
-            fprintf(g_logFile, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buffer);
-            fflush(g_logFile);
-        }
-    }
-
-    LeaveCriticalSection(&g_logCs);
-}
-
-void LogError(const char* format, ...) noexcept {
-    if (!format) return;
-
-    char buffer[2048];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-
-    LogMessage("[ERROR] %s", buffer);
-}
-
 bool IsJassVMAllocation(size_t size, const char* name) noexcept {
     return (size == JASSVM_BLOCK_SIZE &&
         name &&
@@ -504,8 +457,8 @@ void CreateTemporaryStabilizers(int cleanAllCount) noexcept {
 bool InitializeLogging() noexcept {
     InitializeCriticalSection(&g_logCs);
 
-    g_logFile = fopen("StormHook.log", "w");
-    if (g_logFile) {
+    // 将 fopen 改为 fopen_s
+    if (fopen_s(&g_logFile, "StormHook.log", "w") == 0) {
         g_logInitialized = true;
         LogMessage("[初始化] 日志系统启动成功");
         return true;
