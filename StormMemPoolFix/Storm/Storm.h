@@ -30,19 +30,6 @@ namespace StormConst {
     constexpr size_t MIN_ALLOC_SIZE = 16;       // 最小分配大小
 }
 
-//---------------------------------------------------------------------------
-//  StormAllocHeader —— 8字节标准头部
-//---------------------------------------------------------------------------
-#pragma pack(push, 1)
-struct StormAllocHeader {
-    uint16_t Size;      // 总块大小（包含头+用户区+尾部），大块时填0xFFFF
-    uint8_t  AlignPad;  // 对齐填充字节数
-    uint8_t  Flags;     // 标志位组合（见 StormConst）
-    uint16_t HeapHigh;  // 堆标识高16位（Storm内部使用）
-    uint16_t Magic;     // 固定魔数 0x6F6D
-};
-#pragma pack(pop)
-
 static_assert(sizeof(StormAllocHeader) == 8, "StormAllocHeader must be 8 bytes");
 
 //---------------------------------------------------------------------------

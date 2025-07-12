@@ -1,9 +1,9 @@
-// SafeExecute.cpp - C·ç¸ñSEH°ü×°ÊµÏÖ
+ï»¿// SafeExecute.cpp - Cé£Žæ ¼SEHåŒ…è£…å®žçŽ°
 #include "pch.h"
 #include "SafeExecute.h"
 
 ///////////////////////////////////////////////////////////////////////////////
-// C·ç¸ñSEH°ü×°ÊµÏÖ
+// Cé£Žæ ¼SEHåŒ…è£…å®žçŽ°
 ///////////////////////////////////////////////////////////////////////////////
 
 extern "C" {
@@ -13,7 +13,7 @@ extern "C" {
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation ? operation : "Unknown");
-            return 0;  // Ê§°Ü
+            return 0;  // å¤±è´¥
         }
     }
 }

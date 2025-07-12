@@ -1,21 +1,19 @@
-﻿// MemoryPool.h - 修复重定义问题的版本
+﻿// MemoryPool.h - 修复版本，统一使用MemorySafety
 #pragma once
 
 #include "pch.h"
-#include "StormCommon.h"  // 使用共享定义
+#include "StormCommon.h"
 #include "../Base/SafeExecute.h"
 #include "../Base/MemorySafety.h"
 #include <Windows.h>
 #include <psapi.h>
 #include <atomic>
-#include <mutex>
 #include <thread>
 #include <chrono>
 #include <functional>
-#include <vector>
 #include <memory>
 
-// 内存池统计信息 - 修复拷贝构造问题
+// 内存池统计信息
 struct MemoryPoolStats {
     // 基础统计
     size_t totalAllocated = 0;
@@ -45,35 +43,9 @@ struct MemoryPoolStats {
         const std::atomic<size_t>& misses,
         const std::atomic<size_t>& stormCleanups,
         const std::atomic<size_t>& pressureClnps
-    ) {
-        MemoryPoolStats stats;
-        stats.totalAllocated = alloc.load();
-        stats.totalFreed = freed.load();
-        stats.currentInUse = inUse.load();
-        stats.peakUsage = peak.load();
-        stats.allocCount = allocCnt.load();
-        stats.freeCount = freeCnt.load();
-        stats.reallocCount = reallocCnt.load();
-        stats.cacheHits = hits.load();
-        stats.cacheMisses = misses.load();
-        stats.stormCleanupTriggers = stormCleanups.load();
-        stats.pressureCleanups = pressureClnps.load();
-        return stats;
-    }
+    );
 
-    void Reset() noexcept {
-        totalAllocated = 0;
-        totalFreed = 0;
-        currentInUse = 0;
-        peakUsage = 0;
-        allocCount = 0;
-        freeCount = 0;
-        reallocCount = 0;
-        cacheHits = 0;
-        cacheMisses = 0;
-        stormCleanupTriggers = 0;
-        pressureCleanups = 0;
-    }
+    void Reset() noexcept;
 };
 
 // 内存池配置参数
@@ -89,7 +61,7 @@ struct MemoryPoolConfig {
     bool enableDetailedLogging = false;           // 启用详细日志
 };
 
-// JassVM专用内存池（简化实现）
+// JassVM专用内存池（基于MemorySafety实现）
 namespace JVM_MemPool {
     void Initialize();
     void* Allocate(std::size_t size);
@@ -99,7 +71,7 @@ namespace JVM_MemPool {
     void Cleanup();
 }
 
-// 小块内存池（简化实现）  
+// 小块内存池（基于MemorySafety实现）  
 namespace SmallBlockPool {
     void Initialize();
     bool ShouldIntercept(std::size_t size);
@@ -116,7 +88,7 @@ public:
     // 生命周期管理
     bool Initialize(const MemoryPoolConfig& config = {}) noexcept;
     void Shutdown() noexcept;
-    bool IsInitialized() const noexcept { return m_initialized.load(); }
+    bool IsInitialized() const noexcept;
 
     // 主要内存操作接口
     void* Allocate(size_t size, const char* sourceName = nullptr, DWORD sourceLine = 0) noexcept;
@@ -188,46 +160,45 @@ private:
 
 private:
     // 初始化状态
-    std::atomic<bool> m_initialized{ false };
-    std::atomic<bool> m_shutdownRequested{ false };
+    std::atomic<bool> m_initialized;
+    std::atomic<bool> m_shutdownRequested;
 
     // 配置参数
     MemoryPoolConfig m_config;
-    mutable std::mutex m_configMutex;
+    mutable CRITICAL_SECTION m_configCs;
 
-    // 核心内存管理器
+    // 核心内存管理器引用
     MemorySafety& m_memorySafety;
 
     // Storm函数指针
-    StormHeap_CleanupAll_t m_stormCleanupFunc{ nullptr };
+    StormHeap_CleanupAll_t m_stormCleanupFunc;
 
     // 统计信息（原子变量，避免拷贝构造问题）
-    std::atomic<size_t> m_totalAllocated{ 0 };
-    std::atomic<size_t> m_totalFreed{ 0 };
-    std::atomic<size_t> m_currentInUse{ 0 };
-    std::atomic<size_t> m_peakUsage{ 0 };
-    std::atomic<size_t> m_allocCount{ 0 };
-    std::atomic<size_t> m_freeCount{ 0 };
-    std::atomic<size_t> m_reallocCount{ 0 };
-    std::atomic<size_t> m_cacheHits{ 0 };
-    std::atomic<size_t> m_cacheMisses{ 0 };
-    std::atomic<size_t> m_stormCleanupTriggers{ 0 };
-    std::atomic<size_t> m_pressureCleanups{ 0 };
+    std::atomic<size_t> m_totalAllocated;
+    std::atomic<size_t> m_totalFreed;
+    std::atomic<size_t> m_currentInUse;
+    std::atomic<size_t> m_peakUsage;
+    std::atomic<size_t> m_allocCount;
+    std::atomic<size_t> m_freeCount;
+    std::atomic<size_t> m_reallocCount;
+    std::atomic<size_t> m_cacheHits;
+    std::atomic<size_t> m_cacheMisses;
+    std::atomic<size_t> m_stormCleanupTriggers;
+    std::atomic<size_t> m_pressureCleanups;
 
     // 后台任务
     std::unique_ptr<std::thread> m_backgroundThread;
-    std::atomic<bool> m_backgroundTaskRunning{ false };
-    std::mutex m_backgroundMutex;
-    std::condition_variable m_backgroundCondition;
+    std::atomic<bool> m_backgroundTaskRunning;
+    CRITICAL_SECTION m_backgroundCs;
 
     // 最后清理时间（避免频繁清理）
-    std::atomic<DWORD> m_lastCleanupTime{ 0 };
-    std::atomic<DWORD> m_lastStormCleanupTime{ 0 };
-    std::atomic<DWORD> m_lastStatsTime{ 0 };
+    std::atomic<DWORD> m_lastCleanupTime;
+    std::atomic<DWORD> m_lastStormCleanupTime;
+    std::atomic<DWORD> m_lastStatsTime;
 
     // 日志文件
-    mutable std::mutex m_logMutex;
-    HANDLE m_logFile{ INVALID_HANDLE_VALUE };
+    mutable CRITICAL_SECTION m_logCs;
+    HANDLE m_logFile;
 };
 
 // 全局访问宏
