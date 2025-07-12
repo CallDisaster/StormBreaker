@@ -1,7 +1,10 @@
-﻿// MemoryPool.h - 修复SafeExecuteNonConst模板问题
+﻿// MemoryPool.h - 修复重定义问题的版本
 #pragma once
 
 #include "pch.h"
+#include "StormCommon.h"  // 使用共享定义
+#include "../Base/SafeExecute.h"
+#include "../Base/MemorySafety.h"
 #include <Windows.h>
 #include <psapi.h>
 #include <atomic>
@@ -11,10 +14,6 @@
 #include <functional>
 #include <vector>
 #include <memory>
-#include "Base/MemorySafety.h"
-
-// 前向声明
-typedef void(*StormHeap_CleanupAll_t)();
 
 // 内存池统计信息 - 修复拷贝构造问题
 struct MemoryPoolStats {
@@ -106,56 +105,6 @@ namespace SmallBlockPool {
     bool ShouldIntercept(std::size_t size);
     void* Allocate(std::size_t size);
     bool Free(void* ptr, std::size_t size);
-}
-
-// SEH安全包装函数 - 修复void返回类型问题
-template<typename Func>
-auto SafeExecuteNonConst(Func&& func, const char* operation) noexcept {
-    using ReturnType = decltype(func());
-
-    __try {
-        if constexpr (std::is_same_v<ReturnType, void>) {
-            func();
-            return;
-        }
-        else {
-            return func();
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // 简单的printf输出，避免复杂的日志系统
-        printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation);
-
-        if constexpr (std::is_same_v<ReturnType, void>) {
-            return;
-        }
-        else if constexpr (std::is_pointer_v<ReturnType>) {
-            return nullptr;
-        }
-        else if constexpr (std::is_same_v<ReturnType, bool>) {
-            return false;
-        }
-        else if constexpr (std::is_arithmetic_v<ReturnType>) {
-            return static_cast<ReturnType>(0);
-        }
-        else {
-            return ReturnType{};
-        }
-    }
-}
-
-// 专门为需要默认值的情况提供的重载
-template<typename Func, typename DefaultType>
-auto SafeExecuteNonConstWithDefault(Func&& func, const char* operation, DefaultType defaultValue) noexcept {
-    using ReturnType = decltype(func());
-
-    __try {
-        return func();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation);
-        return defaultValue;
-    }
 }
 
 // 主内存池类

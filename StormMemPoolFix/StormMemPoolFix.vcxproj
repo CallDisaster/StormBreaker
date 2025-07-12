@@ -153,6 +153,7 @@
   <ItemGroup>
     <ClInclude Include="Base\fp_call.h" />
     <ClInclude Include="Base\MemorySafety.h" />
+    <ClInclude Include="Base\SafeExecute.h" />
     <ClInclude Include="Base\SmartMemoryManager.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="Game\GameDllReverse\AIL.h" />
@@ -163,7 +164,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
-    <ClInclude Include="Storm\StormFileIO.h" />
+    <ClInclude Include="Storm\StormCommon.h" />
     <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
@@ -172,6 +173,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Base\MemroySafety.cpp" />
+    <ClCompile Include="Base\SafeExecute.cpp" />
     <ClCompile Include="Base\SmartMemoryManger.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="Game\GameDllReverse\AIL.cpp" />
@@ -186,6 +188,7 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Storm\MemoryPool.cpp" />
+    <ClCompile Include="Storm\StormCommon.cpp" />
     <ClCompile Include="Storm\StormHeapHook.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />

@@ -1,6 +1,7 @@
-﻿// MemoryPool.cpp - 修复后的内存池实现
+﻿// MemoryPool.cpp - 修复后的简化实现
 #include "pch.h"
 #include "MemoryPool.h"
+#include "StormCommon.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -198,7 +199,7 @@ MemoryPool::~MemoryPool() noexcept {
 }
 
 bool MemoryPool::Initialize(const MemoryPoolConfig& config) noexcept {
-    return SafeExecuteNonConst([this, &config]() -> bool {
+    return SafeExecuteBool([this, &config]() -> bool {
         bool expected = false;
         if (!m_initialized.compare_exchange_strong(expected, true)) {
             return true; // 已初始化
@@ -222,10 +223,6 @@ bool MemoryPool::Initialize(const MemoryPoolConfig& config) noexcept {
         );
 
         LogMessage("[MemoryPool] 初始化开始");
-        LogMessage("[MemoryPool] 配置 - 大块阈值:%zuKB, 内存水位:%zuMB, 最大缓存:%zuMB",
-            m_config.bigBlockThreshold / 1024,
-            m_config.memoryWatermarkMB,
-            m_config.maxCacheSizeMB);
 
         // 初始化MemorySafety
         if (!m_memorySafety.Initialize()) {
@@ -251,12 +248,11 @@ bool MemoryPool::Initialize(const MemoryPoolConfig& config) noexcept {
 
         LogMessage("[MemoryPool] 初始化完成");
         return true;
-
-        }, "Initialize");
+        }, "MemoryPool::Initialize");
 }
 
 void MemoryPool::Shutdown() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         bool expected = true;
         if (!m_initialized.compare_exchange_strong(expected, false)) {
             return; // 已关闭
@@ -285,8 +281,7 @@ void MemoryPool::Shutdown() noexcept {
             CloseHandle(m_logFile);
             m_logFile = INVALID_HANDLE_VALUE;
         }
-
-        }, "Shutdown");
+        }, "MemoryPool::Shutdown");
 }
 
 void* MemoryPool::Allocate(size_t size, const char* sourceName, DWORD sourceLine) noexcept {
@@ -314,7 +309,7 @@ void* MemoryPool::ReallocSafe(void* oldPtr, size_t newSize, const char* sourceNa
 }
 
 void* MemoryPool::InternalAllocate(size_t size, const char* sourceName, DWORD sourceLine, bool useFallback) noexcept {
-    return SafeExecuteNonConst([this, size, sourceName, sourceLine, useFallback]() -> void* {
+    return SafeExecutePtr([this, size, sourceName, sourceLine, useFallback]() -> void* {
         if (!m_initialized.load()) {
             return nullptr;
         }
@@ -373,12 +368,11 @@ void* MemoryPool::InternalAllocate(size_t size, const char* sourceName, DWORD so
         LogError("[MemoryPool] 分配失败: 大小:%zu, 来源:%s:%u",
             size, sourceName ? sourceName : "null", sourceLine);
         return nullptr;
-
-        }, "InternalAllocate");
+        }, "MemoryPool::InternalAllocate");
 }
 
 bool MemoryPool::InternalFree(void* ptr, bool useFallback) noexcept {
-    return SafeExecuteNonConst([this, ptr, useFallback]() -> bool {
+    return SafeExecuteBool([this, ptr, useFallback]() -> bool {
         if (!ptr || !m_initialized.load()) {
             return false;
         }
@@ -433,12 +427,11 @@ bool MemoryPool::InternalFree(void* ptr, bool useFallback) noexcept {
 
         LogError("[MemoryPool] 释放失败: %p", ptr);
         return false;
-
-        }, "InternalFree");
+        }, "MemoryPool::InternalFree");
 }
 
 void* MemoryPool::InternalRealloc(void* oldPtr, size_t newSize, const char* sourceName, DWORD sourceLine, bool useFallback) noexcept {
-    return SafeExecuteNonConst([this, oldPtr, newSize, sourceName, sourceLine, useFallback]() -> void* {
+    return SafeExecutePtr([this, oldPtr, newSize, sourceName, sourceLine, useFallback]() -> void* {
         if (!m_initialized.load()) {
             return nullptr;
         }
@@ -495,23 +488,21 @@ void* MemoryPool::InternalRealloc(void* oldPtr, size_t newSize, const char* sour
 
         LogError("[MemoryPool] 重分配失败: %p, 大小:%zu", oldPtr, newSize);
         return nullptr;
-
-        }, "InternalRealloc");
+        }, "MemoryPool::InternalRealloc");
 }
 
 bool MemoryPool::IsFromPool(void* ptr) const noexcept {
-    return SafeExecuteNonConst([this, ptr]() -> bool {
+    return SafeExecuteBool([this, ptr]() -> bool {
         if (!ptr || !m_initialized.load()) {
             return false;
         }
 
         return JVM_MemPool::IsFromPool(ptr) || m_memorySafety.IsOurBlock(ptr);
-
-        }, "IsFromPool");
+        }, "MemoryPool::IsFromPool");
 }
 
 size_t MemoryPool::GetBlockSize(void* ptr) const noexcept {
-    return SafeExecuteNonConst([this, ptr]() -> size_t {
+    return SafeExecuteValue([this, ptr]() -> size_t {
         if (!ptr || !m_initialized.load()) {
             return 0;
         }
@@ -521,8 +512,7 @@ size_t MemoryPool::GetBlockSize(void* ptr) const noexcept {
         }
 
         return m_memorySafety.GetBlockSize(ptr);
-
-        }, "GetBlockSize");
+        }, "MemoryPool::GetBlockSize");
 }
 
 bool MemoryPool::IsLargeBlock(size_t size) const noexcept {
@@ -531,7 +521,7 @@ bool MemoryPool::IsLargeBlock(size_t size) const noexcept {
 }
 
 void MemoryPool::CheckMemoryPressure() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         if (!m_config.enableMemoryPressureMonitoring) {
             return;
         }
@@ -548,12 +538,11 @@ void MemoryPool::CheckMemoryPressure() noexcept {
             ForceCleanup();
             m_pressureCleanups.fetch_add(1);
         }
-
-        }, "CheckMemoryPressure");
+        }, "MemoryPool::CheckMemoryPressure");
 }
 
 void MemoryPool::ForceCleanup() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         LogMessage("[MemoryPool] 开始强制清理");
 
         DWORD currentTime = MemorySafetyUtils::GetTickCount();
@@ -566,12 +555,11 @@ void MemoryPool::ForceCleanup() noexcept {
         TriggerStormCleanup();
 
         LogMessage("[MemoryPool] 强制清理完成");
-
-        }, "ForceCleanup");
+        }, "MemoryPool::ForceCleanup");
 }
 
 void MemoryPool::TriggerStormCleanup() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         if (!m_stormCleanupFunc) {
             return;
         }
@@ -594,24 +582,22 @@ void MemoryPool::TriggerStormCleanup() noexcept {
         __except (EXCEPTION_EXECUTE_HANDLER) {
             LogError("[MemoryPool] Storm清理异常: 0x%08X", GetExceptionCode());
         }
-
-        }, "TriggerStormCleanup");
+        }, "MemoryPool::TriggerStormCleanup");
 }
 
 void MemoryPool::StartBackgroundTasks() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         if (m_backgroundTaskRunning.exchange(true)) {
             return; // 已在运行
         }
 
         m_backgroundThread = std::make_unique<std::thread>(&MemoryPool::BackgroundTaskLoop, this);
         LogMessage("[MemoryPool] 后台任务已启动");
-
-        }, "StartBackgroundTasks");
+        }, "MemoryPool::StartBackgroundTasks");
 }
 
 void MemoryPool::StopBackgroundTasks() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         m_shutdownRequested.store(true);
         m_backgroundTaskRunning.store(false);
 
@@ -625,8 +611,7 @@ void MemoryPool::StopBackgroundTasks() noexcept {
         }
 
         LogMessage("[MemoryPool] 后台任务已停止");
-
-        }, "StopBackgroundTasks");
+        }, "MemoryPool::StopBackgroundTasks");
 }
 
 void MemoryPool::BackgroundTaskLoop() noexcept {
@@ -656,7 +641,7 @@ void MemoryPool::BackgroundTaskLoop() noexcept {
 }
 
 void MemoryPool::RunPeriodicTasks() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         DWORD currentTime = MemorySafetyUtils::GetTickCount();
 
         // 处理Hold队列
@@ -676,14 +661,13 @@ void MemoryPool::RunPeriodicTasks() noexcept {
                 PrintStatistics();
             }
         }
-
-        }, "RunPeriodicTasks");
+        }, "MemoryPool::RunPeriodicTasks");
 }
 
 void MemoryPool::ProcessHoldQueue() noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         m_memorySafety.ProcessHoldQueue();
-        }, "ProcessHoldQueue");
+        }, "MemoryPool::ProcessHoldQueue");
 }
 
 void MemoryPool::UpdateMemoryStats(size_t size, bool isAllocation) noexcept {
@@ -707,13 +691,12 @@ void MemoryPool::UpdateMemoryStats(size_t size, bool isAllocation) noexcept {
 }
 
 bool MemoryPool::IsMemoryUnderPressure() const noexcept {
-    return SafeExecuteNonConst([this]() -> bool {
+    return SafeExecuteBool([this]() -> bool {
         size_t currentVM = MemoryPoolUtils::GetProcessVirtualMemoryUsage();
         size_t watermarkBytes = m_config.memoryWatermarkMB * 1024 * 1024;
 
         return currentVM > watermarkBytes;
-
-        }, "IsMemoryUnderPressure");
+        }, "MemoryPool::IsMemoryUnderPressure");
 }
 
 MemoryPoolStats MemoryPool::GetStats() const noexcept {
@@ -725,7 +708,7 @@ MemoryPoolStats MemoryPool::GetStats() const noexcept {
 }
 
 void MemoryPool::PrintStatistics() const noexcept {
-    SafeExecuteNonConst([this]() -> void {
+    SafeExecuteVoid([this]() {
         MemoryPoolStats stats = GetStats();
 
         LogMessage("[MemoryPool] === 统计报告 ===");
@@ -749,8 +732,7 @@ void MemoryPool::PrintStatistics() const noexcept {
         size_t processVM = MemoryPoolUtils::GetProcessVirtualMemoryUsage();
         LogMessage("  进程虚拟内存: %zuMB", processVM / (1024 * 1024));
         LogMessage("========================");
-
-        }, "PrintStatistics");
+        }, "MemoryPool::PrintStatistics");
 }
 
 double MemoryPool::GetCacheHitRate() const noexcept {

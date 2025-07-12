@@ -84,9 +84,6 @@
     <ClInclude Include="Base\MemorySafety.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
-    <ClInclude Include="Storm\StormFileIO.h">
-      <Filter>头文件\Storm</Filter>
-    </ClInclude>
     <ClInclude Include="Log\MemoryTracker.h">
       <Filter>头文件\Log</Filter>
     </ClInclude>
@@ -110,6 +107,12 @@
     </ClInclude>
     <ClInclude Include="Base\SmartMemoryManager.h">
       <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Storm\StormCommon.h">
+      <Filter>头文件\Storm</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\SafeExecute.h">
+      <Filter>头文件\Base</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -156,6 +159,12 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="Base\MemroySafety.cpp">
+      <Filter>源文件\Base</Filter>
+    </ClCompile>
+    <ClCompile Include="Storm\StormCommon.cpp">
+      <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\SafeExecute.cpp">
       <Filter>源文件\Base</Filter>
     </ClCompile>
   </ItemGroup>
