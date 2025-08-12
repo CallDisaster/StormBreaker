@@ -66,3 +66,7 @@ inline LPCRITICAL_SECTION Storm_g_HeapCriticalSectionPtr(uint8_t index)
 
 // 新增Storm_g_HeapTable宏定义
 #define Storm_g_HeapTable (*(DWORD***)(gStormDllBase + OFFSET_g_HeapTable))
+
+bool InitializeStormOffsets();
+uintptr_t GetStormDllBase();
+bool IsStormOffsetsInitialized();

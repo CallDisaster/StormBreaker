@@ -72,8 +72,8 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <OutDir>D:\Work\War3\StormBreaker</OutDir>
-    <ExternalIncludePath>$(ProjectDir)Dependencies\nlohmann\include;$(ProjectDir)Dependencies\Detours\include;$(ProjectDir)Dependencies\mimalloc-dev\include;$(ProjectDir)Dependencies\spdlog\include;$(ProjectDir)Dependencies\tlsf;$(ExternalIncludePath)</ExternalIncludePath>
+    <OutDir>E:\Work\War3\StormBreaker</OutDir>
+    <ExternalIncludePath>$(ProjectDir)Dependencies\Detours\include;$(ProjectDir)Dependencies\mimalloc-dev\include;$(ProjectDir)Dependencies\spdlog\include;$(ProjectDir)Dependencies\tlsf;$(ExternalIncludePath)</ExternalIncludePath>
     <IncludePath>$(ProjectDir);$(IncludePath)</IncludePath>
     <LibraryPath>E:\Mycode\C++\StormMemPoolFix\StormMemPoolFix\StormMemPoolFix\Dependencies\mimalloc-dev\build\Release;$(ProjectDir)\Dependencies\Detours\lib.X86;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
@@ -112,7 +112,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>detours.lib;Shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>detours.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)$(TargetName).asi</OutputFile>
     </Link>
   </ItemDefinitionGroup>
@@ -153,34 +153,20 @@
   <ItemGroup>
     <ClInclude Include="Base\fp_call.h" />
     <ClInclude Include="Base\MemorySafety.h" />
-    <ClInclude Include="Base\SafeExecute.h" />
-    <ClInclude Include="Base\SmartMemoryManager.h" />
+    <ClInclude Include="Base\Logger.h" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="Game\GameDllReverse\AIL.h" />
-    <ClInclude Include="Game\GameHook.h" />
-    <ClInclude Include="Log\LogSystem.h" />
-    <ClInclude Include="Log\MemoryTracker.h" />
-    <ClInclude Include="Log\ReportViewer.h" />
+    <ClInclude Include="Game\PathCapUnlock.h" />
     <ClInclude Include="pch.h" />
-    <ClInclude Include="resource.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
-    <ClInclude Include="Storm\StormCommon.h" />
-    <ClInclude Include="Storm\StormHeap.h" />
     <ClInclude Include="Storm\StormHook.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
     <ClInclude Include="Storm\tlsf.h" />
-    <ClInclude Include="Utils\Resource\WebResourceExtractor.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Base\Logger.cpp" />
     <ClCompile Include="Base\MemroySafety.cpp" />
-    <ClCompile Include="Base\SafeExecute.cpp" />
-    <ClCompile Include="Base\SmartMemoryManger.cpp" />
     <ClCompile Include="dllmain.cpp" />
-    <ClCompile Include="Game\GameDllReverse\AIL.cpp" />
-    <ClCompile Include="Game\GameHook.cpp" />
-    <ClCompile Include="Log\LogSystem.cpp" />
-    <ClCompile Include="Log\MemoryTracker.cpp" />
-    <ClCompile Include="Log\ReportViewer.cpp" />
+    <ClCompile Include="Game\PathCapUnlock.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -188,21 +174,12 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Storm\MemoryPool.cpp" />
-    <ClCompile Include="Storm\StormCommon.cpp" />
-    <ClCompile Include="Storm\StormHeapHook.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />
     <ClCompile Include="Storm\tlsf.c">
       <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Default</CompileAs>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="Utils\Resource\WebResourceExtractor.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <ResourceCompile Include="StormBreaker.rc" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="Utils\Resource\index.html" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

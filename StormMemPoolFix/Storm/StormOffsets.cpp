@@ -28,3 +28,45 @@ uintptr_t OFFSET_g_HeapActiveFlag = 0x55370;
 uintptr_t OFFSET_g_HeapCriticalSections = 0x55770;
 uintptr_t OFFSET_g_HeapTable = 0x56F80;
 
+/**
+ * 初始化Storm.dll基址
+ * 应在程序启动时调用
+ */
+bool InitializeStormOffsets() {
+    HMODULE hStorm = GetModuleHandleA("Storm.dll");
+    if (!hStorm) {
+        printf("[ERROR] 无法获取Storm.dll模块句柄\n");
+        return false;
+    }
+
+    gStormDllBase = reinterpret_cast<uintptr_t>(hStorm);
+    printf("[INFO] Storm.dll基址已设置: 0x%p\n", hStorm);
+
+    // 验证几个关键偏移
+    __try {
+        bool memSysInit = Storm_g_MemorySystemInitialized;
+        size_t totalMem = Storm_g_TotalAllocatedMemory;
+        printf("[INFO] Storm内存系统验证: 已初始化=%s, 总内存=%zu\n",
+            memSysInit ? "是" : "否", totalMem);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        printf("[ERROR] Storm偏移验证失败，可能偏移不正确\n");
+        gStormDllBase = 0;
+        return false;
+    }
+}
+
+/**
+ * 获取Storm.dll基址
+ */
+uintptr_t GetStormDllBase() {
+    return gStormDllBase;
+}
+
+/**
+ * 检查Storm偏移是否已初始化
+ */
+bool IsStormOffsetsInitialized() {
+    return gStormDllBase != 0;
+}

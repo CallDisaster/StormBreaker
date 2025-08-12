@@ -1,59 +1,24 @@
-﻿// pch.h - 预编译头文件，解决缺失定义问题
-#pragma once
+﻿// pch.h: 这是预编译标头文件。
+// 下方列出的文件仅编译一次，提高了将来生成的生成性能。
+// 这还将影响 IntelliSense 性能，包括代码完成和许多代码浏览功能。
+// 但是，如果此处列出的文件中的任何一个在生成之间有更新，它们全部都将被重新编译。
+// 请勿在此处添加要频繁更新的文件，这将使得性能优势无效。
 
-// 标准C/C++头文件
+#ifndef PCH_H
+#define PCH_H
+
+// 添加要在此处预编译的标头
 #include <Windows.h>
-#include <iostream>
-#include <memory>
-#include <vector>
-#include <string>
-#include <atomic>
+#include <cstdio>
+#include <map>
 #include <mutex>
-#include <thread>
-#include <condition_variable>
-#include <chrono>
-#include <unordered_map>
-#include <queue>
-#include <algorithm>
-#include <functional>
-#include <type_traits>
+#include <vector>
+#include <cstring>
+#endif //PCH_H
 
-// Windows相关头文件
-#include <psapi.h>
-#include <TlHelp32.h>
-
-// 确保链接必要的库
-#pragma comment(lib, "psapi.lib")
-
-// 解决安全函数警告
-#define _CRT_SECURE_NO_WARNINGS
-
-// 常用的内存对齐宏
-#define ALIGN_UP(value, alignment) (((value) + (alignment) - 1) & ~((alignment) - 1))
-#define ALIGN_DOWN(value, alignment) ((value) & ~((alignment) - 1))
-
-// 常用的大小计算宏
-#define KB(x) ((x) * 1024)
-#define MB(x) ((x) * 1024 * 1024)
-#define GB(x) ((x) * 1024 * 1024 * 1024)
-
-// SEH辅助宏
-#define SAFE_TRY __try {
-#define SAFE_EXCEPT(operation) } __except(EXCEPTION_EXECUTE_HANDLER) { \
-    printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation); \
-}
-
-// 调试输出宏
-#ifdef _DEBUG
-#define DEBUG_PRINT(format, ...) printf("[DEBUG] " format "\n", ##__VA_ARGS__)
-#else
-#define DEBUG_PRINT(format, ...) ((void)0)
-#endif
-
-// 内存池相关常量
-namespace MemPoolConstants {
-    constexpr size_t DEFAULT_ALIGNMENT = 16;
-    constexpr size_t PAGE_SIZE = 4096;
-    constexpr size_t LARGE_BLOCK_THRESHOLD = 128 * 1024;  // 128KB
-    constexpr DWORD DEFAULT_HOLD_TIME = 500;              // 500ms
-}
+bool InitializeStormBreaker();
+void ShutdownStormBreaker();
+bool InstallStormHooks();
+void UninstallStormHooks();
+bool StartMemoryMonitoring();
+void StopMemoryMonitoring();
