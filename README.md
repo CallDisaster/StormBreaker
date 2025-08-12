@@ -3,6 +3,7 @@
 ## 项目简介
 
 **StormBreaker** 是一个针对魔兽争霸3（Warcraft III 1.27a）的内存管理优化插件。通过深度Hook暴雪Storm内存池系统，尝试解决Storm内存池大块的不常用资源一直占据虚拟内存的问题。
+本项目尚未被大规模测试，作者仅使用了自己地图作压力测试且没有崩溃后上传至Github。
 
 ## 🎯 核心功能
 
@@ -117,7 +118,7 @@ void* SafeTLSFMalloc(tlsf_t tlsf, size_t size) {
 Game Directory/
 ├── game.dll
 ├── storm.dll
-├── StormBreaker.dll          # 复制到游戏目录
+├── StormBreaker.asi          # 复制到游戏目录
 └── StormBreaker/             # 日志目录（自动创建）
     ├── StormMemory.log
     └── StormMemory.log.1
