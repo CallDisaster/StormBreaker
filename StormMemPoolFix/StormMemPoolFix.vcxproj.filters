@@ -25,35 +25,11 @@
     <Filter Include="头文件\Base">
       <UniqueIdentifier>{87914a8f-aaf9-459f-ae07-6c18a416f663}</UniqueIdentifier>
     </Filter>
-    <Filter Include="头文件\Log">
-      <UniqueIdentifier>{013e0e8b-8f1b-4103-90ef-310bf1f5525a}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="源文件\Log">
-      <UniqueIdentifier>{2593c254-ec8c-4a54-99ab-f58979e86182}</UniqueIdentifier>
-    </Filter>
     <Filter Include="源文件\Game">
-      <UniqueIdentifier>{d139edc1-0b36-4a0e-9d87-8a1ef4f6993f}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="源文件\Game\GameDllReverse">
-      <UniqueIdentifier>{ea393575-be4b-4861-a09b-2d9ea9c14059}</UniqueIdentifier>
+      <UniqueIdentifier>{ea4fc883-205e-4942-9341-0b66d840dc3c}</UniqueIdentifier>
     </Filter>
     <Filter Include="头文件\Game">
-      <UniqueIdentifier>{55162994-24da-499b-85d1-7f127f9081d5}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="头文件\Game\GameDllReverse">
-      <UniqueIdentifier>{bb82f8b6-a176-41de-9fcf-7f01095637b5}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="头文件\Utils">
-      <UniqueIdentifier>{0ef6dedd-a732-488a-acc6-3252eab988da}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="头文件\Utils\Resource">
-      <UniqueIdentifier>{da5d2eb6-6ea0-4a4c-816a-1c63586c014e}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="源文件\Utils">
-      <UniqueIdentifier>{6b047329-7af2-4230-9c07-fcc6a9bbacf7}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="源文件\Utils\Resource">
-      <UniqueIdentifier>{b0c4bad3-b16a-4244-9099-485931be2147}</UniqueIdentifier>
+      <UniqueIdentifier>{f1435e13-7af7-4151-b3c5-54f0b3fc9856}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -69,9 +45,6 @@
     <ClInclude Include="Storm\MemoryPool.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
-    <ClInclude Include="Storm\StormHeap.h">
-      <Filter>头文件\Storm</Filter>
-    </ClInclude>
     <ClInclude Include="Storm\StormHook.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
@@ -81,38 +54,14 @@
     <ClInclude Include="Storm\tlsf.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
+    <ClInclude Include="Base\Logger.h">
+      <Filter>头文件\Base</Filter>
+    </ClInclude>
     <ClInclude Include="Base\MemorySafety.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
-    <ClInclude Include="Log\MemoryTracker.h">
-      <Filter>头文件\Log</Filter>
-    </ClInclude>
-    <ClInclude Include="Log\LogSystem.h">
-      <Filter>头文件\Log</Filter>
-    </ClInclude>
-    <ClInclude Include="Game\GameDllReverse\AIL.h">
-      <Filter>头文件\Game\GameDllReverse</Filter>
-    </ClInclude>
-    <ClInclude Include="Game\GameHook.h">
+    <ClInclude Include="Game\PathCapUnlock.h">
       <Filter>头文件\Game</Filter>
-    </ClInclude>
-    <ClInclude Include="resource.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
-    <ClInclude Include="Utils\Resource\WebResourceExtractor.h">
-      <Filter>头文件\Utils\Resource</Filter>
-    </ClInclude>
-    <ClInclude Include="Log\ReportViewer.h">
-      <Filter>头文件\Log</Filter>
-    </ClInclude>
-    <ClInclude Include="Base\SmartMemoryManager.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
-    <ClInclude Include="Storm\StormCommon.h">
-      <Filter>头文件\Storm</Filter>
-    </ClInclude>
-    <ClInclude Include="Base\SafeExecute.h">
-      <Filter>头文件\Base</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -128,52 +77,20 @@
     <ClCompile Include="Storm\MemoryPool.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
-    <ClCompile Include="Storm\StormHeapHook.cpp">
-      <Filter>源文件\Storm</Filter>
-    </ClCompile>
     <ClCompile Include="Storm\StormHook.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
     <ClCompile Include="Storm\tlsf.c">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
-    <ClCompile Include="Log\MemoryTracker.cpp">
-      <Filter>源文件\Log</Filter>
-    </ClCompile>
-    <ClCompile Include="Log\LogSystem.cpp">
-      <Filter>源文件\Log</Filter>
-    </ClCompile>
-    <ClCompile Include="Log\ReportViewer.cpp">
-      <Filter>源文件\Log</Filter>
-    </ClCompile>
-    <ClCompile Include="Game\GameHook.cpp">
-      <Filter>源文件\Game</Filter>
-    </ClCompile>
-    <ClCompile Include="Game\GameDllReverse\AIL.cpp">
-      <Filter>源文件\Game\GameDllReverse</Filter>
-    </ClCompile>
-    <ClCompile Include="Utils\Resource\WebResourceExtractor.cpp">
-      <Filter>源文件\Utils\Resource</Filter>
-    </ClCompile>
-    <ClCompile Include="Base\SmartMemoryManger.cpp">
-      <Filter>源文件</Filter>
+    <ClCompile Include="Base\Logger.cpp">
+      <Filter>源文件\Base</Filter>
     </ClCompile>
     <ClCompile Include="Base\MemroySafety.cpp">
       <Filter>源文件\Base</Filter>
     </ClCompile>
-    <ClCompile Include="Storm\StormCommon.cpp">
-      <Filter>源文件\Storm</Filter>
+    <ClCompile Include="Game\PathCapUnlock.cpp">
+      <Filter>源文件\Game</Filter>
     </ClCompile>
-    <ClCompile Include="Base\SafeExecute.cpp">
-      <Filter>源文件\Base</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ResourceCompile Include="StormBreaker.rc">
-      <Filter>资源文件</Filter>
-    </ResourceCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="Utils\Resource\index.html" />
   </ItemGroup>
 </Project>

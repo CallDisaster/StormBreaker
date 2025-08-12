@@ -1,700 +1,862 @@
-﻿// StormHook.cpp - 修复后的Storm Hook实现
+// ======================== StormHook.cpp 完整修复版本 ========================
 #include "pch.h"
 #include "StormHook.h"
-#include "StormOffsets.h"
 #include "MemoryPool.h"
-#include <Windows.h>
+#include "Base/Logger.h"
+#include "Base/MemorySafety.h"
 #include <detours.h>
+#include <shared_mutex>
 #include <vector>
-#include <atomic>
-#include <mutex>
-#include <thread>
-#include <condition_variable>
-#include <Psapi.h>
-#include <Log/LogSystem.h>
+#include <algorithm>
+#include <memory>
+#include <cstdint>
+#include <unordered_map>
 
-#pragma comment(lib, "detours.lib")
-#pragma comment(lib, "psapi.lib")
+// ======================== 全局变量定义 ========================
+Storm_MemAlloc_t       g_origStormAlloc = nullptr;
+Storm_MemFree_t        g_origStormFree = nullptr;
+Storm_MemReAlloc_t     g_origStormReAlloc = nullptr;
+StormHeap_CleanupAll_t g_origCleanupAll = nullptr;
+ResetMemoryManager_t   g_origResetMemoryManager = nullptr;
 
-///////////////////////////////////////////////////////////////////////////////
-// 全局变量定义
-///////////////////////////////////////////////////////////////////////////////
+// ======================== 内部状态管理 ========================
+namespace {
+    // 线程安全的自管块表
+    std::shared_mutex g_managedBlocksMutex;
+    std::unordered_map<void*, ManagedBlockInfo> g_managedBlocks;
 
-// 核心状态变量
-std::atomic<bool> g_hooksInitialized{ false };
-std::atomic<bool> g_shutdownRequested{ false };
-std::atomic<bool> g_cleanAllInProgress{ false };
-std::atomic<bool> g_insideUnsafePeriod{ false };
+    // 全局状态标志
+    std::atomic<bool> g_initialized(false);
+    std::atomic<bool> g_inUnsafePeriod(false);
+    std::atomic<bool> g_inCleanupAll(false);
+    std::atomic<bool> g_inReset(false);
 
-// 内存阈值配置
-std::atomic<size_t> g_bigThreshold{ DEFAULT_BIG_BLOCK_THRESHOLD };
+    // 统计信息
+    std::atomic<size_t> g_totalAllocatedBlocks(0);
+    std::atomic<size_t> g_totalAllocatedBytes(0);
+    std::atomic<size_t> g_totalFreedBlocks(0);
+    std::atomic<size_t> g_totalFreedBytes(0);
 
-// 内存跟踪
-std::atomic<size_t> g_totalAllocated{ 0 };
-std::atomic<size_t> g_totalFreed{ 0 };
-std::atomic<size_t> g_hookAllocCount{ 0 };
-std::atomic<size_t> g_hookFreeCount{ 0 };
+    // 大块分配阈值（64KB）
+    std::atomic<size_t> g_largeBlockThreshold{ 128 * 1024 }; // 默认 128 KiB，更安全
 
-// Storm函数指针 - 基于IDA Pro确认的地址
-Storm_MemAlloc_t s_origStormAlloc = nullptr;
-Storm_MemFree_t s_origStormFree = nullptr;
-Storm_MemReAlloc_t s_origStormReAlloc = nullptr;
-StormHeap_CleanupAll_t s_origCleanupAll = nullptr;
+    // 线程局部状态（避免递归）
+    thread_local bool tls_inHook = false;
 
-// CleanAll相关状态
-std::atomic<int> g_cleanAllCounter{ 0 };
-thread_local bool tls_inCleanAll = false;
+    // 真实StormHeap探测
+    std::atomic<void*> g_defaultStormHeap{ nullptr };
+}
 
-// 日志相关
-static CRITICAL_SECTION g_logCs;
-static FILE* g_logFile = nullptr;
-static bool g_logInitialized = false;
+// ======================== SEH包装的辅助函数 ========================
+namespace SEH_Helpers {
+    DWORD g_lastExceptionCode = 0;
 
-///////////////////////////////////////////////////////////////////////////////
-// C风格SEH安全包装实现
-///////////////////////////////////////////////////////////////////////////////
+    // SEH包装的内存复制（避免C++对象）
+    BOOL SafeMemCopy_SEH(void* dst, const void* src, size_t size) {
+        if (!dst || !src || size == 0) return FALSE;
 
-extern "C" {
-    int __stdcall SafeExecuteVoid(SafeOperationFunc func, void* context, const char* operation) {
         __try {
-            return func(context);
+            memcpy(dst, src, size);
+            return TRUE;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            // 纯C代码，不能调用LogError（因为它可能包含C++对象）
-            printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation ? operation : "Unknown");
-            return 0;  // 失败
+            g_lastExceptionCode = GetExceptionCode();
+            return FALSE;
         }
     }
 
-    int __stdcall SafeExecuteInt(SafeOperationFunc func, void* context, const char* operation) {
+    // SEH包装的头部验证
+    BOOL ValidateHeader_SEH(const void* userPtr) {
+        if (!userPtr) return FALSE;
+
         __try {
-            return func(context);
+            const uint8_t* ptr = static_cast<const uint8_t*>(userPtr);
+            const StormAllocHeader* header = reinterpret_cast<const StormAllocHeader*>(ptr - sizeof(StormAllocHeader));
+
+            // 验证魔数
+            if (header->magic != STORM_FRONT_MAGIC) return FALSE;
+
+            // 验证HeapPtr不为空（防止野指针）
+            if (!header->heapPtr) return FALSE;
+
+            return TRUE;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation ? operation : "Unknown");
-            return 0;  // 失败
+            g_lastExceptionCode = GetExceptionCode();
+            return FALSE;
         }
     }
 
-    void* __stdcall SafeExecutePtr(SafeOperationFunc func, void* context, const char* operation) {
+    // SEH包装的原始Storm调用
+    void* CallOrigStormAlloc_SEH(int ecx, int edx, size_t size, const char* name, DWORD srcLine, DWORD flags) {
         __try {
-            return (void*)func(context);
+            return g_origStormAlloc ? g_origStormAlloc(ecx, edx, size, name, srcLine, flags) : nullptr;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            printf("[SEH] Exception 0x%08X in %s\n", GetExceptionCode(), operation ? operation : "Unknown");
-            return nullptr;  // 失败
-        }
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 永久稳定块管理实现
-///////////////////////////////////////////////////////////////////////////////
-
-ThreadSafePermanentBlocks::ThreadSafePermanentBlocks() noexcept {
-    InitializeCriticalSection(&m_cs);
-}
-
-ThreadSafePermanentBlocks::~ThreadSafePermanentBlocks() noexcept {
-    Clear();
-    DeleteCriticalSection(&m_cs);
-}
-
-void ThreadSafePermanentBlocks::Add(void* ptr) noexcept {
-    if (!ptr) return;
-
-    EnterCriticalSection(&m_cs);
-    m_blocks.push_back(ptr);
-    LeaveCriticalSection(&m_cs);
-}
-
-bool ThreadSafePermanentBlocks::Contains(void* ptr) const noexcept {
-    if (!ptr) return false;
-
-    bool found = false;
-    EnterCriticalSection(&m_cs);
-    for (void* block : m_blocks) {
-        if (block == ptr) {
-            found = true;
-            break;
-        }
-    }
-    LeaveCriticalSection(&m_cs);
-    return found;
-}
-
-void ThreadSafePermanentBlocks::Clear() noexcept {
-    EnterCriticalSection(&m_cs);
-    m_blocks.clear();
-    LeaveCriticalSection(&m_cs);
-}
-
-size_t ThreadSafePermanentBlocks::Size() const noexcept {
-    size_t size = 0;
-    EnterCriticalSection(&m_cs);
-    size = m_blocks.size();
-    LeaveCriticalSection(&m_cs);
-    return size;
-}
-
-ThreadSafePermanentBlocks g_permanentBlocks;
-
-///////////////////////////////////////////////////////////////////////////////
-// C风格操作函数实现
-///////////////////////////////////////////////////////////////////////////////
-
-// 分配操作
-int __stdcall AllocOperation(void* ctx) {
-    AllocContext* context = (AllocContext*)ctx;
-
-    // 更新统计（原子操作，无RAII）
-    g_hookAllocCount.fetch_add(1, std::memory_order_relaxed);
-
-    // 检查是否为JassVM特殊分配
-    bool isJassVM = (context->size == JASSVM_BLOCK_SIZE &&
-        context->name &&
-        strstr(context->name, "Instance.cpp") != nullptr);
-
-    if (isJassVM) {
-        void* jvmPtr = JVM_MemPool::Allocate(context->size);
-        if (jvmPtr) {
-            g_totalAllocated.fetch_add(context->size, std::memory_order_relaxed);
-            context->result = reinterpret_cast<size_t>(jvmPtr);
-            return 1;  // 成功
+            g_lastExceptionCode = GetExceptionCode();
+            return nullptr;
         }
     }
 
-    // 检查是否使用内存池
-    bool useManagedPool = (context->size >= g_bigThreshold.load(std::memory_order_relaxed));
-
-    if (useManagedPool && !g_shutdownRequested.load(std::memory_order_acquire)) {
-        void* managedPtr = g_MemoryPool.AllocateSafe(context->size, context->name, context->src_line);
-        if (managedPtr) {
-            g_totalAllocated.fetch_add(context->size, std::memory_order_relaxed);
-            context->result = reinterpret_cast<size_t>(managedPtr);
-            return 1;  // 成功
+    int CallOrigStormFree_SEH(void* ptr, const char* name, int argList, DWORD flags) {
+        __try {
+            return g_origStormFree ? g_origStormFree(ptr, name, argList, flags) : 1;
         }
-    }
-
-    // 回退到Storm原始分配
-    if (s_origStormAlloc) {
-        context->result = s_origStormAlloc(context->ecx, context->edx, context->size,
-            context->name, context->src_line, context->flag);
-        if (context->result) {
-            g_totalAllocated.fetch_add(context->size, std::memory_order_relaxed);
-        }
-        return 1;  // 成功
-    }
-
-    context->result = 0;
-    return 0;  // 失败
-}
-
-// 释放操作
-int __stdcall FreeOperation(void* ctx) {
-    FreeContext* context = (FreeContext*)ctx;
-
-    g_hookFreeCount.fetch_add(1, std::memory_order_relaxed);
-
-    if (!context->a1) {
-        context->result = 1;  // 空指针认为成功
-        return 1;
-    }
-
-    void* ptr = reinterpret_cast<void*>(context->a1);
-
-    // 检查是否为永久块
-    if (g_permanentBlocks.Contains(ptr)) {
-        context->result = 1;  // 永久块不释放，假装成功
-        return 1;
-    }
-
-    // 检查是否为JVM内存池指针
-    if (JVM_MemPool::IsFromPool(ptr)) {
-        JVM_MemPool::Free(ptr);
-        g_totalFreed.fetch_add(JASSVM_BLOCK_SIZE, std::memory_order_relaxed);
-        context->result = 1;
-        return 1;
-    }
-
-    // 检查是否为我们管理的大块
-    if (g_MemoryPool.IsFromPool(ptr)) {
-        size_t blockSize = g_MemoryPool.GetBlockSize(ptr);
-        bool success = g_MemoryPool.FreeSafe(ptr);
-        if (success && blockSize > 0) {
-            g_totalFreed.fetch_add(blockSize, std::memory_order_relaxed);
-            context->result = 1;
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_lastExceptionCode = GetExceptionCode();
             return 1;
         }
     }
 
-    // 回退到Storm原始释放
-    if (s_origStormFree) {
-        context->result = s_origStormFree(context->a1, context->name, context->argList, context->a4);
-        return 1;
+    void* CallOrigStormReAlloc_SEH(int ecx, int edx, void* oldPtr, size_t newSize, const char* name, DWORD srcLine, DWORD flags) {
+        __try {
+            return g_origStormReAlloc ? g_origStormReAlloc(ecx, edx, oldPtr, newSize, name, srcLine, flags) : nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_lastExceptionCode = GetExceptionCode();
+            return nullptr;
+        }
     }
 
-    context->result = 0;
-    return 0;
+    // === 新增：SEH保护的StormHeap探测函数 ===
+    BOOL CaptureHeapFromUserPtr_SEH(const void* userPtr, void** outHeap) {
+        if (!userPtr || !outHeap) return FALSE;
+        __try {
+            const uint8_t* p = (const uint8_t*)userPtr;
+            const StormAllocHeader* h = (const StormAllocHeader*)(p - sizeof(StormAllocHeader));
+            if (h->magic != STORM_FRONT_MAGIC || !h->heapPtr) return FALSE;
+            *outHeap = h->heapPtr;
+            return TRUE;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_lastExceptionCode = GetExceptionCode();
+            return FALSE;
+        }
+    }
+
+    void* ProbeAlloc32_SEH() {
+        __try {
+            return g_origStormAlloc ? g_origStormAlloc(0, 0, 32, "probe", 0, 0) : nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_lastExceptionCode = GetExceptionCode();
+            return nullptr;
+        }
+    }
+
+    void ProbeFree_SEH(void* p) {
+        __try {
+            if (g_origStormFree && p) g_origStormFree(p, "probe", 0, 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_lastExceptionCode = GetExceptionCode();
+        }
+    }
+
+    // 获取最后异常代码的函数，用于外部日志记录
+    DWORD GetLastExceptionCode() {
+        return g_lastExceptionCode;
+    }
+
+    // 清除异常代码
+    void ClearLastExceptionCode() {
+        g_lastExceptionCode = 0;
+    }
 }
 
-// 重分配操作
-int __stdcall ReallocOperation(void* ctx) {
-    ReallocContext* context = (ReallocContext*)ctx;
+// ======================== 内部实现函数 ========================
+namespace StormHook_Internal {
 
-    // 边界情况处理
-    if (!context->oldPtr) {
-        AllocContext allocCtx = { context->ecx, context->edx, context->newSize,
-                                 context->name, context->src_line, context->flag, 0 };
-        if (AllocOperation(&allocCtx)) {
-            context->result = reinterpret_cast<void*>(allocCtx.result);
-            return 1;
+    // 对齐辅助函数
+    static inline uint8_t* AlignUp(uint8_t* ptr, size_t alignment) {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        addr = (addr + (alignment - 1)) & ~(uintptr_t)(alignment - 1);
+        return reinterpret_cast<uint8_t*>(addr);
+    }
+
+    static BOOL __stdcall UpdateHeaderHeapPtr_SEH(void* userPtr, void* newHeap) {
+        __try {
+            uint8_t* p = (uint8_t*)userPtr;
+            StormAllocHeader* h = (StormAllocHeader*)(p - sizeof(StormAllocHeader));
+            if (h->magic != STORM_FRONT_MAGIC) return FALSE;
+            h->heapPtr = newHeap;
+            return TRUE;
         }
-        context->result = nullptr;
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return FALSE;
+        }
+    }
+
+    // === 新增：StormHeap探测函数 ===
+    bool ProbeDefaultStormHeapPointer() {
+        if (g_defaultStormHeap.load(std::memory_order_acquire)) return true;
+        if (!g_origStormAlloc || !g_origStormFree) return false;
+
+        void* tmp = SEH_Helpers::ProbeAlloc32_SEH();
+        if (!tmp) return false;
+
+        void* heap = nullptr;
+        if (SEH_Helpers::CaptureHeapFromUserPtr_SEH(tmp, &heap) && heap) {
+            void* expected = nullptr;
+            g_defaultStormHeap.compare_exchange_strong(expected, heap, std::memory_order_acq_rel);
+        }
+
+        SEH_Helpers::ProbeFree_SEH(tmp);
+        return g_defaultStormHeap.load(std::memory_order_acquire) != nullptr;
+    }
+
+    void* GetDefaultStormHeap() {
+        return g_defaultStormHeap.load(std::memory_order_acquire);
+    }
+
+    void TryCaptureDefaultHeapFromAllocResult(void* userPtr) {
+        if (GetDefaultStormHeap() || !userPtr) return;
+
+        void* heap = nullptr;
+        if (SEH_Helpers::CaptureHeapFromUserPtr_SEH(userPtr, &heap) && heap) {
+            void* expected = nullptr;
+            g_defaultStormHeap.compare_exchange_strong(expected, heap, std::memory_order_acq_rel);
+        }
+    }
+
+    bool RegisterManagedBlock(void* userPtr, const ManagedBlockInfo& info) {
+        if (!userPtr) return false;
+
+        std::unique_lock<std::shared_mutex> lock(g_managedBlocksMutex);
+
+        // 检查是否已存在
+        if (g_managedBlocks.find(userPtr) != g_managedBlocks.end()) {
+            Logger::GetInstance().LogWarning("尝试注册已存在的管理块: %p", userPtr);
+            return false;
+        }
+
+        g_managedBlocks[userPtr] = info;
+        g_totalAllocatedBlocks.fetch_add(1, std::memory_order_relaxed);
+        g_totalAllocatedBytes.fetch_add(info.originalSize, std::memory_order_relaxed);
+
+        return true;
+    }
+
+    void FixHeadersAfterReset(void* newHeap) {
+        if (!newHeap) return;
+
+        std::vector<void*> snapshot;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_managedBlocksMutex);
+            snapshot.reserve(g_managedBlocks.size());
+            for (const auto& kv : g_managedBlocks) snapshot.push_back(kv.first);
+        }
+
+        size_t ok = 0, fail = 0;
+        for (void* up : snapshot) {
+            if (UpdateHeaderHeapPtr_SEH(up, newHeap)) ++ok; else ++fail;
+        }
+        Logger::GetInstance().LogInfo("Reset后已修复heapPtr: 成功=%zu, 失败=%zu", ok, fail);
+    }
+
+    bool UnregisterManagedBlock(void* userPtr) {
+        if (!userPtr) return false;
+
+        std::unique_lock<std::shared_mutex> lock(g_managedBlocksMutex);
+
+        auto it = g_managedBlocks.find(userPtr);
+        if (it == g_managedBlocks.end()) {
+            return false;
+        }
+
+        g_totalFreedBlocks.fetch_add(1, std::memory_order_relaxed);
+        g_totalFreedBytes.fetch_add(it->second.originalSize, std::memory_order_relaxed);
+
+        g_managedBlocks.erase(it);
+        return true;
+    }
+
+    bool GetManagedBlockInfo(void* userPtr, ManagedBlockInfo& info) {
+        if (!userPtr) return false;
+
+        std::shared_lock<std::shared_mutex> lock(g_managedBlocksMutex);
+
+        auto it = g_managedBlocks.find(userPtr);
+        if (it == g_managedBlocks.end()) {
+            return false;
+        }
+
+        info = it->second;
+        return true;
+    }
+
+    // === 修改：使用真实StormHeap指针 ===
+    void SetupStormCompatibleHeader(void* userPtr, size_t size) {
+        if (!userPtr) return;
+
+        uint8_t* ptr = static_cast<uint8_t*>(userPtr);
+        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(ptr - sizeof(StormAllocHeader));
+
+        header->size = static_cast<uint16_t>(size & 0xFFFF);
+        // padding 已在 AllocateMemory 里设置
+        header->flags = 0; // 关键：不设置大页标记(0x4)
+
+        // 关键：写入"真实"的 StormHeap*，而不是函数地址或模块句柄
+        void* realHeap = GetDefaultStormHeap();
+        header->heapPtr = realHeap;   // 由探测流程保证非空
+        header->magic = STORM_FRONT_MAGIC;
+
+        Logger::GetInstance().LogDebug("设置Storm兼容头: ptr=%p, size=%zu, heapPtr=%p",
+            userPtr, size, header->heapPtr);
+    }
+
+    bool ValidateStormHeader(void* userPtr) {
+        return SEH_Helpers::ValidateHeader_SEH(userPtr) == TRUE;
+    }
+
+    size_t GetBlockSizeFromHeader(void* userPtr) {
+        if (!ValidateStormHeader(userPtr)) {
+            return 0;
+        }
+
+        const uint8_t* ptr = static_cast<const uint8_t*>(userPtr);
+        const StormAllocHeader* header = reinterpret_cast<const StormAllocHeader*>(ptr - sizeof(StormAllocHeader));
+
+        return header->size;
+    }
+
+    size_t GetBlockSizeFromManagedTable(void* userPtr) {
+        ManagedBlockInfo info;
+        if (GetManagedBlockInfo(userPtr, info)) {
+            return info.originalSize;
+        }
         return 0;
     }
 
-    if (context->newSize == 0) {
-        FreeContext freeCtx = { reinterpret_cast<int>(context->oldPtr),
-                               const_cast<char*>(context->name),
-                               (int)context->src_line, (int)context->flag, 0 };
-        FreeOperation(&freeCtx);
-        context->result = nullptr;
-        return 1;
+    void EnterUnsafePeriod() {
+        g_inUnsafePeriod.store(true, std::memory_order_release);
+        Logger::GetInstance().LogDebug("进入不安全期");
     }
 
-    // 检查是否为JVM内存池指针
-    if (JVM_MemPool::IsFromPool(context->oldPtr)) {
-        context->result = JVM_MemPool::Realloc(context->oldPtr, context->newSize);
-        return 1;
+    void ExitUnsafePeriod() {
+        g_inUnsafePeriod.store(false, std::memory_order_release);
+        Logger::GetInstance().LogDebug("退出不安全期");
+    }
+}
+
+// ======================== 公共接口实现 ========================
+namespace StormHook {
+
+    bool Initialize() {
+        if (g_initialized.exchange(true, std::memory_order_acq_rel)) {
+            return true; // 已初始化
+        }
+
+        Logger::GetInstance().LogInfo("初始化StormHook系统...");
+
+        // 初始化内存池
+        if (!MemoryPool::Initialize()) {
+            Logger::GetInstance().LogError("内存池初始化失败");
+            g_initialized.store(false, std::memory_order_release);
+            return false;
+        }
+
+        // 初始化内存安全系统
+        if (!MemorySafety::GetInstance().Initialize()) {
+            Logger::GetInstance().LogError("内存安全系统初始化失败");
+            g_initialized.store(false, std::memory_order_release);
+            return false;
+        }
+
+        // === 新增：主动探测默认StormHeap* ===
+        StormHook_Internal::ProbeDefaultStormHeapPointer();
+
+        Logger::GetInstance().LogInfo("StormHook系统初始化完成");
+        return true;
     }
 
-    // 检查是否为永久块
-    if (g_permanentBlocks.Contains(context->oldPtr)) {
-        // 永久块只分配新的，不释放旧的
-        AllocContext allocCtx = { context->ecx, context->edx, context->newSize,
-                                 context->name, context->src_line, context->flag, 0 };
-        if (AllocOperation(&allocCtx)) {
-            void* newPtr = reinterpret_cast<void*>(allocCtx.result);
-            if (newPtr) {
-                // 安全复制数据
-                size_t copySize = min(context->newSize, (size_t)64);  // 保守地复制64字节
-                memcpy(newPtr, context->oldPtr, copySize);
+    void Shutdown() {
+        if (!g_initialized.exchange(false, std::memory_order_acq_rel)) {
+            return; // 未初始化
+        }
+
+        Logger::GetInstance().LogInfo("关闭StormHook系统...");
+
+        // 清理所有管理的块
+        FlushManagedBlocks();
+
+        // 关闭内存安全系统
+        MemorySafety::GetInstance().Shutdown();
+
+        // 关闭内存池
+        MemoryPool::Shutdown();
+
+        Logger::GetInstance().LogInfo("StormHook系统已关闭");
+    }
+
+    bool IsOurBlock(void* userPtr) {
+        if (!userPtr || !g_initialized.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        // 快速检查：是否在我们的管理表中
+        std::shared_lock<std::shared_mutex> lock(g_managedBlocksMutex);
+        return g_managedBlocks.find(userPtr) != g_managedBlocks.end();
+    }
+
+    bool IsInUnsafePeriod() {
+        return g_inUnsafePeriod.load(std::memory_order_acquire) ||
+            g_inCleanupAll.load(std::memory_order_acquire) ||
+            g_inReset.load(std::memory_order_acquire);
+    }
+
+    void SetLargeBlockThreshold(size_t bytes) {
+        if (bytes < 64 * 1024) bytes = 64 * 1024; // 最低不小于 64 KiB
+        g_largeBlockThreshold.store(bytes, std::memory_order_release);
+        Logger::GetInstance().LogInfo("大块拦截阈值已设置为: %zu KiB", bytes / 1024);
+    }
+
+    size_t GetLargeBlockThreshold() {
+        return g_largeBlockThreshold.load(std::memory_order_acquire);
+    }
+
+    // === 修改：未获得真实StormHeap则不拦截 ===
+    void* AllocateMemory(size_t size, const char* name, DWORD srcLine) {
+        if (!g_initialized.load(std::memory_order_acquire) || tls_inHook) {
+            return nullptr;
+        }
+
+        // 修改：使用可调阈值
+        if (size < g_largeBlockThreshold.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+
+        // 在不安全期间直接回退到原生分配
+        if (IsInUnsafePeriod()) {
+            return nullptr;
+        }
+
+        // 未探测到真实StormHeap则回退
+        if (!StormHook_Internal::GetDefaultStormHeap()) {
+            return nullptr;
+        }
+
+        tls_inHook = true;
+
+        // 计算总需要的大小：头部 + 用户数据 + 对齐余量
+        const size_t headerSize = sizeof(StormAllocHeader);
+        const size_t alignment = 16;
+        const size_t totalNeeded = size + headerSize + (alignment - 1);
+
+        // 从TLSF分配原始内存（不使用AllocateAligned，我们自己处理对齐）
+        void* rawPtr = MemoryPool::Allocate(totalNeeded);
+        if (!rawPtr) {
+            Logger::GetInstance().LogError("TLSF分配失败: size=%zu", totalNeeded);
+            tls_inHook = false;
+            return nullptr;
+        }
+
+        // 计算对齐后的用户指针位置
+        uint8_t* rawBytes = static_cast<uint8_t*>(rawPtr);
+        uint8_t* userPtr = StormHook_Internal::AlignUp(rawBytes + headerSize, alignment);
+
+        // 验证有足够空间放置头部
+        const size_t actualHeaderOffset = static_cast<size_t>(userPtr - rawBytes);
+        if (actualHeaderOffset < headerSize) {
+            Logger::GetInstance().LogError("对齐计算错误: headerOffset=%zu < headerSize=%zu",
+                actualHeaderOffset, headerSize);
+            MemoryPool::Free(rawPtr);
+            tls_inHook = false;
+            return nullptr;
+        }
+
+        // 设置头部中的padding字段（记录额外的偏移量）
+        StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(userPtr - headerSize);
+        header->padding = static_cast<uint8_t>(actualHeaderOffset - headerSize);
+
+        // 设置Storm兼容头部（现在使用真实StormHeap指针）
+        StormHook_Internal::SetupStormCompatibleHeader(userPtr, size);
+
+        // 注册到管理表
+        ManagedBlockInfo info;
+        info.magic = STORMBREAKER_MAGIC;
+        info.originalSize = size;
+        info.rawPtr = rawPtr;
+        info.timestamp = GetTickCount();
+
+        if (!StormHook_Internal::RegisterManagedBlock(userPtr, info)) {
+            Logger::GetInstance().LogError("注册管理块失败: ptr=%p", userPtr);
+            MemoryPool::Free(rawPtr);
+            tls_inHook = false;
+            return nullptr;
+        }
+
+        // 注册到内存安全系统（在非不安全期间）
+        if (!IsInUnsafePeriod()) {
+            MemorySafety::GetInstance().RegisterMemoryBlock(rawPtr, userPtr, size, name, srcLine);
+        }
+
+        // 减少频繁的Debug日志输出，只在大块分配时记录
+        if (size >= 1024 * 1024) {  // 只记录1MB以上的大块分配
+            Logger::GetInstance().LogInfo("分配大块: user=%p, size=%zu MB", userPtr, size / (1024 * 1024));
+        }
+
+        tls_inHook = false;
+        return userPtr;
+    }
+
+    bool FreeMemory(void* ptr) {
+        if (!ptr || !g_initialized.load(std::memory_order_acquire) || tls_inHook) {
+            return false;
+        }
+
+        tls_inHook = true;
+
+        // 获取管理块信息
+        ManagedBlockInfo info;
+        if (!StormHook_Internal::GetManagedBlockInfo(ptr, info)) {
+            tls_inHook = false;
+            return false; // 不是我们管理的块
+        }
+
+        // 从管理表中移除（一定要先移，避免地址复用撞车）
+        if (!StormHook_Internal::UnregisterManagedBlock(ptr)) {
+            Logger::GetInstance().LogError("移除管理块失败: ptr=%p", ptr);
+        }
+
+        // 关键改动：无论是否处于不安全期，都尽力把 MemorySafety 的登记移除，避免"重复注册"
+        MemorySafety::GetInstance().TryUnregisterBlock(ptr);
+
+        // 释放 TLSF 内存
+        MemoryPool::Free(info.rawPtr);
+
+        if (info.originalSize >= 1024 * 1024) {
+            Logger::GetInstance().LogInfo("释放大块: ptr=%p, size=%zu MB",
+                ptr, info.originalSize / (1024 * 1024));
+        }
+
+        tls_inHook = false;
+        return true;
+    }
+
+    void* ReallocMemory(void* oldPtr, size_t newSize, const char* name, DWORD srcLine) {
+        if (!g_initialized.load(std::memory_order_acquire) || tls_inHook) {
+            return nullptr;
+        }
+
+        // 处理边界情况
+        if (!oldPtr) {
+            return AllocateMemory(newSize, name, srcLine);
+        }
+
+        if (newSize == 0) {
+            FreeMemory(oldPtr);
+            return nullptr;
+        }
+
+        tls_inHook = true;
+
+        // 获取旧块信息
+        ManagedBlockInfo oldInfo;
+        if (!StormHook_Internal::GetManagedBlockInfo(oldPtr, oldInfo)) {
+            tls_inHook = false;
+            return nullptr; // 不是我们管理的块
+        }
+
+        // 如果新大小不需要大块处理，返回失败让调用者处理
+        if (newSize < GetLargeBlockThreshold()) {
+            tls_inHook = false;
+            return nullptr;
+        }
+
+        // 分配新块（会自动处理对齐）
+        void* newPtr = AllocateMemory(newSize, name, srcLine);
+        if (!newPtr) {
+            Logger::GetInstance().LogError("重分配新块失败: size=%zu", newSize);
+            tls_inHook = false;
+            return nullptr;
+        }
+
+        // 复制数据（取较小的大小）
+        size_t copySize = (oldInfo.originalSize < newSize) ? oldInfo.originalSize : newSize;
+        if (!SEH_Helpers::SafeMemCopy_SEH(newPtr, oldPtr, copySize)) {
+            Logger::GetInstance().LogError("重分配数据复制失败");
+            FreeMemory(newPtr);
+            tls_inHook = false;
+            return nullptr;
+        }
+
+        // 释放旧块
+        FreeMemory(oldPtr);
+
+        Logger::GetInstance().LogDebug("成功重分配: old=%p->new=%p, oldSize=%zu->newSize=%zu",
+            oldPtr, newPtr, oldInfo.originalSize, newSize);
+
+        tls_inHook = false;
+        return newPtr;
+    }
+
+    void FlushManagedBlocks() {
+        Logger::GetInstance().LogInfo("清理所有管理块...");
+
+        std::vector<void*> blocksToFree;
+
+        {
+            std::shared_lock<std::shared_mutex> lock(g_managedBlocksMutex);
+            blocksToFree.reserve(g_managedBlocks.size());
+
+            for (const auto& pair : g_managedBlocks) {
+                blocksToFree.push_back(pair.first);
             }
-            context->result = newPtr;
-            return 1;
         }
-        context->result = nullptr;
-        return 0;
-    }
 
-    // 检查是否为我们管理的块
-    if (g_MemoryPool.IsFromPool(context->oldPtr)) {
-        void* newPtr = g_MemoryPool.ReallocSafe(context->oldPtr, context->newSize,
-            context->name, context->src_line);
-        context->result = newPtr;
-        return 1;
-    }
-
-    // 回退到Storm原始重分配
-    if (s_origStormReAlloc) {
-        context->result = s_origStormReAlloc(context->ecx, context->edx, context->oldPtr,
-            context->newSize, context->name,
-            context->src_line, context->flag);
-        return 1;
-    }
-
-    context->result = nullptr;
-    return 0;
-}
-
-// 创建永久稳定块操作
-int __stdcall CreatePermanentStabilizersOperation(void* ctx) {
-    StabilizerContext* context = (StabilizerContext*)ctx;
-
-    // 创建不同大小的稳定块
-    size_t sizes[] = { 64, 128, 256, 512, 1024, 2048, 4096 };
-    int sizeCount = sizeof(sizes) / sizeof(sizes[0]);
-
-    for (int i = 0; i < context->count && i < sizeCount; ++i) {
-        void* stabilizer = g_MemoryPool.AllocateSafe(sizes[i], "永久稳定块", 0);
-        if (stabilizer) {
-            g_permanentBlocks.Add(stabilizer);
+        for (void* ptr : blocksToFree) {
+            FreeMemory(ptr);
         }
-    }
-    return 1;
-}
 
-// 创建临时稳定块操作
-int __stdcall CreateTemporaryStabilizersOperation(void* ctx) {
-    StabilizerContext* context = (StabilizerContext*)ctx;
-
-    // 只在特定的CleanAll计数时创建
-    if (context->cleanAllCount % 50 != 0) return 1;
-
-    // 创建几个临时块
-    for (int i = 0; i < 3; ++i) {
-        size_t size = 32 * (1 << i);  // 32, 64, 128
-        void* stabilizer = g_MemoryPool.AllocateSafe(size, "临时稳定块", 0);
-        // 临时块不加入永久列表
-    }
-    return 1;
-}
-
-// CleanAll操作
-int __stdcall CleanAllOperation(void* ctx) {
-    // 防止重入
-    if (tls_inCleanAll) {
-        return 1;
+        Logger::GetInstance().LogInfo("清理完成，共清理%zu个块", blocksToFree.size());
     }
 
-    tls_inCleanAll = true;
-    g_cleanAllInProgress.store(true, std::memory_order_release);
+    void ProcessDeferredFree() {
+        MemorySafety::GetInstance().ProcessDeferredFreeQueue();
+    }
 
-    int currentCount = g_cleanAllCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+    size_t GetManagedBlockCount() {
+        return g_totalAllocatedBlocks.load(std::memory_order_relaxed) -
+            g_totalFreedBlocks.load(std::memory_order_relaxed);
+    }
 
-    // 通知进入不安全期
-    g_insideUnsafePeriod.store(true, std::memory_order_release);
+    size_t GetTotalManagedSize() {
+        return g_totalAllocatedBytes.load(std::memory_order_relaxed) -
+            g_totalFreedBytes.load(std::memory_order_relaxed);
+    }
 
-    // 检查内存压力并触发清理
-    PROCESS_MEMORY_COUNTERS_EX pmc{};
-    pmc.cb = sizeof(pmc);
-    if (GetProcessMemoryInfo(GetCurrentProcess(),
-        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
-        sizeof(pmc))) {
-        if (pmc.PrivateUsage > 1400LL * 1024 * 1024) {  // 1.4GB
-            g_MemoryPool.ForceCleanup();
+    void PrepareForReset() {
+        Logger::GetInstance().LogDebug("准备Reset，进入不安全期...");
+        g_inReset.store(true, std::memory_order_release);
+
+        // 我们自己的不安全期
+        StormHook_Internal::EnterUnsafePeriod();
+        // 让 MemorySafety 也进入不安全期
+        MemorySafety::GetInstance().EnterUnsafePeriod();
+
+        // 为避免 Reset 过程后半段才去 free，尽量在 Reset 前清空延迟队列
+        MemorySafety::GetInstance().FlushDeferredFreeQueue();
+
+        // 清理 TLSF 空闲页
+        MemoryPool::TrimFreePages();
+    }
+
+    void PostReset() {
+        Logger::GetInstance().LogDebug("Reset完成，开始收尾...");
+
+        // Reset 后，Storm 会重建 StormHeap，先重探一次默认 StormHeap*
+        (void)StormHook_Internal::ProbeDefaultStormHeapPointer();
+        void* newHeap = StormHook_Internal::GetDefaultStormHeap();
+
+        // 用新的 StormHeap* 修我们头里的 heapPtr，避免后续校验/回收踩旧堆
+        StormHook_Internal::FixHeadersAfterReset(newHeap);
+
+        // 先退出 MemorySafety 的不安全期，再处理可能积压的延迟释放
+        MemorySafety::GetInstance().ExitUnsafePeriod();
+        MemorySafety::GetInstance().ProcessDeferredFreeQueue();
+
+        // 退出我们的不安全期
+        StormHook_Internal::ExitUnsafePeriod();
+        g_inReset.store(false, std::memory_order_release);
+
+        Logger::GetInstance().LogInfo("ResetMemoryManager完成");
+    }
+
+    // 新增：验证指针是否正确对齐
+    bool IsPointerAligned(void* ptr, size_t alignment) {
+        if (!ptr) return false;
+        return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
+    }
+
+    // 新增：验证我们分配的内存是否正确对齐
+    bool ValidateBlockAlignment(void* userPtr) {
+        if (!userPtr || !IsOurBlock(userPtr)) {
+            return false;
         }
+
+        // 检查用户指针是否16字节对齐
+        if (!IsPointerAligned(userPtr, 16)) {
+            Logger::GetInstance().LogError("用户指针未正确16字节对齐: %p", userPtr);
+            return false;
+        }
+
+        // 验证头部位置
+        const uint8_t* ptr = static_cast<const uint8_t*>(userPtr);
+        const StormAllocHeader* header = reinterpret_cast<const StormAllocHeader*>(ptr - sizeof(StormAllocHeader));
+
+        // 检查魔数
+        if (header->magic != STORM_FRONT_MAGIC) {
+            Logger::GetInstance().LogError("头部魔数不正确: %p, magic=0x%04X", userPtr, header->magic);
+            return false;
+        }
+
+        // 检查HeapPtr是否有效
+        if (!header->heapPtr) {
+            Logger::GetInstance().LogError("头部heapPtr为空: %p", userPtr);
+            return false;
+        }
+
+        return true;
     }
-
-    // 调用Storm原始清理
-    if (s_origCleanupAll) {
-        s_origCleanupAll();
-    }
-
-    // 创建稳定块（降低频率）
-    if (currentCount % 100 == 0) {
-        StabilizerContext stabCtx = { 0, nullptr, currentCount };
-        CreateTemporaryStabilizersOperation(&stabCtx);
-    }
-
-    // 退出不安全期
-    g_insideUnsafePeriod.store(false, std::memory_order_release);
-    g_cleanAllInProgress.store(false, std::memory_order_release);
-    tls_inCleanAll = false;
-
-    return 1;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// Hook函数实现
-///////////////////////////////////////////////////////////////////////////////
+// ======================== Hook函数实现 ========================
 
-size_t __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
-    const char* name, DWORD src_line, DWORD flag) {
+void* __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
+    const char* name, DWORD srcLine, DWORD flags) {
+    // 尝试用我们的系统分配
+    void* ptr = StormHook::AllocateMemory(size, name, srcLine);
+    if (ptr) {
+        return ptr;
+    }
 
-    AllocContext context = { ecx, edx, size, name, src_line, flag, 0 };
-    SAFE_CALL_INT("Hooked_Storm_MemAlloc", AllocOperation, &context);
-    return context.result;
+    // 回退到原始Storm分配
+    void* result = SEH_Helpers::CallOrigStormAlloc_SEH(ecx, edx, size, name, srcLine, flags);
+
+    // === 新增：顺手被动抓一次StormHeap ===
+    StormHook_Internal::TryCaptureDefaultHeapFromAllocResult(result);
+
+    // 检查是否有异常发生
+    DWORD exceptCode = SEH_Helpers::GetLastExceptionCode();
+    if (exceptCode != 0) {
+        Logger::GetInstance().LogError("Storm原始分配函数异常: size=%zu, code=0x%08X", size, exceptCode);
+        SEH_Helpers::ClearLastExceptionCode();
+    }
+
+    return result;
 }
 
-int __stdcall Hooked_Storm_MemFree(int a1, char* name, int argList, int a4) {
-    FreeContext context = { a1, name, argList, a4, 0 };
-    SAFE_CALL_INT("Hooked_Storm_MemFree", FreeOperation, &context);
-    return context.result;
+int __stdcall Hooked_Storm_MemFree(void* ptr, const char* name, int argList, DWORD flags) {
+    if (!ptr) {
+        return 1; // NULL指针认为成功
+    }
+
+    // 尝试用我们的系统释放
+    if (StormHook::FreeMemory(ptr)) {
+        return 1; // 成功
+    }
+
+    // 回退到原始Storm释放
+    int result = SEH_Helpers::CallOrigStormFree_SEH(ptr, name, argList, flags);
+
+    // 检查是否有异常发生
+    DWORD exceptCode = SEH_Helpers::GetLastExceptionCode();
+    if (exceptCode != 0) {
+        Logger::GetInstance().LogError("Storm原始释放函数异常: ptr=%p, code=0x%08X", ptr, exceptCode);
+        SEH_Helpers::ClearLastExceptionCode();
+    }
+
+    return result;
 }
 
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
-    const char* name, DWORD src_line, DWORD flag) {
+    const char* name, DWORD srcLine, DWORD flags) {
+    // 尝试用我们的系统重分配
+    void* ptr = StormHook::ReallocMemory(oldPtr, newSize, name, srcLine);
+    if (ptr) {
+        return ptr;
+    }
 
-    ReallocContext context = { ecx, edx, oldPtr, newSize, name, src_line, flag, nullptr };
-    SAFE_CALL_PTR("Hooked_Storm_MemReAlloc", ReallocOperation, &context);
-    return context.result;
+    // 如果oldPtr是我们管理的但新大小不需要大块处理，需要手动迁移
+    if (oldPtr && StormHook::IsOurBlock(oldPtr) && newSize > 0) {
+        // 使用Storm分配新内存
+        void* newPtr = SEH_Helpers::CallOrigStormAlloc_SEH(ecx, edx, newSize, name, srcLine, flags);
+
+        if (newPtr) {
+            // 复制数据
+            size_t oldSize = StormHook_Internal::GetBlockSizeFromManagedTable(oldPtr);
+            size_t copySize = (oldSize < newSize) ? oldSize : newSize;
+
+            if (SEH_Helpers::SafeMemCopy_SEH(newPtr, oldPtr, copySize)) {
+                // 释放旧块
+                StormHook::FreeMemory(oldPtr);
+                return newPtr;
+            }
+            else {
+                // 复制失败，释放新分配的内存
+                SEH_Helpers::CallOrigStormFree_SEH(newPtr, name, 0, 0);
+            }
+        }
+
+        return nullptr;
+    }
+
+    // 回退到原始Storm重分配
+    void* result = SEH_Helpers::CallOrigStormReAlloc_SEH(ecx, edx, oldPtr, newSize, name, srcLine, flags);
+
+    // 检查是否有异常发生
+    DWORD exceptCode = SEH_Helpers::GetLastExceptionCode();
+    if (exceptCode != 0) {
+        Logger::GetInstance().LogError("Storm原始重分配函数异常: ptr=%p, size=%zu, code=0x%08X",
+            oldPtr, newSize, exceptCode);
+        SEH_Helpers::ClearLastExceptionCode();
+    }
+
+    return result;
 }
 
-void Hooked_StormHeap_CleanupAll() {
-    SAFE_CALL_VOID("Hooked_StormHeap_CleanupAll", CleanAllOperation, nullptr);
-}
-
-bool IsJassVMAllocation(size_t size, const char* name) noexcept {
-    return (size == JASSVM_BLOCK_SIZE &&
-        name &&
-        strstr(name, "Instance.cpp") != nullptr);
-}
-
-bool IsPermanentBlock(void* ptr) noexcept {
-    return g_permanentBlocks.Contains(ptr);
-}
-
-size_t GetProcessVirtualMemoryUsage() noexcept {
-    PROCESS_MEMORY_COUNTERS_EX pmc{};
-    pmc.cb = sizeof(pmc);
-
-    if (GetProcessMemoryInfo(GetCurrentProcess(),
-        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
-        sizeof(pmc))) {
-        return pmc.PrivateUsage;
-    }
-    return 0;
-}
-
-void CreatePermanentStabilizers(int count, const char* reason) noexcept {
-    LogMessage("[稳定化] 创建%d个永久稳定块 (%s)", count, reason);
-
-    StabilizerContext context = { count, reason, 0 };
-    SAFE_CALL_VOID("CreatePermanentStabilizers", CreatePermanentStabilizersOperation, &context);
-}
-
-void CreateTemporaryStabilizers(int cleanAllCount) noexcept {
-    StabilizerContext context = { 0, nullptr, cleanAllCount };
-    SAFE_CALL_VOID("CreateTemporaryStabilizers", CreateTemporaryStabilizersOperation, &context);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 初始化和清理函数
-///////////////////////////////////////////////////////////////////////////////
-
-bool InitializeLogging() noexcept {
-    InitializeCriticalSection(&g_logCs);
-
-    // 将 fopen 改为 fopen_s
-    if (fopen_s(&g_logFile, "StormHook.log", "w") == 0) {
-        g_logInitialized = true;
-        LogMessage("[初始化] 日志系统启动成功");
-        return true;
-    }
-    else {
-        printf("[错误] 无法创建日志文件\n");
-        return false;
-    }
-}
-
-bool FindStormFunctions() noexcept {
-    // 查找Storm.dll基址
-    HMODULE stormDll = GetModuleHandleA("Storm.dll");
-    if (!stormDll) {
-        LogError("[错误] 未找到Storm.dll模块");
-        return false;
+void __stdcall Hooked_StormHeap_CleanupAll() {
+    // 防止递归调用
+    if (g_inCleanupAll.exchange(true, std::memory_order_acq_rel)) {
+        return;
     }
 
-    gStormDllBase = reinterpret_cast<uintptr_t>(stormDll);
-    LogMessage("[初始化] Storm.dll基址: 0x%08X", gStormDllBase);
+    // 使用静态变量控制日志频率，避免刷屏
+    static std::atomic<DWORD> lastLogTime{ 0 };
+    static std::atomic<size_t> callCount{ 0 };
 
-    // 设置函数指针（基于IDA Pro确认的偏移）
-    s_origStormAlloc = reinterpret_cast<Storm_MemAlloc_t>(gStormDllBase + 0x2B830);
-    s_origStormFree = reinterpret_cast<Storm_MemFree_t>(gStormDllBase + 0x2BE40);
-    s_origStormReAlloc = reinterpret_cast<Storm_MemReAlloc_t>(gStormDllBase + 0x2C8B0);
-    s_origCleanupAll = reinterpret_cast<StormHeap_CleanupAll_t>(gStormDllBase + 0x2AB50);
+    DWORD currentTime = GetTickCount();
+    size_t currentCount = callCount.fetch_add(1, std::memory_order_relaxed);
 
-    LogMessage("[初始化] Storm函数地址:");
-    LogMessage("  - MemAlloc: %p", s_origStormAlloc);
-    LogMessage("  - MemFree: %p", s_origStormFree);
-    LogMessage("  - MemReAlloc: %p", s_origStormReAlloc);
-    LogMessage("  - CleanupAll: %p", s_origCleanupAll);
+    // 只有在超过1秒间隔或者是错误时才记录日志
+    bool shouldLog = (currentTime - lastLogTime.load(std::memory_order_relaxed) > 1000) || (currentCount % 100 == 0);
 
-    // 验证函数指针有效性
-    if (!s_origStormAlloc || !s_origStormFree ||
-        !s_origStormReAlloc || !s_origCleanupAll) {
-        LogError("[错误] Storm函数地址无效");
-        return false;
+    if (shouldLog) {
+        lastLogTime.store(currentTime, std::memory_order_relaxed);
+        Logger::GetInstance().LogDebug("CleanupAll调用 (第%zu次)", currentCount);
     }
 
-    return true;
-}
+    StormHook_Internal::EnterUnsafePeriod();
 
-bool InstallHooks() noexcept {
-    LogMessage("[初始化] 开始安装Hook...");
-
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-
-    // 安装内存分配Hook
-    DetourAttach(&(PVOID&)s_origStormAlloc, Hooked_Storm_MemAlloc);
-    DetourAttach(&(PVOID&)s_origStormFree, Hooked_Storm_MemFree);
-    DetourAttach(&(PVOID&)s_origStormReAlloc, Hooked_Storm_MemReAlloc);
-    DetourAttach(&(PVOID&)s_origCleanupAll, Hooked_StormHeap_CleanupAll);
-
-    LONG detourResult = DetourTransactionCommit();
-    if (detourResult != NO_ERROR) {
-        LogError("[错误] Hook安装失败，错误代码: %ld", detourResult);
-        return false;
-    }
-
-    LogMessage("[初始化] Hook安装成功");
-    return true;
-}
-
-void UninstallHooks() noexcept {
-    LogMessage("[清理] 开始卸载Hook...");
-
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-
-    // 按相反顺序卸载
-    if (s_origCleanupAll) {
-        DetourDetach(&(PVOID&)s_origCleanupAll, Hooked_StormHeap_CleanupAll);
-    }
-    if (s_origStormReAlloc) {
-        DetourDetach(&(PVOID&)s_origStormReAlloc, Hooked_Storm_MemReAlloc);
-    }
-    if (s_origStormFree) {
-        DetourDetach(&(PVOID&)s_origStormFree, Hooked_Storm_MemFree);
-    }
-    if (s_origStormAlloc) {
-        DetourDetach(&(PVOID&)s_origStormAlloc, Hooked_Storm_MemAlloc);
-    }
-
-    LONG result = DetourTransactionCommit();
-    LogMessage("[清理] Hook卸载%s", (result == NO_ERROR) ? "成功" : "失败");
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 主要接口函数实现
-///////////////////////////////////////////////////////////////////////////////
-
-bool InitializeStormMemoryHooks() noexcept {
-    bool expected = false;
-    if (!g_hooksInitialized.compare_exchange_strong(expected, true)) {
-        LogMessage("[警告] StormHook已经初始化");
-        return true;
-    }
-
-    LogMessage("[初始化] StormHook初始化开始...");
-
-    // 1. 初始化日志系统
-    if (!InitializeLogging()) {
-        return false;
-    }
-
-    // 2. 初始化MemoryPool
-    MemoryPoolConfig config;
-    config.bigBlockThreshold = g_bigThreshold.load();
-    config.enableDetailedLogging = true;
-
-    if (!g_MemoryPool.Initialize(config)) {
-        LogError("[错误] MemoryPool初始化失败");
-        return false;
-    }
-
-    // 3. 设置Storm清理函数
-    g_MemoryPool.SetStormCleanupFunction(s_origCleanupAll);
-
-    // 4. 查找Storm函数
-    if (!FindStormFunctions()) {
-        return false;
-    }
-
-    // 5. 创建初始稳定块
-    CreatePermanentStabilizers(10, "初始化稳定");
-
-    // 6. 安装Hook
-    if (!InstallHooks()) {
-        return false;
-    }
-
-    LogMessage("[初始化] StormHook初始化完成");
-    LogMessage("[状态] 大块阈值: %zu KB", g_bigThreshold.load() / 1024);
-
-    return true;
-}
-
-void ShutdownStormMemoryHooks() noexcept {
-    bool expected = true;
-    if (!g_hooksInitialized.compare_exchange_strong(expected, false)) {
-        return;  // 已经关闭或未初始化
-    }
-
-    LogMessage("[清理] StormHook关闭开始...");
-
-    // 1. 设置关闭标志
-    g_shutdownRequested.store(true, std::memory_order_release);
-    g_insideUnsafePeriod.store(true, std::memory_order_release);
-
-    // 2. 等待CleanAll完成
-    if (g_cleanAllInProgress.load(std::memory_order_acquire)) {
-        LogMessage("[清理] 等待CleanAll完成...");
-        int waitCount = 0;
-        while (g_cleanAllInProgress.load(std::memory_order_acquire) && waitCount < 20) {
-            Sleep(50);
-            waitCount++;
+    // 安全执行原始CleanupAll
+    __try {
+        if (g_origCleanupAll) {
+            g_origCleanupAll();
         }
     }
-
-    // 3. 打印最终统计
-    size_t allocated = g_totalAllocated.load(std::memory_order_relaxed);
-    size_t freed = g_totalFreed.load(std::memory_order_relaxed);
-    size_t allocCount = g_hookAllocCount.load(std::memory_order_relaxed);
-    size_t freeCount = g_hookFreeCount.load(std::memory_order_relaxed);
-
-    LogMessage("[统计] 最终数据:");
-    LogMessage("  - 总分配: %zu MB (%zu 次)", allocated / (1024 * 1024), allocCount);
-    LogMessage("  - 总释放: %zu MB (%zu 次)", freed / (1024 * 1024), freeCount);
-    LogMessage("  - 净使用: %zu MB", (allocated - freed) / (1024 * 1024));
-    LogMessage("  - CleanAll调用: %d 次", g_cleanAllCounter.load());
-    LogMessage("  - 永久块数量: %zu", g_permanentBlocks.Size());
-
-    // 4. 卸载Hook
-    UninstallHooks();
-
-    // 5. 清理永久块引用（不实际释放内存）
-    g_permanentBlocks.Clear();
-
-    // 6. 关闭MemoryPool
-    g_MemoryPool.Shutdown();
-
-    // 7. 关闭日志
-    LogMessage("[清理] StormHook关闭完成");
-    if (g_logFile) {
-        fclose(g_logFile);
-        g_logFile = nullptr;
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::GetInstance().LogError("CleanupAll执行异常: 0x%08X (调用次数: %zu)", GetExceptionCode(), currentCount);
     }
 
-    if (g_logInitialized) {
-        g_logInitialized = false;
-        DeleteCriticalSection(&g_logCs);
+    // 处理延迟释放
+    StormHook::ProcessDeferredFree();
+
+    StormHook_Internal::ExitUnsafePeriod();
+    g_inCleanupAll.store(false, std::memory_order_release);
+}
+
+int __fastcall Hooked_ResetMemoryManager(void* thiz, int edx, int a2, void (*pump)(void)) {
+    Logger::GetInstance().LogInfo("开始ResetMemoryManager...");
+
+    // Reset前准备
+    StormHook::PrepareForReset();
+
+    int result = 0;
+
+    // 安全执行原始Reset
+    __try {
+        if (g_origResetMemoryManager) {
+            result = g_origResetMemoryManager(thiz, edx, a2, pump);
+        }
     }
-}
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::GetInstance().LogError("ResetMemoryManager执行异常: 0x%08X", GetExceptionCode());
+    }
 
-bool IsHooksInitialized() noexcept {
-    return g_hooksInitialized.load(std::memory_order_acquire);
-}
+    // Reset后清理
+    StormHook::PostReset();
 
-void SetBigBlockThreshold(size_t sizeInBytes) noexcept {
-    size_t oldThreshold = g_bigThreshold.exchange(sizeInBytes, std::memory_order_relaxed);
-    LogMessage("[配置] 大块阈值: %zu -> %zu 字节", oldThreshold, sizeInBytes);
-
-    // 更新MemoryPool配置
-    MemoryPoolConfig config = g_MemoryPool.GetConfig();
-    config.bigBlockThreshold = sizeInBytes;
-    g_MemoryPool.UpdateConfig(config);
-}
-
-void GetMemoryStatistics(size_t& allocated, size_t& freed, size_t& allocCount, size_t& freeCount) noexcept {
-    allocated = g_totalAllocated.load(std::memory_order_relaxed);
-    freed = g_totalFreed.load(std::memory_order_relaxed);
-    allocCount = g_hookAllocCount.load(std::memory_order_relaxed);
-    freeCount = g_hookFreeCount.load(std::memory_order_relaxed);
-}
-
-void PrintMemoryStatus() noexcept {
-    size_t allocated, freed, allocCount, freeCount;
-    GetMemoryStatistics(allocated, freed, allocCount, freeCount);
-
-    size_t vmUsage = GetProcessVirtualMemoryUsage();
-    MemoryPoolStats poolStats = g_MemoryPool.GetStats();
-
-    LogMessage("\n[状态报告] ====================");
-    LogMessage("虚拟内存使用: %zu MB", vmUsage / (1024 * 1024));
-    LogMessage("Hook分配: %zu MB (%zu 次)", allocated / (1024 * 1024), allocCount);
-    LogMessage("Hook释放: %zu MB (%zu 次)", freed / (1024 * 1024), freeCount);
-    LogMessage("MemoryPool统计: 分配=%zu次, 释放=%zu次",
-        poolStats.allocCount, poolStats.freeCount);
-    LogMessage("CleanAll计数: %d", g_cleanAllCounter.load());
-    LogMessage("永久块数量: %zu", g_permanentBlocks.Size());
-    LogMessage("==============================\n");
-}
-
-void ForceMemoryCleanup() noexcept {
-    LogMessage("[手动] 触发内存清理...");
-    g_MemoryPool.ForceCleanup();
+    Logger::GetInstance().LogInfo("ResetMemoryManager完成");
+    return result;
 }

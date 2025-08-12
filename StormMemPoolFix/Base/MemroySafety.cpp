@@ -1,872 +1,1020 @@
-﻿// MemorySafety.cpp - 基于TLSF的高效内存管理实现（完整重写）
-#include "pch.h"
+﻿#include "pch.h"
 #include "MemorySafety.h"
-#include <psapi.h>
+#include "Logger.h"
+#include "Storm/MemoryPool.h"
 #include <algorithm>
-#include <Log/LogSystem.h>
+#include <cstring>
+#include <Storm/StormOffsets.h>
+#include <Storm/StormHook.h>
+#include <Psapi.h>
 
-#pragma comment(lib, "psapi.lib")
-
-///////////////////////////////////////////////////////////////////////////////
-// 结构体实现
-///////////////////////////////////////////////////////////////////////////////
-
-TLSFPoolInstance::TLSFPoolInstance()
-    : baseMemory(nullptr), totalSize(0), tlsfHandle(nullptr), usedBytes(0), allocCount(0), freeCount(0) {
-    InitializeCriticalSection(&cs);
+// ======================== 常量定义 ========================
+namespace {
+    constexpr size_t DEFAULT_MAX_DEFERRED_ITEMS = 1000;
+    constexpr DWORD  DEFAULT_DEFERRED_TIMEOUT = 30000;  // 30秒
+    constexpr size_t DEFAULT_MAX_TRACKED_BLOCKS = 10000;
+    constexpr DWORD  MONITOR_INTERVAL = 5000;           // 5秒
 }
 
-TLSFPoolInstance::~TLSFPoolInstance() {
-    if (tlsfHandle) {
-        tlsf_destroy(tlsfHandle);
-    }
-    if (baseMemory) {
-        VirtualFree(baseMemory, 0, MEM_RELEASE);
-    }
-    DeleteCriticalSection(&cs);
-}
+// ======================== MemorySafety实现 ========================
 
-HoldItem::HoldItem(void* user, void* raw, size_t size, size_t pool)
-    : userPtr(user), rawPtr(raw), userSize(size), poolIndex(pool), queueTime(GetTickCount()) {
-}
-
-BlockInfo::BlockInfo()
-    : rawPtr(nullptr), userPtr(nullptr), totalSize(0), userSize(0),
-    poolIndex(SIZE_MAX), allocTime(0), sourceName(nullptr),
-    sourceLine(0), isInHoldQueue(false) {
-}
-
-BlockInfo::BlockInfo(void* raw, void* user, size_t total, size_t userSz, size_t pool,
-    const char* name, DWORD line)
-    : rawPtr(raw), userPtr(user), totalSize(total), userSize(userSz),
-    poolIndex(pool), allocTime(GetTickCount()), sourceName(name),
-    sourceLine(line), isInHoldQueue(false) {
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 单例实现
-///////////////////////////////////////////////////////////////////////////////
-
-MemorySafety& MemorySafety::GetInstance() noexcept {
+MemorySafety& MemorySafety::GetInstance() {
     static MemorySafety instance;
     return instance;
 }
 
-MemorySafety::MemorySafety() noexcept
-    : m_initialized(false), m_shutdownRequested(false),
-    m_totalAllocated(0), m_totalFreed(0), m_forceCleanups(0),
-    m_directVirtualAllocCount(0), m_directVirtualAllocBytes(0),
-    m_lastCleanupTime(0) {
-
-    InitializeCriticalSection(&m_configCs);
-    InitializeCriticalSection(&m_blockMapCs);
-    InitializeCriticalSection(&m_holdQueueCs);
-
-    // 初始化池指针为nullptr
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        m_pools[i] = nullptr;
-    }
+MemorySafetyConfig MemorySafety::GetDefaultConfig() {
+    MemorySafetyConfig config;
+    config.enableTracking = true;
+    config.enableValidation = true;
+    config.enableDeferredFree = true;
+    config.maxDeferredItems = DEFAULT_MAX_DEFERRED_ITEMS;
+    config.deferredTimeout = DEFAULT_DEFERRED_TIMEOUT;
+    config.enableLeakDetection = true;
+    config.enableCorruptionDetection = true;
+    config.maxTrackedBlocks = DEFAULT_MAX_TRACKED_BLOCKS;
+    return config;
 }
 
-MemorySafety::~MemorySafety() noexcept {
-    if (m_initialized.load()) {
-        Shutdown();
-    }
-    DeleteCriticalSection(&m_configCs);
-    DeleteCriticalSection(&m_blockMapCs);
-    DeleteCriticalSection(&m_holdQueueCs);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 生命周期管理
-///////////////////////////////////////////////////////////////////////////////
-
-bool MemorySafety::Initialize(const MemorySafetyConfig& config) noexcept {
-    bool expected = false;
-    if (!m_initialized.compare_exchange_strong(expected, true)) {
+bool MemorySafety::Initialize(const MemorySafetyConfig& config) {
+    if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
         return true; // 已初始化
     }
 
-    // 保存配置
-    EnterCriticalSection(&m_configCs);
     m_config = config;
-    LeaveCriticalSection(&m_configCs);
 
-    // 初始化TLSF池
-    if (!InitializePools()) {
-        LogError("[MemorySafety] TLSF池初始化失败");
-        m_initialized.store(false);
-        return false;
-    }
+    // 初始化临界区
+    InitializeCriticalSection(&m_deferredLock);
 
     // 重置统计
-    ResetStatistics();
-    m_lastCleanupTime.store(MemorySafetyUtils::GetTickCount());
+    memset(&m_stats, 0, sizeof(m_stats));
 
-    LogMessage("[MemorySafety] 初始化完成，创建%d个TLSF池", POOL_COUNT);
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        LogMessage("  池%zu: %zuMB (阈值≤%zuKB)", i, POOL_SIZES[i] / (1024 * 1024), POOL_THRESHOLDS[i] / 1024);
-    }
+    Logger::GetInstance().LogInfo("内存安全系统已初始化");
+    Logger::GetInstance().LogInfo("配置: 跟踪=%s, 验证=%s, 延迟释放=%s, 泄漏检测=%s",
+        m_config.enableTracking ? "启用" : "禁用",
+        m_config.enableValidation ? "启用" : "禁用",
+        m_config.enableDeferredFree ? "启用" : "禁用",
+        m_config.enableLeakDetection ? "启用" : "禁用");
 
     return true;
 }
 
-void MemorySafety::Shutdown() noexcept {
-    bool expected = true;
-    if (!m_initialized.compare_exchange_strong(expected, false)) {
-        return; // 已关闭
+void MemorySafety::Shutdown() {
+    if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
+        return; // 未初始化
     }
 
-    LogMessage("[MemorySafety] 开始关闭");
+    Logger::GetInstance().LogInfo("内存安全系统正在关闭...");
 
-    // 强制处理剩余的Hold队列
-    DrainHoldQueue();
+    // 输出最终统计
+    PrintStats();
 
-    // 打印最终统计
-    PrintStatistics();
-
-    // 销毁TLSF池
-    DestroyPools();
-
-    // 清理块映射
-    EnterCriticalSection(&m_blockMapCs);
-    m_blockMap.clear();
-    LeaveCriticalSection(&m_blockMapCs);
-
-    LogMessage("[MemorySafety] 关闭完成");
-}
-
-bool MemorySafety::IsInitialized() const noexcept {
-    return m_initialized.load();
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// TLSF池管理
-///////////////////////////////////////////////////////////////////////////////
-
-bool MemorySafety::InitializePools() noexcept {
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        m_pools[i] = new TLSFPoolInstance();
-        TLSFPoolInstance& pool = *m_pools[i];
-
-        // 分配大块内存
-        pool.totalSize = POOL_SIZES[i];
-        pool.baseMemory = VirtualAlloc(nullptr, pool.totalSize,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-        if (!pool.baseMemory) {
-            LogError("[MemorySafety] 池%zu VirtualAlloc失败: %zuMB", i, pool.totalSize / (1024 * 1024));
-            return false;
-        }
-
-        // 创建TLSF实例
-        pool.tlsfHandle = tlsf_create_with_pool(pool.baseMemory, pool.totalSize);
-        if (!pool.tlsfHandle) {
-            LogError("[MemorySafety] 池%zu TLSF创建失败", i);
-            VirtualFree(pool.baseMemory, 0, MEM_RELEASE);
-            pool.baseMemory = nullptr;
-            return false;
-        }
-
-        LogMessage("[MemorySafety] 池%zu初始化成功: %p, %zuMB",
-            i, pool.baseMemory, pool.totalSize / (1024 * 1024));
-    }
-    return true;
-}
-
-void MemorySafety::DestroyPools() noexcept {
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        if (m_pools[i]) {
-            TLSFPoolInstance& pool = *m_pools[i];
-
-            LogMessage("[MemorySafety] 销毁池%zu: 分配%zu次, 释放%zu次, 使用率%.1f%%",
-                i, pool.allocCount.load(), pool.freeCount.load(),
-                pool.totalSize > 0 ? (pool.usedBytes.load() * 100.0 / pool.totalSize) : 0.0);
-
-            delete m_pools[i];
-            m_pools[i] = nullptr;
+    // 检测泄漏
+    if (m_config.enableLeakDetection) {
+        auto leaks = DetectLeaks(0); // 检测所有未释放的块
+        if (!leaks.empty()) {
+            Logger::GetInstance().LogWarning("检测到%zu个潜在内存泄漏", leaks.size());
+            ReportLeaks(leaks);
         }
     }
+
+    // 处理剩余的延迟释放项
+    FlushDeferredFreeQueue();
+
+    // 清理跟踪数据
+    ClearAllTracking();
+
+    // 清理临界区
+    DeleteCriticalSection(&m_deferredLock);
+
+    Logger::GetInstance().LogInfo("内存安全系统已关闭");
 }
 
-size_t MemorySafety::SelectPool(size_t size) const noexcept {
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        if (size <= POOL_THRESHOLDS[i]) {
-            return i;
-        }
-    }
-    return SIZE_MAX; // 超过所有池限制，需要直接VirtualAlloc
+bool MemorySafety::IsInitialized() const {
+    return m_initialized.load(std::memory_order_acquire);
 }
 
-void* MemorySafety::AllocateFromPool(size_t poolIndex, size_t totalSize) noexcept {
-    if (poolIndex >= POOL_COUNT || !m_pools[poolIndex]) {
-        return nullptr;
-    }
-
-    TLSFPoolInstance& pool = *m_pools[poolIndex];
-    EnterCriticalSection(&pool.cs);
-
-    void* ptr = tlsf_malloc(pool.tlsfHandle, totalSize);
-    if (ptr) {
-        pool.usedBytes.fetch_add(totalSize);
-        pool.allocCount.fetch_add(1);
-    }
-
-    LeaveCriticalSection(&pool.cs);
-    return ptr;
-}
-
-bool MemorySafety::FreeToPool(size_t poolIndex, void* ptr) noexcept {
-    if (poolIndex >= POOL_COUNT || !m_pools[poolIndex] || !ptr) {
+bool MemorySafety::RegisterMemoryBlock(void* rawPtr, void* userPtr, size_t size,
+    const char* sourceName, DWORD sourceLine) {
+    if (!IsInitialized() || !m_config.enableTracking || !userPtr) {
         return false;
     }
 
-    TLSFPoolInstance& pool = *m_pools[poolIndex];
-    EnterCriticalSection(&pool.cs);
-
-    // 获取块大小（用于统计）
-    size_t blockSize = tlsf_block_size(ptr);
-
-    tlsf_free(pool.tlsfHandle, ptr);
-
-    if (blockSize > 0) {
-        pool.usedBytes.fetch_sub(blockSize);
-    }
-    pool.freeCount.fetch_add(1);
-
-    LeaveCriticalSection(&pool.cs);
-    return true;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 大块直接分配
-///////////////////////////////////////////////////////////////////////////////
-
-void* MemorySafety::DirectVirtualAlloc(size_t size) noexcept {
-    return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-}
-
-bool MemorySafety::DirectVirtualFree(void* ptr) noexcept {
-    return VirtualFree(ptr, 0, MEM_RELEASE) != FALSE;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 内存分配接口
-///////////////////////////////////////////////////////////////////////////////
-
-void* MemorySafety::AllocateBlock(size_t userSize, const char* sourceName, DWORD sourceLine) noexcept {
-    if (!m_initialized.load()) {
-        return nullptr;
-    }
-
-    return InternalAllocate(userSize, sourceName, sourceLine);
-}
-
-bool MemorySafety::FreeBlock(void* userPtr) noexcept {
-    if (!userPtr || !m_initialized.load()) {
+    // 检查是否超过最大跟踪数量
+    if (m_trackedBlocks.size() >= m_config.maxTrackedBlocks) {
+        Logger::GetInstance().LogWarning("达到最大跟踪块数量限制: %zu", m_config.maxTrackedBlocks);
         return false;
     }
 
-    return InternalFree(userPtr);
-}
+    MemoryBlockInfo info;
+    info.rawPtr = rawPtr;
+    info.userPtr = userPtr;
+    info.size = size;
+    info.sourceName = sourceName;
+    info.sourceLine = sourceLine;
+    info.timestamp = GetTickCount();
+    info.threadId = GetCurrentThreadId();
+    info.isValid = true;
 
-void* MemorySafety::ReallocateBlock(void* userPtr, size_t newSize, const char* sourceName, DWORD sourceLine) noexcept {
-    if (!m_initialized.load()) {
-        return nullptr;
+    AcquireSRWLockExclusive(&m_blocksLock);
+
+    // 检查是否已存在
+    if (m_trackedBlocks.find(userPtr) != m_trackedBlocks.end()) {
+        ReleaseSRWLockExclusive(&m_blocksLock);
+        Logger::GetInstance().LogWarning("尝试重复注册内存块: %p", userPtr);
+        return false;
     }
 
-    return InternalRealloc(userPtr, newSize, sourceName, sourceLine);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 内部实现
-///////////////////////////////////////////////////////////////////////////////
-
-void* MemorySafety::InternalAllocate(size_t userSize, const char* sourceName, DWORD sourceLine) noexcept {
-    // 计算总大小（包含Storm头部）
-    size_t totalSize = CalculateTotalSize(userSize);
-
-    // 选择合适的池
-    size_t poolIndex = SelectPool(totalSize);
-    void* rawPtr = nullptr;
-
-    if (poolIndex != SIZE_MAX) {
-        // 从TLSF池分配
-        rawPtr = AllocateFromPool(poolIndex, totalSize);
-        if (!rawPtr) {
-            // 池满了，尝试使用下一个池
-            if (poolIndex + 1 < POOL_COUNT) {
-                rawPtr = AllocateFromPool(poolIndex + 1, totalSize);
-                if (rawPtr) {
-                    poolIndex = poolIndex + 1;
-                }
-            }
-        }
-    }
-
-    if (!rawPtr) {
-        // 所有池都失败，直接VirtualAlloc
-        rawPtr = DirectVirtualAlloc(totalSize);
-        if (!rawPtr) {
-            return nullptr;
-        }
-        poolIndex = SIZE_MAX; // 标记为直接分配
-        m_directVirtualAllocCount.fetch_add(1);
-        m_directVirtualAllocBytes.fetch_add(totalSize);
-    }
-
-    // 计算用户指针
-    void* userPtr = GetUserPtrFromRaw(rawPtr);
-
-    // 设置Storm兼容头部
-    SetupStormHeader(userPtr, userSize, totalSize);
-
-    // 更新块映射
-    EnterCriticalSection(&m_blockMapCs);
-    m_blockMap[userPtr] = BlockInfo(rawPtr, userPtr, totalSize, userSize, poolIndex, sourceName, sourceLine);
-    LeaveCriticalSection(&m_blockMapCs);
+    m_trackedBlocks[userPtr] = info;
 
     // 更新统计
-    UpdateStatistics(userSize, true, poolIndex);
+    m_stats.totalRegistered++;
+    m_stats.currentBlocks++;
+    m_stats.currentSize += size;
 
-    return userPtr;
-}
-
-bool MemorySafety::InternalFree(void* userPtr) noexcept {
-    // 查找块信息
-    BlockInfo info;
-    bool found = false;
-
-    EnterCriticalSection(&m_blockMapCs);
-    auto it = m_blockMap.find(userPtr);
-    if (it != m_blockMap.end()) {
-        info = it->second;
-        found = true;
-
-        EnterCriticalSection(&m_configCs);
-        bool enableHoldQueue = m_config.enableHoldQueue;
-        LeaveCriticalSection(&m_configCs);
-
-        if (enableHoldQueue && !info.isInHoldQueue) {
-            // 标记为在Hold队列中，但不删除映射
-            it->second.isInHoldQueue = true;
-        }
-        else {
-            // 已经在Hold队列中或禁用Hold队列，直接删除映射
-            m_blockMap.erase(it);
-        }
+    if (m_stats.currentBlocks > m_stats.peakBlocks) {
+        m_stats.peakBlocks = m_stats.currentBlocks;
     }
-    LeaveCriticalSection(&m_blockMapCs);
-
-    if (!found) {
-        return false; // 不是我们管理的块
+    if (m_stats.currentSize > m_stats.peakSize) {
+        m_stats.peakSize = m_stats.currentSize;
     }
 
-    EnterCriticalSection(&m_configCs);
-    bool enableHoldQueue = m_config.enableHoldQueue;
-    LeaveCriticalSection(&m_configCs);
+    ReleaseSRWLockExclusive(&m_blocksLock);
 
-    if (enableHoldQueue && !info.isInHoldQueue) {
-        // 添加到Hold队列而不是立即释放
-        AddToHoldQueue(userPtr, info.rawPtr, info.userSize, info.poolIndex);
-    }
-    else {
-        // 立即释放
-        if (info.poolIndex != SIZE_MAX) {
-            FreeToPool(info.poolIndex, info.rawPtr);
-        }
-        else {
-            DirectVirtualFree(info.rawPtr);
-        }
-    }
-
-    // 更新统计
-    UpdateStatistics(info.userSize, false, info.poolIndex);
+    Logger::GetInstance().LogDebug("注册内存块: ptr=%p, size=%zu, source=%s:%lu",
+        userPtr, size, sourceName ? sourceName : "unknown", sourceLine);
 
     return true;
 }
 
-void* MemorySafety::InternalRealloc(void* userPtr, size_t newSize, const char* sourceName, DWORD sourceLine) noexcept {
-    if (!userPtr) {
-        return InternalAllocate(newSize, sourceName, sourceLine);
+bool MemorySafety::UnregisterMemoryBlock(void* userPtr) {
+    if (!IsInitialized() || !m_config.enableTracking || !userPtr) {
+        return false;
     }
 
-    if (newSize == 0) {
-        InternalFree(userPtr);
-        return nullptr;
+    AcquireSRWLockExclusive(&m_blocksLock);
+
+    auto it = m_trackedBlocks.find(userPtr);
+    if (it == m_trackedBlocks.end()) {
+        ReleaseSRWLockExclusive(&m_blocksLock);
+        return false;
     }
 
-    // 获取旧块信息
-    BlockInfo oldInfo;
-    bool found = false;
+    size_t blockSize = it->second.size;
+    m_trackedBlocks.erase(it);
 
-    EnterCriticalSection(&m_blockMapCs);
-    auto it = m_blockMap.find(userPtr);
-    if (it != m_blockMap.end()) {
-        oldInfo = it->second;
-        found = true;
-    }
-    LeaveCriticalSection(&m_blockMapCs);
+    // 更新统计
+    m_stats.totalUnregistered++;
+    m_stats.currentBlocks--;
+    m_stats.currentSize -= blockSize;
 
-    if (!found) {
-        return nullptr; // 不是我们管理的块
-    }
+    ReleaseSRWLockExclusive(&m_blocksLock);
 
-    // 如果新大小和旧大小差不多，且在同一个池中，可以尝试原地扩展
-    size_t newTotalSize = CalculateTotalSize(newSize);
-    size_t newPoolIndex = SelectPool(newTotalSize);
+    Logger::GetInstance().LogDebug("注销内存块: ptr=%p, size=%zu", userPtr, blockSize);
 
-    if (newPoolIndex == oldInfo.poolIndex && oldInfo.poolIndex != SIZE_MAX) {
-        // 尝试原地重分配（TLSF支持）
-        TLSFPoolInstance& pool = *m_pools[oldInfo.poolIndex];
-        EnterCriticalSection(&pool.cs);
-
-        void* newRawPtr = tlsf_realloc(pool.tlsfHandle, oldInfo.rawPtr, newTotalSize);
-        if (newRawPtr) {
-            // 原地扩展成功
-            void* newUserPtr = GetUserPtrFromRaw(newRawPtr);
-
-            // 更新块信息
-            EnterCriticalSection(&m_blockMapCs);
-            m_blockMap.erase(userPtr);
-            m_blockMap[newUserPtr] = BlockInfo(newRawPtr, newUserPtr, newTotalSize, newSize,
-                newPoolIndex, sourceName, sourceLine);
-            LeaveCriticalSection(&m_blockMapCs);
-
-            // 重新设置Storm头部
-            SetupStormHeader(newUserPtr, newSize, newTotalSize);
-
-            LeaveCriticalSection(&pool.cs);
-            return newUserPtr;
-        }
-
-        LeaveCriticalSection(&pool.cs);
-    }
-
-    // 原地扩展失败，分配新块并复制数据
-    void* newPtr = InternalAllocate(newSize, sourceName, sourceLine);
-    if (!newPtr) {
-        return nullptr;
-    }
-
-    // 复制数据
-    size_t copySize = (oldInfo.userSize < newSize) ? oldInfo.userSize : newSize;
-    memcpy(newPtr, userPtr, copySize);
-
-    // 释放旧块
-    InternalFree(userPtr);
-
-    return newPtr;
+    return true;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// Hold队列管理
-///////////////////////////////////////////////////////////////////////////////
+bool MemorySafety::TryUnregisterBlock(void* userPtr) {
+    // 安全版本，不输出错误日志
+    if (!IsInitialized() || !m_config.enableTracking || !userPtr) {
+        return false;
+    }
 
-void MemorySafety::AddToHoldQueue(void* userPtr, void* rawPtr, size_t userSize, size_t poolIndex) noexcept {
-    EnterCriticalSection(&m_holdQueueCs);
+    AcquireSRWLockExclusive(&m_blocksLock);
+
+    auto it = m_trackedBlocks.find(userPtr);
+    if (it == m_trackedBlocks.end()) {
+        ReleaseSRWLockExclusive(&m_blocksLock);
+        return false;
+    }
+
+    size_t blockSize = it->second.size;
+    m_trackedBlocks.erase(it);
+
+    // 更新统计
+    m_stats.totalUnregistered++;
+    m_stats.currentBlocks--;
+    m_stats.currentSize -= blockSize;
+
+    ReleaseSRWLockExclusive(&m_blocksLock);
+
+    return true;
+}
+
+bool MemorySafety::GetMemoryBlockInfo(void* userPtr, MemoryBlockInfo& info) const {
+    if (!IsInitialized() || !userPtr) {
+        return false;
+    }
+
+    AcquireSRWLockShared(&m_blocksLock);
+
+    auto it = m_trackedBlocks.find(userPtr);
+    if (it == m_trackedBlocks.end()) {
+        ReleaseSRWLockShared(&m_blocksLock);
+        return false;
+    }
+
+    info = it->second;
+    ReleaseSRWLockShared(&m_blocksLock);
+
+    return true;
+}
+
+bool MemorySafety::ValidateMemoryBlock(void* userPtr) const {
+    if (!IsInitialized() || !m_config.enableValidation || !userPtr) {
+        return false;
+    }
+
+    MemoryBlockInfo info;
+    if (!GetMemoryBlockInfo(userPtr, info)) {
+        NotifyValidationFailure(userPtr, "块未注册");
+        return false;
+    }
+
+    if (!info.isValid) {
+        NotifyValidationFailure(userPtr, "块已标记为无效");
+        return false;
+    }
+
+    // 验证块是否来自我们的内存池
+    if (!MemoryPool::IsFromPool(info.rawPtr)) {
+        NotifyValidationFailure(userPtr, "块不来自TLSF池");
+        return false;
+    }
+
+    // 验证块大小
+    size_t actualSize = MemoryPool::GetBlockSize(info.rawPtr);
+    if (actualSize == 0) {
+        NotifyValidationFailure(userPtr, "无法获取块大小");
+        return false;
+    }
+
+    const_cast<MemorySafety*>(this)->m_stats.validationCount++;
+
+    return true;
+}
+
+bool MemorySafety::ValidateAllBlocks() const {
+    if (!IsInitialized() || !m_config.enableValidation) {
+        return true;
+    }
+
+    Logger::GetInstance().LogInfo("开始验证所有内存块...");
+
+    AcquireSRWLockShared(&m_blocksLock);
+
+    size_t totalBlocks = m_trackedBlocks.size();
+    size_t validBlocks = 0;
+    size_t invalidBlocks = 0;
+
+    for (const auto& pair : m_trackedBlocks) {
+        ReleaseSRWLockShared(&m_blocksLock);
+
+        if (ValidateMemoryBlock(pair.first)) {
+            validBlocks++;
+        }
+        else {
+            invalidBlocks++;
+        }
+
+        AcquireSRWLockShared(&m_blocksLock);
+    }
+
+    ReleaseSRWLockShared(&m_blocksLock);
+
+    const_cast<MemorySafety*>(this)->m_stats.lastValidationTime = GetTickCount();
+    const_cast<MemorySafety*>(this)->m_stats.validationFailures += invalidBlocks;
+
+    Logger::GetInstance().LogInfo("内存块验证完成: 总计=%zu, 有效=%zu, 无效=%zu",
+        totalBlocks, validBlocks, invalidBlocks);
+
+    return invalidBlocks == 0;
+}
+
+size_t MemorySafety::ValidateAndRepairBlocks() {
+    if (!IsInitialized() || !m_config.enableValidation) {
+        return 0;
+    }
+
+    Logger::GetInstance().LogInfo("开始验证并修复内存块...");
+
+    std::vector<void*> blocksToRemove;
+
+    AcquireSRWLockShared(&m_blocksLock);
+
+    for (const auto& pair : m_trackedBlocks) {
+        void* userPtr = pair.first;
+        const MemoryBlockInfo& info = pair.second;
+
+        ReleaseSRWLockShared(&m_blocksLock);
+
+        if (IsBlockCorrupted(info)) {
+            blocksToRemove.push_back(userPtr);
+            Logger::GetInstance().LogWarning("发现损坏块，将移除跟踪: %p", userPtr);
+        }
+
+        AcquireSRWLockShared(&m_blocksLock);
+    }
+
+    ReleaseSRWLockShared(&m_blocksLock);
+
+    // 移除损坏的块
+    for (void* ptr : blocksToRemove) {
+        TryUnregisterBlock(ptr);
+    }
+
+    Logger::GetInstance().LogInfo("修复完成，移除了%zu个损坏块", blocksToRemove.size());
+
+    return blocksToRemove.size();
+}
+
+void MemorySafety::EnqueueDeferredFree(void* ptr, size_t size) {
+    if (!IsInitialized() || !m_config.enableDeferredFree || !ptr) {
+        return;
+    }
+
+    DeferredFreeItem item;
+    item.ptr = ptr;
+    item.size = size;
+    item.queueTime = GetTickCount();
+    item.threadId = GetCurrentThreadId();
+
+    EnterCriticalSection(&m_deferredLock);
 
     // 检查队列大小限制
-    EnterCriticalSection(&m_configCs);
-    size_t maxSize = m_config.maxHoldQueueSize;
-    LeaveCriticalSection(&m_configCs);
-
-    if (m_holdQueue.size() >= maxSize) {
-        // 队列满了，强制处理最老的项
-        ProcessExpiredItems();
+    if (m_deferredQueue.size() >= m_config.maxDeferredItems) {
+        // 处理最老的项目为新项目腾出空间
+        ProcessDeferredFreeItem(m_deferredQueue.front());
+        m_deferredQueue.erase(m_deferredQueue.begin());
     }
 
-    m_holdQueue.emplace_back(userPtr, rawPtr, userSize, poolIndex);
+    m_deferredQueue.push_back(item);
+    m_stats.deferredFreeCount++;
 
-    LeaveCriticalSection(&m_holdQueueCs);
+    LeaveCriticalSection(&m_deferredLock);
+
+    Logger::GetInstance().LogDebug("延迟释放入队: ptr=%p, size=%zu, 队列大小=%zu",
+        ptr, size, m_deferredQueue.size());
 }
 
-void MemorySafety::ProcessHoldQueue() noexcept {
-    EnterCriticalSection(&m_holdQueueCs);
-    ProcessExpiredItems();
-    LeaveCriticalSection(&m_holdQueueCs);
-}
+void MemorySafety::ProcessDeferredFreeQueue() {
+    if (!IsInitialized() || !m_config.enableDeferredFree) {
+        return;
+    }
 
-void MemorySafety::ProcessExpiredItems() noexcept {
-    DWORD currentTime = MemorySafetyUtils::GetTickCount();
+    DWORD currentTime = GetTickCount();
+    std::vector<DeferredFreeItem> itemsToProcess;
 
-    EnterCriticalSection(&m_configCs);
-    DWORD holdTime = m_config.holdBufferTimeMs;
-    LeaveCriticalSection(&m_configCs);
+    EnterCriticalSection(&m_deferredLock);
 
-    auto it = m_holdQueue.begin();
-    while (it != m_holdQueue.end()) {
-        if (currentTime - it->queueTime >= holdTime) {
-            // 过期，实际释放
-            if (it->poolIndex != SIZE_MAX) {
-                FreeToPool(it->poolIndex, it->rawPtr);
-            }
-            else {
-                DirectVirtualFree(it->rawPtr);
-            }
-
-            // 从块映射中删除
-            EnterCriticalSection(&m_blockMapCs);
-            m_blockMap.erase(it->userPtr);
-            LeaveCriticalSection(&m_blockMapCs);
-
-            it = m_holdQueue.erase(it);
+    // 收集超时的项目
+    auto it = m_deferredQueue.begin();
+    while (it != m_deferredQueue.end()) {
+        if (currentTime - it->queueTime >= m_config.deferredTimeout) {
+            itemsToProcess.push_back(*it);
+            it = m_deferredQueue.erase(it);
         }
         else {
             ++it;
         }
     }
-}
 
-void MemorySafety::DrainHoldQueue() noexcept {
-    EnterCriticalSection(&m_holdQueueCs);
+    LeaveCriticalSection(&m_deferredLock);
 
-    for (auto& item : m_holdQueue) {
-        if (item.poolIndex != SIZE_MAX) {
-            FreeToPool(item.poolIndex, item.rawPtr);
-        }
-        else {
-            DirectVirtualFree(item.rawPtr);
-        }
-
-        // 从块映射中删除
-        EnterCriticalSection(&m_blockMapCs);
-        m_blockMap.erase(item.userPtr);
-        LeaveCriticalSection(&m_blockMapCs);
+    // 处理项目
+    for (const auto& item : itemsToProcess) {
+        ProcessDeferredFreeItem(item);
     }
 
-    m_holdQueue.clear();
-    LeaveCriticalSection(&m_holdQueueCs);
+    if (!itemsToProcess.empty()) {
+        Logger::GetInstance().LogDebug("处理了%zu个延迟释放项", itemsToProcess.size());
+    }
 }
 
-size_t MemorySafety::GetHoldQueueSize() const noexcept {
-    EnterCriticalSection(&m_holdQueueCs);
-    size_t size = m_holdQueue.size();
-    LeaveCriticalSection(&m_holdQueueCs);
-    return size;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 块信息查询
-///////////////////////////////////////////////////////////////////////////////
-
-bool MemorySafety::IsOurBlock(void* userPtr) const noexcept {
-    if (!userPtr || !m_initialized.load()) {
-        return false;
+void MemorySafety::FlushDeferredFreeQueue() {
+    if (!IsInitialized()) {
+        return;
     }
 
-    EnterCriticalSection(&m_blockMapCs);
-    bool found = m_blockMap.find(userPtr) != m_blockMap.end();
-    LeaveCriticalSection(&m_blockMapCs);
-    return found;
+    Logger::GetInstance().LogInfo("刷新延迟释放队列...");
+
+    std::vector<DeferredFreeItem> allItems;
+
+    EnterCriticalSection(&m_deferredLock);
+    allItems = m_deferredQueue;
+    m_deferredQueue.clear();
+    LeaveCriticalSection(&m_deferredLock);
+
+    // 处理所有项目
+    for (const auto& item : allItems) {
+        ProcessDeferredFreeItem(item);
+    }
+
+    Logger::GetInstance().LogInfo("刷新完成，处理了%zu个项目", allItems.size());
 }
 
-size_t MemorySafety::GetBlockSize(void* userPtr) const noexcept {
-    if (!userPtr || !m_initialized.load()) {
+size_t MemorySafety::GetDeferredFreeQueueSize() const {
+    if (!IsInitialized()) {
         return 0;
     }
 
-    EnterCriticalSection(&m_blockMapCs);
-    auto it = m_blockMap.find(userPtr);
-    size_t size = (it != m_blockMap.end()) ? it->second.userSize : 0;
-    LeaveCriticalSection(&m_blockMapCs);
+    EnterCriticalSection(&m_deferredLock);
+    size_t size = m_deferredQueue.size();
+    LeaveCriticalSection(&m_deferredLock);
+
     return size;
 }
 
-BlockInfo MemorySafety::GetBlockInfo(void* userPtr) const noexcept {
-    if (!userPtr || !m_initialized.load()) {
-        return BlockInfo();
+void MemorySafety::EnterUnsafePeriod() {
+    m_inUnsafePeriod.store(true, std::memory_order_release);
+
+    if (m_unsafePeriodCallback) {
+        m_unsafePeriodCallback(true);
     }
 
-    EnterCriticalSection(&m_blockMapCs);
-    auto it = m_blockMap.find(userPtr);
-    BlockInfo info = (it != m_blockMap.end()) ? it->second : BlockInfo();
-    LeaveCriticalSection(&m_blockMapCs);
-    return info;
+    Logger::GetInstance().LogInfo("进入不安全期");
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// Storm兼容性
-///////////////////////////////////////////////////////////////////////////////
+void MemorySafety::ExitUnsafePeriod() {
+    m_inUnsafePeriod.store(false, std::memory_order_release);
 
-void MemorySafety::SetupStormHeader(void* userPtr, size_t userSize, size_t totalSize) noexcept {
-    if (!userPtr) return;
-
-    StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
-        static_cast<char*>(userPtr) - sizeof(StormAllocHeader)
-        );
-
-    // 设置Storm兼容的头部 - 使用正确的字段名
-    header->HeapPtr = 0xC0DEFEED; // 特殊标记，表示我们管理的块
-    header->Size = static_cast<DWORD>(userSize);
-    header->AlignPadding = 0;
-    header->Flags = 0x1; // 启用尾魔数
-    header->Magic = STORM_FRONT_MAGIC;
-
-    // 设置尾部魔数（如果启用）
-    if (header->Flags & 0x1) {
-        uint16_t* tailMagic = reinterpret_cast<uint16_t*>(
-            static_cast<char*>(userPtr) + userSize
-            );
-        *tailMagic = STORM_TAIL_MAGIC;
+    if (m_unsafePeriodCallback) {
+        m_unsafePeriodCallback(false);
     }
+
+    Logger::GetInstance().LogInfo("退出不安全期");
 }
 
-bool MemorySafety::ValidateStormHeader(void* userPtr) const noexcept {
-    if (!userPtr) return false;
+bool MemorySafety::IsInUnsafePeriod() const {
+    return m_inUnsafePeriod.load(std::memory_order_acquire);
+}
 
-    StormAllocHeader* header = reinterpret_cast<StormAllocHeader*>(
-        static_cast<char*>(userPtr) - sizeof(StormAllocHeader)
-        );
+void MemorySafety::SetUnsafePeriodCallback(void (*callback)(bool entering)) {
+    m_unsafePeriodCallback = callback;
+}
 
-    // 检查前魔数
-    if (header->Magic != STORM_FRONT_MAGIC) {
-        return false;
+std::vector<MemorySafety::LeakInfo> MemorySafety::DetectLeaks(DWORD minAge) const {
+    std::vector<LeakInfo> leaks;
+
+    if (!IsInitialized() || !m_config.enableLeakDetection) {
+        return leaks;
     }
 
-    // 检查尾魔数（如果启用）
-    if (header->Flags & 0x1) {
-        uint16_t* tailMagic = reinterpret_cast<uint16_t*>(
-            static_cast<char*>(userPtr) + header->Size
-            );
-        if (*tailMagic != STORM_TAIL_MAGIC) {
-            return false;
+    DWORD currentTime = GetTickCount();
+
+    AcquireSRWLockShared(&m_blocksLock);
+
+    for (const auto& pair : m_trackedBlocks) {
+        const MemoryBlockInfo& info = pair.second;
+        DWORD age = currentTime - info.timestamp;
+
+        if (age >= minAge) {
+            LeakInfo leak;
+            leak.userPtr = info.userPtr;
+            leak.size = info.size;
+            leak.sourceName = info.sourceName;
+            leak.sourceLine = info.sourceLine;
+            leak.age = age;
+
+            leaks.push_back(leak);
         }
     }
 
-    return true;
+    ReleaseSRWLockShared(&m_blocksLock);
+
+    const_cast<MemorySafety*>(this)->m_stats.leakDetections++;
+
+    return leaks;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// 工具函数
-///////////////////////////////////////////////////////////////////////////////
+void MemorySafety::ReportLeaks(const std::vector<LeakInfo>& leaks) const {
+    if (leaks.empty()) {
+        return;
+    }
 
-size_t MemorySafety::CalculateTotalSize(size_t userSize) const noexcept {
-    return AlignSize(sizeof(StormAllocHeader) + userSize + sizeof(uint16_t), 16);
+    Logger::GetInstance().LogWarning("=== 内存泄漏报告 ===");
+    Logger::GetInstance().LogWarning("检测到%zu个潜在泄漏:", leaks.size());
+
+    size_t totalSize = 0;
+    for (const auto& leak : leaks) {
+        totalSize += leak.size;
+
+        Logger::GetInstance().LogWarning("泄漏: ptr=%p, size=%zu, age=%lu ms, source=%s:%lu",
+            leak.userPtr, leak.size, leak.age,
+            leak.sourceName ? leak.sourceName : "unknown",
+            leak.sourceLine);
+
+        if (m_leakDetectedCallback) {
+            m_leakDetectedCallback(leak);
+        }
+    }
+
+    Logger::GetInstance().LogWarning("总泄漏大小: %zu 字节 (%.2f MB)",
+        totalSize, totalSize / (1024.0 * 1024.0));
+    Logger::GetInstance().LogWarning("================");
 }
 
-void* MemorySafety::GetUserPtrFromRaw(void* rawPtr) const noexcept {
-    if (!rawPtr) return nullptr;
-    return static_cast<char*>(rawPtr) + sizeof(StormAllocHeader);
+std::vector<MemorySafety::CorruptionInfo> MemorySafety::DetectCorruption() const {
+    std::vector<CorruptionInfo> corruptions;
+
+    if (!IsInitialized() || !m_config.enableCorruptionDetection) {
+        return corruptions;
+    }
+
+    AcquireSRWLockShared(&m_blocksLock);
+
+    for (const auto& pair : m_trackedBlocks) {
+        const MemoryBlockInfo& info = pair.second;
+
+        ReleaseSRWLockShared(&m_blocksLock);
+
+        if (IsBlockCorrupted(info)) {
+            CorruptionInfo corruption;
+            corruption.userPtr = info.userPtr;
+            corruption.expectedSize = info.size;
+            corruption.actualSize = MemoryPool::GetBlockSize(info.rawPtr);
+            corruption.description = "块大小不匹配或块已损坏";
+
+            corruptions.push_back(corruption);
+        }
+
+        AcquireSRWLockShared(&m_blocksLock);
+    }
+
+    ReleaseSRWLockShared(&m_blocksLock);
+
+    const_cast<MemorySafety*>(this)->m_stats.corruptionDetections++;
+
+    return corruptions;
 }
 
-void* MemorySafety::GetRawPtrFromUser(void* userPtr) const noexcept {
-    if (!userPtr) return nullptr;
-    return static_cast<char*>(userPtr) - sizeof(StormAllocHeader);
+void MemorySafety::ReportCorruption(const std::vector<CorruptionInfo>& corruptions) const {
+    if (corruptions.empty()) {
+        return;
+    }
+
+    Logger::GetInstance().LogError("=== 内存损坏报告 ===");
+    Logger::GetInstance().LogError("检测到%zu个损坏块:", corruptions.size());
+
+    for (const auto& corruption : corruptions) {
+        Logger::GetInstance().LogError("损坏: ptr=%p, 期望大小=%zu, 实际大小=%zu, 描述=%s",
+            corruption.userPtr, corruption.expectedSize,
+            corruption.actualSize, corruption.description);
+
+        if (m_corruptionDetectedCallback) {
+            m_corruptionDetectedCallback(corruption);
+        }
+    }
+
+    Logger::GetInstance().LogError("================");
 }
 
-size_t MemorySafety::AlignSize(size_t size, size_t alignment) const noexcept {
-    return (size + alignment - 1) & ~(alignment - 1);
+MemorySafety::MemorySafetyStats MemorySafety::GetStats() const {
+    return m_stats;
 }
 
-void MemorySafety::UpdateStatistics(size_t size, bool isAllocation, size_t poolIndex) noexcept {
-    if (isAllocation) {
-        m_totalAllocated.fetch_add(size);
+void MemorySafety::ResetStats() {
+    memset(&m_stats, 0, sizeof(m_stats));
+    Logger::GetInstance().LogInfo("内存安全统计已重置");
+}
+
+void MemorySafety::PrintStats() const {
+    Logger::GetInstance().LogInfo("=== 内存安全系统统计 ===");
+    Logger::GetInstance().LogInfo("注册块: %zu, 注销块: %zu, 当前块: %zu",
+        m_stats.totalRegistered, m_stats.totalUnregistered, m_stats.currentBlocks);
+    Logger::GetInstance().LogInfo("当前大小: %zu MB, 峰值块数: %zu, 峰值大小: %zu MB",
+        m_stats.currentSize / (1024 * 1024), m_stats.peakBlocks,
+        m_stats.peakSize / (1024 * 1024));
+    Logger::GetInstance().LogInfo("验证: %zu 次, 失败: %zu 次",
+        m_stats.validationCount, m_stats.validationFailures);
+    Logger::GetInstance().LogInfo("延迟释放: %zu 次, 泄漏检测: %zu 次, 损坏检测: %zu 次",
+        m_stats.deferredFreeCount, m_stats.leakDetections, m_stats.corruptionDetections);
+    Logger::GetInstance().LogInfo("延迟队列大小: %zu", GetDeferredFreeQueueSize());
+    Logger::GetInstance().LogInfo("=====================");
+}
+
+void MemorySafety::SetConfig(const MemorySafetyConfig& config) {
+    m_config = config;
+    Logger::GetInstance().LogInfo("内存安全配置已更新");
+}
+
+MemorySafetyConfig MemorySafety::GetConfig() const {
+    return m_config;
+}
+
+void MemorySafety::DumpAllBlocks() const {
+    if (!IsInitialized()) {
+        return;
+    }
+
+    Logger::GetInstance().LogInfo("=== 所有跟踪的内存块 ===");
+
+    AcquireSRWLockShared(&m_blocksLock);
+
+    for (const auto& pair : m_trackedBlocks) {
+        const MemoryBlockInfo& info = pair.second;
+        DWORD age = GetTickCount() - info.timestamp;
+
+        Logger::GetInstance().LogInfo("块: ptr=%p, raw=%p, size=%zu, age=%lu ms, thread=%lu, source=%s:%lu",
+            info.userPtr, info.rawPtr, info.size, age, info.threadId,
+            info.sourceName ? info.sourceName : "unknown", info.sourceLine);
+    }
+
+    ReleaseSRWLockShared(&m_blocksLock);
+
+    Logger::GetInstance().LogInfo("总计: %zu 个块", m_trackedBlocks.size());
+    Logger::GetInstance().LogInfo("===================");
+}
+
+void MemorySafety::DumpDeferredQueue() const {
+    if (!IsInitialized()) {
+        return;
+    }
+
+    Logger::GetInstance().LogInfo("=== 延迟释放队列 ===");
+
+    EnterCriticalSection(&m_deferredLock);
+
+    DWORD currentTime = GetTickCount();
+    for (size_t i = 0; i < m_deferredQueue.size(); i++) {
+        const auto& item = m_deferredQueue[i];
+        DWORD age = currentTime - item.queueTime;
+
+        Logger::GetInstance().LogInfo("项目 #%zu: ptr=%p, size=%zu, age=%lu ms, thread=%lu",
+            i, item.ptr, item.size, age, item.threadId);
+    }
+
+    LeaveCriticalSection(&m_deferredLock);
+
+    Logger::GetInstance().LogInfo("总计: %zu 个项目", m_deferredQueue.size());
+    Logger::GetInstance().LogInfo("================");
+}
+
+void MemorySafety::ClearAllTracking() {
+    Logger::GetInstance().LogInfo("清理所有跟踪数据...");
+
+    AcquireSRWLockExclusive(&m_blocksLock);
+    m_trackedBlocks.clear();
+    ReleaseSRWLockExclusive(&m_blocksLock);
+
+    EnterCriticalSection(&m_deferredLock);
+    m_deferredQueue.clear();
+    LeaveCriticalSection(&m_deferredLock);
+
+    Logger::GetInstance().LogInfo("跟踪数据清理完成");
+}
+
+void MemorySafety::SetValidationFailureCallback(ValidationFailureCallback callback) {
+    m_validationFailureCallback = callback;
+}
+
+void MemorySafety::SetLeakDetectedCallback(LeakDetectedCallback callback) {
+    m_leakDetectedCallback = callback;
+}
+
+void MemorySafety::SetCorruptionDetectedCallback(CorruptionDetectedCallback callback) {
+    m_corruptionDetectedCallback = callback;
+}
+
+// ======================== 内部实现 ========================
+
+void MemorySafety::ProcessDeferredFreeItem(const DeferredFreeItem& item) {
+    // 1) 查询rawPtr（item.ptr 是 userPtr）
+    MemoryBlockInfo info{};
+    bool got = GetMemoryBlockInfo(item.ptr, info);
+
+    // 2) 从跟踪移除（安全版本，不报错）
+    TryUnregisterBlock(item.ptr);
+
+    // 3) 释放：仅当拿到 rawPtr 才释放；否则跳过，避免 TLSF 损坏
+    if (got && info.rawPtr) {
+        MemoryPool::FreeSafe(info.rawPtr);
+        Logger::GetInstance().LogDebug(
+            "处理延迟释放(raw): user=%p, raw=%p, size=%zu",
+            item.ptr, info.rawPtr, item.size);
     }
     else {
-        m_totalFreed.fetch_add(size);
+        Logger::GetInstance().LogError(
+            "延迟释放缺rawPtr，已跳过以避免TLSF损坏: user=%p, size=%zu",
+            item.ptr, item.size);
+        // 关键：绝不fallback到 free(userPtr)，这会破坏TLSF池
+        // 可选：将其计入泄漏统计或重试队列，但切忌直接释放userPtr
+    }
+}
+bool MemorySafety::IsBlockCorrupted(const MemoryBlockInfo& info) const {
+    // 检查块是否仍在池中
+    if (!MemoryPool::IsFromPool(info.rawPtr)) {
+        return true;
+    }
+
+    // 检查块大小是否一致
+    size_t actualSize = MemoryPool::GetBlockSize(info.rawPtr);
+    if (actualSize == 0) {
+        return true;
+    }
+
+    // 大小差异太大可能表示损坏
+    if (actualSize < info.size) {
+        return true;
+    }
+
+    return false;
+}
+
+void MemorySafety::NotifyValidationFailure(void* userPtr, const char* reason) const {
+    Logger::GetInstance().LogError("内存验证失败: ptr=%p, 原因=%s", userPtr, reason);
+
+    if (m_validationFailureCallback) {
+        m_validationFailureCallback(userPtr, reason);
     }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// 内存压力管理
-///////////////////////////////////////////////////////////////////////////////
-
-bool MemorySafety::IsMemoryUnderPressure() const noexcept {
-    size_t vmUsage = MemorySafetyUtils::GetProcessVirtualMemoryUsage();
-
-    EnterCriticalSection(&m_configCs);
-    size_t watermarkBytes = m_config.memoryWatermarkMB * 1024 * 1024;
-    LeaveCriticalSection(&m_configCs);
-
-    return vmUsage > watermarkBytes;
-}
-
-void MemorySafety::ForceCleanup() noexcept {
-    DWORD currentTime = MemorySafetyUtils::GetTickCount();
-    DWORD lastCleanup = m_lastCleanupTime.load();
-
-    if (currentTime - lastCleanup < MIN_CLEANUP_INTERVAL_MS) {
-        return; // 避免频繁清理
-    }
-
-    // 处理Hold队列
-    ProcessHoldQueue();
-
-    m_lastCleanupTime.store(currentTime);
-    m_forceCleanups.fetch_add(1);
-
-    LogMessage("[MemorySafety] 强制清理完成");
-}
-
-void MemorySafety::TriggerPressureCleanup() noexcept {
-    if (IsMemoryUnderPressure()) {
-        ForceCleanup();
+void MemorySafety::NotifyLeakDetected(const LeakInfo& leak) const {
+    if (m_leakDetectedCallback) {
+        m_leakDetectedCallback(leak);
     }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// 配置管理
-///////////////////////////////////////////////////////////////////////////////
-
-void MemorySafety::SetHoldTimeMs(DWORD timeMs) noexcept {
-    EnterCriticalSection(&m_configCs);
-    m_config.holdBufferTimeMs = timeMs;
-    LeaveCriticalSection(&m_configCs);
+void MemorySafety::NotifyCorruptionDetected(const CorruptionInfo& corruption) const {
+    if (m_corruptionDetectedCallback) {
+        m_corruptionDetectedCallback(corruption);
+    }
 }
 
-void MemorySafety::SetWatermarkMB(size_t watermarkMB) noexcept {
-    EnterCriticalSection(&m_configCs);
-    m_config.memoryWatermarkMB = watermarkMB;
-    LeaveCriticalSection(&m_configCs);
+// ======================== MemoryMonitor实现 ========================
+
+MemoryMonitor::MemoryMonitor() : m_thread(nullptr), m_stopEvent(nullptr), m_interval(5000) {
 }
 
-void MemorySafety::SetMaxHoldQueueSize(size_t maxSize) noexcept {
-    EnterCriticalSection(&m_configCs);
-    m_config.maxHoldQueueSize = maxSize;
-    LeaveCriticalSection(&m_configCs);
+MemoryMonitor::~MemoryMonitor() {
+    StopMonitoring();
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// 兼容性方法（为MemoryPool提供）
-///////////////////////////////////////////////////////////////////////////////
+void MemoryMonitor::StartMonitoring(DWORD intervalMs) {
+    if (m_running.exchange(true, std::memory_order_acq_rel)) {
+        return; // 已在运行
+    }
 
-size_t MemorySafety::GetTotalCached() const noexcept {
-    size_t totalCached = 0;
+    m_interval = intervalMs;
+    m_stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 
-    // 统计所有池的已分配内存
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        if (m_pools[i]) {
-            totalCached += m_pools[i]->usedBytes.load();
+    if (!m_stopEvent) {
+        m_running.store(false, std::memory_order_release);
+        return;
+    }
+
+    // 初始化时间戳
+    DWORD currentTime = GetTickCount();
+    m_lastReportTime = currentTime;
+    m_lastStatsTime = currentTime;
+    m_lastValidationTime = currentTime;
+    m_lastLeakCheckTime = currentTime;
+
+    m_thread = CreateThread(nullptr, 0, MonitorThreadProc, this, 0, nullptr);
+
+    if (!m_thread) {
+        CloseHandle(m_stopEvent);
+        m_stopEvent = nullptr;
+        m_running.store(false, std::memory_order_release);
+        return;
+    }
+
+    Logger::GetInstance().LogInfo("增强版内存监控器已启动，间隔=%lu ms", intervalMs);
+}
+
+void MemoryMonitor::StopMonitoring() {
+    if (!m_running.exchange(false, std::memory_order_acq_rel)) {
+        return; // 未运行
+    }
+
+    if (m_stopEvent) {
+        SetEvent(m_stopEvent);
+    }
+
+    if (m_thread) {
+        WaitForSingleObject(m_thread, 5000);
+        CloseHandle(m_thread);
+        m_thread = nullptr;
+    }
+
+    if (m_stopEvent) {
+        CloseHandle(m_stopEvent);
+        m_stopEvent = nullptr;
+    }
+
+    Logger::GetInstance().LogInfo("增强版内存监控器已停止");
+}
+
+bool MemoryMonitor::IsMonitoring() const {
+    return m_running.load(std::memory_order_acquire);
+}
+
+DWORD WINAPI MemoryMonitor::MonitorThreadProc(LPVOID param) {
+    MemoryMonitor* monitor = static_cast<MemoryMonitor*>(param);
+    monitor->MonitorLoop();
+    return 0;
+}
+
+void MemoryMonitor::MonitorLoop() {
+    Logger::GetInstance().LogInfo("增强版内存监控线程已启动");
+
+    while (m_running.load(std::memory_order_acquire)) {
+        DWORD waitResult = WaitForSingleObject(m_stopEvent, m_interval);
+
+        if (waitResult == WAIT_OBJECT_0) {
+            break; // 收到停止信号
         }
-    }
 
-    // 加上Hold队列中的内存
-    totalCached += GetHoldQueueSize() * 1024; // 粗略估算
-
-    return totalCached;
-}
-
-void MemorySafety::SetMaxCacheSize(size_t maxSizeMB) noexcept {
-    // 这里可以调整池的行为，暂时只记录配置
-    LogMessage("[MemorySafety] 设置最大缓存大小: %zuMB", maxSizeMB);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 统计信息
-///////////////////////////////////////////////////////////////////////////////
-
-MemorySafety::Statistics MemorySafety::GetStatistics() const noexcept {
-    Statistics stats;
-    stats.totalAllocated = m_totalAllocated.load();
-    stats.totalFreed = m_totalFreed.load();
-    stats.currentUsed = stats.totalAllocated - stats.totalFreed;
-    stats.holdQueueSize = GetHoldQueueSize();
-    stats.forceCleanups = m_forceCleanups.load();
-    stats.directVirtualAllocCount = m_directVirtualAllocCount.load();
-    stats.directVirtualAllocBytes = m_directVirtualAllocBytes.load();
-
-    // 各池统计
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        if (m_pools[i]) {
-            TLSFPoolInstance& pool = *m_pools[i];
-            auto& poolStat = stats.poolStats[i];
-
-            poolStat.totalSize = pool.totalSize;
-            poolStat.usedBytes = pool.usedBytes.load();
-            poolStat.allocCount = pool.allocCount.load();
-            poolStat.freeCount = pool.freeCount.load();
-            poolStat.utilization = pool.totalSize > 0 ?
-                (poolStat.usedBytes * 100.0 / pool.totalSize) : 0.0;
-        }
-    }
-
-    return stats;
-}
-
-void MemorySafety::PrintStatistics() const noexcept {
-    Statistics stats = GetStatistics();
-
-    LogMessage("[MemorySafety] === 统计报告 ===");
-    LogMessage("  总体: 分配=%zuMB, 释放=%zuMB, 使用中=%zuMB",
-        stats.totalAllocated / (1024 * 1024), stats.totalFreed / (1024 * 1024), stats.currentUsed / (1024 * 1024));
-    LogMessage("  Hold队列: %zu项", stats.holdQueueSize);
-    LogMessage("  强制清理: %zu次", stats.forceCleanups);
-    LogMessage("  直接VirtualAlloc: %zu次, %zuMB",
-        stats.directVirtualAllocCount, stats.directVirtualAllocBytes / (1024 * 1024));
-
-    for (size_t i = 0; i < POOL_COUNT; ++i) {
-        auto& ps = stats.poolStats[i];
-        LogMessage("  池%zu: %zuMB, 使用率%.1f%%, 分配%zu次, 释放%zu次",
-            i, ps.totalSize / (1024 * 1024), ps.utilization, ps.allocCount, ps.freeCount);
-    }
-
-    size_t processVM = MemorySafetyUtils::GetProcessVirtualMemoryUsage();
-    LogMessage("  进程虚拟内存: %zuMB", processVM / (1024 * 1024));
-    LogMessage("========================");
-}
-
-void MemorySafety::ResetStatistics() noexcept {
-    m_totalAllocated.store(0);
-    m_totalFreed.store(0);
-    m_forceCleanups.store(0);
-    m_directVirtualAllocCount.store(0);
-    m_directVirtualAllocBytes.store(0);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// 工具函数实现
-///////////////////////////////////////////////////////////////////////////////
-
-namespace MemorySafetyUtils {
-    size_t GetProcessVirtualMemoryUsage() noexcept {
-        PROCESS_MEMORY_COUNTERS_EX pmc = { sizeof(pmc) };
-        if (GetProcessMemoryInfo(GetCurrentProcess(),
-            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
-            return pmc.PrivateUsage;
-        }
-        return 0;
-    }
-
-    size_t GetSystemMemoryLoad() noexcept {
-        MEMORYSTATUSEX ms = { sizeof(ms) };
-        if (GlobalMemoryStatusEx(&ms)) {
-            return ms.dwMemoryLoad;
-        }
-        return 0;
-    }
-
-    DWORD GetTickCount() noexcept {
-        return static_cast<DWORD>(::GetTickCount64() & 0xFFFFFFFF);
-    }
-
-    bool HasTimeElapsed(DWORD startTime, DWORD intervalMs) noexcept {
         DWORD currentTime = GetTickCount();
-        return (currentTime - startTime) >= intervalMs;
+        MemorySafety& safety = MemorySafety::GetInstance();
+
+        if (!safety.IsInitialized()) {
+            continue;
+        }
+
+        // 使用批处理减少锁争用，同一时间只做一种操作
+
+        // 1. 每30秒生成详细报告
+        if (currentTime - m_lastReportTime > 30000) {
+            GenerateDetailedReport();
+            m_lastReportTime = currentTime;
+            continue;
+        }
+
+        // 2. 每60秒打印完整内存统计
+        if (currentTime - m_lastStatsTime > 60000) {
+            PrintMemoryStats();
+            m_lastStatsTime = currentTime;
+            continue;
+        }
+
+        // 3. 每30秒验证所有块
+        if (currentTime - m_lastValidationTime > 30000) {
+            safety.ValidateAllBlocks();
+            m_lastValidationTime = currentTime;
+            continue;
+        }
+
+        // 4. 每60秒检测泄漏
+        if (currentTime - m_lastLeakCheckTime > 60000) {
+            auto leaks = safety.DetectLeaks(120000); // 检测存活超过2分钟的块
+            if (!leaks.empty()) {
+                safety.ReportLeaks(leaks);
+            }
+            m_lastLeakCheckTime = currentTime;
+            continue;
+        }
+
+        // 5. 每次循环都处理延迟释放队列
+        safety.ProcessDeferredFreeQueue();
     }
 
-    size_t AlignSize(size_t size, size_t alignment) noexcept {
-        return (size + alignment - 1) & ~(alignment - 1);
+    Logger::GetInstance().LogInfo("增强版内存监控线程已退出");
+}
+
+void MemoryMonitor::GenerateDetailedReport() {
+    Logger::GetInstance().LogInfo("=== 详细内存报告 ===");
+
+    // OS口径
+    PrintProcessMemory();
+
+    // MemorySafety统计
+    auto safetyStats = MemorySafety::GetInstance().GetStats();
+    Logger::GetInstance().LogInfo("内存安全: 当前块=%zu, 当前大小=%zu MB, 峰值=%zu MB",
+        safetyStats.currentBlocks,
+        safetyStats.currentSize / (1024 * 1024),
+        safetyStats.peakSize / (1024 * 1024));
+
+    // StormHook统计
+    size_t managedBlocks = StormHook::GetManagedBlockCount();
+    size_t managedSize = StormHook::GetTotalManagedSize();
+    Logger::GetInstance().LogInfo("StormHook: 管理块=%zu, 总大小=%zu MB",
+        managedBlocks, managedSize / (1024 * 1024));
+
+    // TLSF内存池统计
+    PrintTLSFPoolStats();
+
+    // Storm内部统计
+    PrintStormInternalStats();
+
+    Logger::GetInstance().LogInfo("==================");
+}
+
+void MemoryMonitor::PrintMemoryStats() {
+    DWORD currentTime = GetTickCount();
+    Logger::GetInstance().LogInfo("\n[内存状态] ---- 距上次报告%u秒 ----",
+        (currentTime - m_lastStatsTime) / 1000);
+
+    // OS口径
+    PrintProcessMemory();
+
+    // MemoryPool统计
+    MemoryPool::PrintStats();
+
+    // MemorySafety统计
+    MemorySafety::GetInstance().PrintStats();
+
+    // StormHook统计
+    Logger::GetInstance().LogInfo("[内存状态] StormHook管理块: %zu个, 总大小: %zu MB",
+        StormHook::GetManagedBlockCount(),
+        StormHook::GetTotalManagedSize() / (1024 * 1024));
+
+    // TLSF详细统计
+    PrintTLSFPoolStats();
+
+    // Storm内部统计
+    PrintStormInternalStats();
+}
+
+void MemoryMonitor::PrintStormInternalStats() {
+    // 需要确保Storm.dll已加载且偏移有效
+    if (gStormDllBase == 0) {
+        Logger::GetInstance().LogWarning("Storm.dll基址未设置，跳过内部统计");
+        return;
     }
 
-    size_t GetPageAlignedSize(size_t size) noexcept {
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        return AlignSize(size, si.dwPageSize);
+    __try {
+        Logger::GetInstance().LogInfo("=== Storm内部统计 ===");
+
+        // 内存系统状态
+        bool memSysInit = Storm_g_MemorySystemInitialized;
+        bool errorHandling = Storm_g_ErrorHandlingEnabled;
+        Logger::GetInstance().LogInfo("Storm内存系统: 已初始化=%s, 错误处理=%s",
+            memSysInit ? "是" : "否", errorHandling ? "是" : "否");
+
+        // 总分配内存
+        size_t totalAlloc = Storm_g_TotalAllocatedMemory;
+        Logger::GetInstance().LogInfo("Storm总分配内存: %zu MB", totalAlloc / (1024 * 1024));
+
+        // 调试相关
+        uint32_t forceAlign = Storm_ForceAllocSizeToFour;
+        uint32_t extraPadding = Storm_ExtraAlignPadding;
+        Logger::GetInstance().LogInfo("Storm调试标志: ForceAlign=%u, ExtraPadding=%u",
+            forceAlign, extraPadding);
+
+        // 堆活跃状态（检查前几个堆）
+        int activeHeaps = 0;
+        for (int i = 0; i < 16; i++) { // 只检查前16个堆，避免过多输出
+            if (Storm_g_HeapActiveFlag(i) != 0) {
+                activeHeaps++;
+            }
+        }
+        Logger::GetInstance().LogInfo("Storm活跃堆数量: %d (前16个检查)", activeHeaps);
+
+        Logger::GetInstance().LogInfo("===================");
     }
-
-    bool IsTLSFPointer(const void* ptr, const TLSFPoolInstance& pool) noexcept {
-        if (!ptr || !pool.baseMemory) return false;
-
-        uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
-        uintptr_t poolStart = reinterpret_cast<uintptr_t>(pool.baseMemory);
-        uintptr_t poolEnd = poolStart + pool.totalSize;
-
-        return ptrAddr >= poolStart && ptrAddr < poolEnd;
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::GetInstance().LogError("访问Storm内部统计时发生异常: 0x%08X", GetExceptionCode());
     }
+}
 
-    size_t GetTLSFBlockSize(tlsf_t tlsf, void* ptr) noexcept {
-        if (!tlsf || !ptr) return 0;
-        return tlsf_block_size(ptr);
+void MemoryMonitor::PrintTLSFPoolStats() {
+    Logger::GetInstance().LogInfo("=== TLSF内存池详细统计 ===");
+
+    auto poolStats = MemoryPool::GetStats();
+    Logger::GetInstance().LogInfo("总大小: %zu MB, 已用: %zu MB (%.1f%%)",
+        poolStats.totalSize / (1024 * 1024),
+        poolStats.usedSize / (1024 * 1024),
+        poolStats.totalSize > 0 ? (poolStats.usedSize * 100.0 / poolStats.totalSize) : 0.0);
+
+    Logger::GetInstance().LogInfo("空闲: %zu MB, 峰值使用: %zu MB",
+        poolStats.freeSize / (1024 * 1024),
+        poolStats.peakUsed / (1024 * 1024));
+
+    Logger::GetInstance().LogInfo("分配次数: %zu, 释放次数: %zu, 扩展次数: %zu",
+        poolStats.allocCount, poolStats.freeCount, poolStats.extendCount);
+
+    // 池数量信息
+    size_t poolCount = MemoryPool::Internal::GetPoolCount();
+    Logger::GetInstance().LogInfo("内存池数量: %zu", poolCount);
+
+    Logger::GetInstance().LogInfo("========================");
+}
+
+void MemoryMonitor::PrintProcessMemory() {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+        sizeof(pmc))) {
+
+        size_t privateBytes = pmc.PrivateUsage;      // 提交量（推荐）
+        size_t workingSet = pmc.WorkingSetSize;    // 常驻集
+        size_t wsPeak = pmc.PeakWorkingSetSize;
+        size_t pagefileUse = pmc.PagefileUsage;     // 兼容字段
+        size_t pagefilePeak = pmc.PeakPagefileUsage;
+
+        Logger::GetInstance().LogInfo("=== 进程内存 (OS口径) ===");
+        Logger::GetInstance().LogInfo("PrivateBytes(提交量): %zu MB", privateBytes / (1024 * 1024));
+        Logger::GetInstance().LogInfo("WorkingSet(常驻):     %zu MB (峰值 %zu MB)",
+            workingSet / (1024 * 1024), wsPeak / (1024 * 1024));
+        Logger::GetInstance().LogInfo("PagefileUsage(兼容):  %zu MB (峰值 %zu MB)",
+            pagefileUse / (1024 * 1024), pagefilePeak / (1024 * 1024));
+        Logger::GetInstance().LogInfo("========================");
+    }
+    else {
+        Logger::GetInstance().LogError("GetProcessMemoryInfo失败: %lu", GetLastError());
     }
 }
