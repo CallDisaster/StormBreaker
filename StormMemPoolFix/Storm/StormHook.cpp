@@ -16,6 +16,7 @@
 Storm_MemAlloc_t       g_origStormAlloc = nullptr;
 Storm_MemFree_t        g_origStormFree = nullptr;
 Storm_MemReAlloc_t     g_origStormReAlloc = nullptr;
+Storm_MemGetSize_t     g_origStormGetSize = nullptr;
 StormHeap_CleanupAll_t g_origCleanupAll = nullptr;
 ResetMemoryManager_t   g_origResetMemoryManager = nullptr;
 
@@ -38,7 +39,7 @@ namespace {
     std::atomic<size_t> g_totalFreedBytes(0);
 
     // 大块分配阈值（64KB）
-    std::atomic<size_t> g_largeBlockThreshold{ 128 * 1024 }; // 默认 128 KiB，更安全
+    std::atomic<size_t> g_largeBlockThreshold{ 64 * 1024 }; // 默认 64 KiB，覆盖Storm大块阈值
 
     // 线程局部状态（避免递归）
     thread_local bool tls_inHook = false;
@@ -365,6 +366,8 @@ namespace StormHook {
 
         // === 新增：主动探测默认StormHeap* ===
         StormHook_Internal::ProbeDefaultStormHeapPointer();
+
+        Logger::GetInstance().LogInfo("大块拦截阈值: %zu KiB", GetLargeBlockThreshold() / 1024);
 
         Logger::GetInstance().LogInfo("StormHook系统初始化完成");
         return true;
@@ -748,6 +751,39 @@ int __stdcall Hooked_Storm_MemFree(void* ptr, const char* name, int argList, DWO
     }
 
     return result;
+}
+
+int __stdcall Hooked_Storm_MemGetSize(void* ptr, const char* name, int argList) {
+    constexpr size_t kStormSizeLimit = 0x7FFFFFFF;
+
+    if (ptr && StormHook::IsOurBlock(ptr)) {
+        size_t blockSize = 0;
+        ManagedBlockInfo info{};
+        if (StormHook_Internal::GetManagedBlockInfo(ptr, info)) {
+            blockSize = info.originalSize;
+        }
+
+        if (blockSize == 0) {
+            blockSize = StormHook_Internal::GetBlockSizeFromManagedTable(ptr);
+        }
+
+        if (blockSize == 0) {
+            blockSize = StormHook_Internal::GetBlockSizeFromHeader(ptr);
+        }
+
+        if (blockSize > 0) {
+            if (blockSize > kStormSizeLimit) {
+                blockSize = kStormSizeLimit;
+            }
+            return static_cast<int>(blockSize);
+        }
+    }
+
+    if (!g_origStormGetSize) {
+        return -1;
+    }
+
+    return g_origStormGetSize(ptr, name, argList);
 }
 
 void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,

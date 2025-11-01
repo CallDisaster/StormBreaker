@@ -911,6 +911,27 @@ void MemoryMonitor::PrintMemoryStats() {
 
     // MemoryPool统计
     MemoryPool::PrintStats();
+    auto poolStats = MemoryPool::GetStats();
+
+    size_t stormTotalBytes = 0;
+    bool stormStatsValid = false;
+    if (gStormDllBase != 0) {
+        __try {
+            stormTotalBytes = Storm_g_TotalAllocatedMemory;
+            stormStatsValid = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            Logger::GetInstance().LogError("读取Storm总分配内存失败: 0x%08X", GetExceptionCode());
+        }
+    }
+
+    if (stormStatsValid) {
+        constexpr size_t MB = 1024 * 1024;
+        size_t tlsfUsed = poolStats.usedSize;
+        long long diff = static_cast<long long>(stormTotalBytes) - static_cast<long long>(tlsfUsed);
+        Logger::GetInstance().LogInfo("[内存状态] Storm累计=%zu MB, TLSF占用=%zu MB, 差值=%lld MB",
+            stormTotalBytes / MB, tlsfUsed / MB, diff / static_cast<long long>(MB));
+    }
 
     // MemorySafety统计
     MemorySafety::GetInstance().PrintStats();

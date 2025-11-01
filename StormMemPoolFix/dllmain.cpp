@@ -72,8 +72,6 @@ namespace {
 
 // 工作线程函数 - 在Loader Lock外执行所有重活
 static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
-    // 等一小段时间确保DLL加载完成
-    Sleep(100);
 
     Logger::GetInstance().LogInfo("开始异步初始化StormBreaker系统...");
 
@@ -89,8 +87,6 @@ static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
         ShutdownStormBreaker();
         return 2;
     }
-
-    g_hooksInstalled.store(true, std::memory_order_release);
 
     if (!InstallPathCapUnlock(2.0f)) {
         Logger::GetInstance().LogWarning("寻路容量写入未成功（可能是版本偏移变化），继续运行不影响其他功能");
@@ -196,6 +192,11 @@ void ShutdownStormBreaker() {
 bool InstallStormHooks() {
     Logger::GetInstance().LogInfo("安装Storm Hook...");
 
+    if (g_hooksInstalled.load(std::memory_order_acquire)) {
+        Logger::GetInstance().LogInfo("Storm Hook已安装，跳过重复安装");
+        return true;
+    }
+
     HMODULE hStorm = GetModuleHandleA("Storm.dll");
     if (!hStorm) {
         Logger::GetInstance().LogError("未找到Storm.dll模块");
@@ -206,10 +207,12 @@ bool InstallStormHooks() {
     auto pAlloc = GetProcAddress(hStorm, "SMemAlloc");
     auto pFree = GetProcAddress(hStorm, "SMemFree");
     auto pReAlloc = GetProcAddress(hStorm, "SMemReAlloc");
+    auto pGetSize = GetProcAddress(hStorm, "SMemGetSize");
     auto pCleanup = GetProcAddress(hStorm, "SMemHeapCleanupAll");
+    auto pReset = GetProcAddress(hStorm, "ResetMemoryManager");
 
     // 如果导出名不存在，尝试已知偏移（需要根据实际版本调整）
-    if (!pAlloc || !pFree || !pReAlloc) {
+    if (!pAlloc || !pFree || !pReAlloc || !pGetSize || !pReset) {
         Logger::GetInstance().LogWarning("部分导出名未找到，尝试使用已知偏移（风险较高）");
         uintptr_t base = reinterpret_cast<uintptr_t>(hStorm);
 
@@ -217,6 +220,8 @@ bool InstallStormHooks() {
         if (!pAlloc) pAlloc = reinterpret_cast<FARPROC>(base + 0x2B830);
         if (!pFree) pFree = reinterpret_cast<FARPROC>(base + 0x2BE40);
         if (!pReAlloc) pReAlloc = reinterpret_cast<FARPROC>(base + 0x2C8B0);
+        if (!pGetSize) pGetSize = reinterpret_cast<FARPROC>(base + 0x2C000);
+        // ResetMemoryManager偏移尚未确认，默认不启用
         if (!pCleanup) pCleanup = reinterpret_cast<FARPROC>(base + 0x2AB50);
     }
 
@@ -224,7 +229,9 @@ bool InstallStormHooks() {
     g_origStormAlloc = reinterpret_cast<Storm_MemAlloc_t>(pAlloc);
     g_origStormFree = reinterpret_cast<Storm_MemFree_t>(pFree);
     g_origStormReAlloc = reinterpret_cast<Storm_MemReAlloc_t>(pReAlloc);
+    g_origStormGetSize = reinterpret_cast<Storm_MemGetSize_t>(pGetSize);
     g_origCleanupAll = reinterpret_cast<StormHeap_CleanupAll_t>(pCleanup);
+    g_origResetMemoryManager = reinterpret_cast<ResetMemoryManager_t>(pReset);
 
     // 使用Detours安装Hook
     DetourTransactionBegin();
@@ -234,6 +241,16 @@ bool InstallStormHooks() {
     DetourAttach(&reinterpret_cast<PVOID&>(g_origStormAlloc), Hooked_Storm_MemAlloc);
     DetourAttach(&reinterpret_cast<PVOID&>(g_origStormFree), Hooked_Storm_MemFree);
     DetourAttach(&reinterpret_cast<PVOID&>(g_origStormReAlloc), Hooked_Storm_MemReAlloc);
+    if (g_origStormGetSize) {
+        DetourAttach(&reinterpret_cast<PVOID&>(g_origStormGetSize), Hooked_Storm_MemGetSize);
+    } else {
+        Logger::GetInstance().LogWarning("未能定位 SMemGetSize，相关兼容功能将被禁用");
+    }
+    if (g_origResetMemoryManager) {
+        DetourAttach(&reinterpret_cast<PVOID&>(g_origResetMemoryManager), Hooked_ResetMemoryManager);
+    } else {
+        Logger::GetInstance().LogWarning("未能定位 ResetMemoryManager，Reset 协同功能暂不可用");
+    }
 
     // Hook清理函数（如果找到的话）
     if (g_origCleanupAll) {
@@ -247,6 +264,7 @@ bool InstallStormHooks() {
     }
 
     Logger::GetInstance().LogInfo("Storm Hook安装成功");
+    g_hooksInstalled.store(true, std::memory_order_release);
     return true;
 }
 
@@ -269,6 +287,12 @@ void UninstallStormHooks() {
     if (g_origStormReAlloc) {
         DetourDetach(&reinterpret_cast<PVOID&>(g_origStormReAlloc), Hooked_Storm_MemReAlloc);
     }
+    if (g_origStormGetSize) {
+        DetourDetach(&reinterpret_cast<PVOID&>(g_origStormGetSize), Hooked_Storm_MemGetSize);
+    }
+    if (g_origResetMemoryManager) {
+        DetourDetach(&reinterpret_cast<PVOID&>(g_origResetMemoryManager), Hooked_ResetMemoryManager);
+    }
     if (g_origCleanupAll) {
         DetourDetach(&reinterpret_cast<PVOID&>(g_origCleanupAll), Hooked_StormHeap_CleanupAll);
     }
@@ -285,7 +309,9 @@ void UninstallStormHooks() {
     g_origStormAlloc = nullptr;
     g_origStormFree = nullptr;
     g_origStormReAlloc = nullptr;
+    g_origStormGetSize = nullptr;
     g_origCleanupAll = nullptr;
+    g_origResetMemoryManager = nullptr;
 }
 
 // ======================== 内存监控启动/停止 ========================
