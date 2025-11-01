@@ -76,6 +76,7 @@ extern "C" {
     void* __fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
         const char* name, DWORD srcLine, DWORD flags);
     int   __stdcall  Hooked_Storm_MemFree(void* ptr, const char* name, int argList, DWORD flags);
+    int   __stdcall  Hooked_Storm_MemGetSize(void* ptr, const char* name, int argList);
     void* __fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void* oldPtr, size_t newSize,
         const char* name, DWORD srcLine, DWORD flags);
 
@@ -92,6 +93,7 @@ typedef void* (__fastcall* Storm_MemAlloc_t)(int ecx, int edx, size_t size,
 typedef int(__stdcall* Storm_MemFree_t)(void* ptr, const char* name, int argList, DWORD flags);
 typedef void* (__fastcall* Storm_MemReAlloc_t)(int ecx, int edx, void* oldPtr, size_t newSize,
     const char* name, DWORD srcLine, DWORD flags);
+typedef int(__stdcall* Storm_MemGetSize_t)(void* ptr, const char* name, int argList);
 typedef void(__stdcall* StormHeap_CleanupAll_t)();
 typedef int(__fastcall* ResetMemoryManager_t)(void* thiz, int edx, int a2, void (*pump)(void));
 
@@ -99,6 +101,7 @@ typedef int(__fastcall* ResetMemoryManager_t)(void* thiz, int edx, int a2, void 
 extern Storm_MemAlloc_t       g_origStormAlloc;
 extern Storm_MemFree_t        g_origStormFree;
 extern Storm_MemReAlloc_t     g_origStormReAlloc;
+extern Storm_MemGetSize_t     g_origStormGetSize;
 extern StormHeap_CleanupAll_t g_origCleanupAll;
 extern ResetMemoryManager_t   g_origResetMemoryManager;
 

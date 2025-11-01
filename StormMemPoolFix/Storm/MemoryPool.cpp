@@ -23,10 +23,10 @@ namespace {
     struct ExtraPool {
         void* base;
         size_t size;
+        pool_t handle;
 
-        // 添加构造函数以支持初始化
-        ExtraPool() : base(nullptr), size(0) {}
-        ExtraPool(void* b, size_t s) : base(b), size(s) {}
+        ExtraPool() : base(nullptr), size(0), handle(nullptr) {}
+        ExtraPool(void* b, size_t s, pool_t h) : base(b), size(s), handle(h) {}
     };
     std::vector<ExtraPool> g_extraPools;
 
@@ -79,15 +79,15 @@ namespace {
             return false;
         }
 
-        pool_t pool = tlsf_add_pool(g_tlsfHandle, newPool, size);
-        if (!pool) {
+        pool_t poolHandle = tlsf_add_pool(g_tlsfHandle, newPool, size);
+        if (!poolHandle) {
             Logger::GetInstance().LogError("tlsf_add_pool失败");
             VirtualFree(newPool, 0, MEM_RELEASE);
             return false;
         }
 
         // 修复：使用构造函数创建ExtraPool对象
-        ExtraPool newExtraPool(newPool, size);
+        ExtraPool newExtraPool(newPool, size, poolHandle);
         g_extraPools.push_back(newExtraPool);
 
         g_totalSize.fetch_add(size, std::memory_order_relaxed);
@@ -212,13 +212,11 @@ namespace MemoryPool {
         // 清理稳定块
         FlushStabilizingBlocks();
 
-        // 销毁TLSF句柄
-        if (g_tlsfHandle) {
-            g_tlsfHandle = nullptr; // TLSF库会自动清理
-        }
-
         // 释放额外池
         for (const ExtraPool& pool : g_extraPools) {
+            if (pool.handle) {
+                tlsf_remove_pool(g_tlsfHandle, pool.handle);
+            }
             if (pool.base) {
                 VirtualFree(pool.base, 0, MEM_RELEASE);
             }
@@ -230,6 +228,9 @@ namespace MemoryPool {
             VirtualFree(g_mainPool, 0, MEM_RELEASE);
             g_mainPool = nullptr;
         }
+
+        // 销毁TLSF句柄
+        g_tlsfHandle = nullptr; // 控制块存在于主池，释放后句柄即无效
 
         // 重置统计
         g_totalSize.store(0, std::memory_order_relaxed);
@@ -623,11 +624,58 @@ namespace MemoryPool {
             writeLock.lock();
         }
 
-        // TODO: 实现具体的页面清理逻辑
-        // 这里可以调用VirtualFree释放完全空闲的页面
+        struct PoolUsageContext {
+            size_t usedBytes = 0;
+            size_t blockCount = 0;
+        };
+
+        auto usageWalker = [](void*, size_t size, int used, void* user) {
+            auto* ctx = static_cast<PoolUsageContext*>(user);
+            ctx->blockCount++;
+            if (used) {
+                ctx->usedBytes += size;
+            }
+        };
+
+        size_t reclaimedPools = 0;
+        size_t reclaimedBytes = 0;
+
+        for (auto it = g_extraPools.begin(); it != g_extraPools.end(); ) {
+            if (!it->handle) {
+                ++it;
+                continue;
+            }
+
+            PoolUsageContext ctx{};
+            tlsf_walk_pool(it->handle, usageWalker, &ctx);
+
+            if (ctx.usedBytes == 0) {
+                tlsf_remove_pool(g_tlsfHandle, it->handle);
+                VirtualFree(it->base, 0, MEM_RELEASE);
+
+                g_totalSize.fetch_sub(it->size, std::memory_order_relaxed);
+                reclaimedBytes += it->size;
+                ++reclaimedPools;
+
+                Logger::GetInstance().LogInfo(
+                    "已回收空闲扩展池: base=%p, size=%zu MB, blocks=%zu",
+                    it->base, it->size / (1024 * 1024), ctx.blockCount);
+
+                it = g_extraPools.erase(it);
+                continue;
+            }
+
+            ++it;
+        }
 
         g_trimCount.fetch_add(1, std::memory_order_relaxed);
-        Logger::GetInstance().LogInfo("空闲页面清理完成");
+        if (reclaimedPools == 0) {
+            Logger::GetInstance().LogInfo("未找到可回收的扩展池");
+        }
+        else {
+            Logger::GetInstance().LogInfo("空闲页面清理完成: 回收池=%zu, 释放=%zu MB",
+                reclaimedPools, reclaimedBytes / (1024 * 1024));
+        }
     }
 
     void CompactPool() {
