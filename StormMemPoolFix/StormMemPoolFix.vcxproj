@@ -155,7 +155,6 @@
     <ClInclude Include="Base\MemorySafety.h" />
     <ClInclude Include="Base\Logger.h" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="Game\GameHooks.h" />
     <ClInclude Include="Game\PathCapUnlock.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Storm\MemoryPool.h" />
@@ -167,7 +166,6 @@
     <ClCompile Include="Base\Logger.cpp" />
     <ClCompile Include="Base\MemroySafety.cpp" />
     <ClCompile Include="dllmain.cpp" />
-    <ClCompile Include="Game\GameHooks.cpp" />
     <ClCompile Include="Game\PathCapUnlock.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
