@@ -362,3 +362,7 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 /build
+
+# Local reverse-engineering artifacts and binary drops
+Document/*.dll
+Document/*.i64

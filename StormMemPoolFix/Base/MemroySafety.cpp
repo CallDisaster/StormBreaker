@@ -836,14 +836,14 @@ void MemoryMonitor::MonitorLoop() {
         // 使用批处理减少锁争用，同一时间只做一种操作
 
         // 1. 每30秒生成详细报告
-        if (currentTime - m_lastReportTime > 30000) {
-            GenerateDetailedReport();
-            m_lastReportTime = currentTime;
-            continue;
-        }
+        //if (currentTime - m_lastReportTime > 30000) {
+        //    GenerateDetailedReport();
+        //    m_lastReportTime = currentTime;
+        //    continue;
+        //}
 
-        // 2. 每60秒打印完整内存统计
-        if (currentTime - m_lastStatsTime > 60000) {
+        // 2. 每600秒打印完整内存统计
+        if (currentTime - m_lastStatsTime > 600000) {
             PrintMemoryStats();
             m_lastStatsTime = currentTime;
             continue;
@@ -860,7 +860,7 @@ void MemoryMonitor::MonitorLoop() {
         if (currentTime - m_lastLeakCheckTime > 60000) {
             auto leaks = safety.DetectLeaks(120000); // 检测存活超过2分钟的块
             if (!leaks.empty()) {
-                safety.ReportLeaks(leaks);
+                //safety.ReportLeaks(leaks);
             }
             m_lastLeakCheckTime = currentTime;
             continue;
@@ -879,12 +879,12 @@ void MemoryMonitor::GenerateDetailedReport() {
     // OS口径
     PrintProcessMemory();
 
-    // MemorySafety统计
-    auto safetyStats = MemorySafety::GetInstance().GetStats();
-    Logger::GetInstance().LogInfo("内存安全: 当前块=%zu, 当前大小=%zu MB, 峰值=%zu MB",
-        safetyStats.currentBlocks,
-        safetyStats.currentSize / (1024 * 1024),
-        safetyStats.peakSize / (1024 * 1024));
+    //// MemorySafety统计
+    //auto safetyStats = MemorySafety::GetInstance().GetStats();
+    //Logger::GetInstance().LogInfo("内存安全: 当前块=%zu, 当前大小=%zu MB, 峰值=%zu MB",
+    //    safetyStats.currentBlocks,
+    //    safetyStats.currentSize / (1024 * 1024),
+    //    safetyStats.peakSize / (1024 * 1024));
 
     // StormHook统计
     size_t managedBlocks = StormHook::GetManagedBlockCount();
