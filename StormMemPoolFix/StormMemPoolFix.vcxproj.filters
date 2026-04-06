@@ -60,6 +60,9 @@
     <ClInclude Include="Base\MemorySafety.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
+    <ClInclude Include="Game\GameHooks.h">
+      <Filter>头文件\Game</Filter>
+    </ClInclude>
     <ClInclude Include="Game\PathCapUnlock.h">
       <Filter>头文件\Game</Filter>
     </ClInclude>
@@ -90,6 +93,9 @@
       <Filter>源文件\Base</Filter>
     </ClCompile>
     <ClCompile Include="Game\PathCapUnlock.cpp">
+      <Filter>源文件\Game</Filter>
+    </ClCompile>
+    <ClCompile Include="Game\GameHooks.cpp">
       <Filter>源文件\Game</Filter>
     </ClCompile>
   </ItemGroup>
