@@ -695,7 +695,7 @@ void MemorySafety::ProcessDeferredFreeItem(const DeferredFreeItem& item) {
             item.ptr, info.rawPtr, item.size);
     }
     else {
-        Logger::GetInstance().LogError(
+        Logger::GetInstance().LogWarning(
             "延迟释放缺rawPtr，已跳过以避免TLSF损坏: user=%p, size=%zu",
             item.ptr, item.size);
         // 关键：绝不fallback到 free(userPtr)，这会破坏TLSF池
@@ -921,7 +921,7 @@ void MemoryMonitor::PrintMemoryStats() {
             stormStatsValid = true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            Logger::GetInstance().LogError("读取Storm总分配内存失败: 0x%08X", GetExceptionCode());
+            Logger::GetInstance().LogWarning("读取Storm总分配内存失败: 0x%08X", GetExceptionCode());
         }
     }
 
@@ -986,7 +986,7 @@ void MemoryMonitor::PrintStormInternalStats() {
         Logger::GetInstance().LogInfo("===================");
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::GetInstance().LogError("访问Storm内部统计时发生异常: 0x%08X", GetExceptionCode());
+        Logger::GetInstance().LogWarning("访问Storm内部统计时发生异常: 0x%08X", GetExceptionCode());
     }
 }
 
@@ -1036,6 +1036,6 @@ void MemoryMonitor::PrintProcessMemory() {
         Logger::GetInstance().LogInfo("========================");
     }
     else {
-        Logger::GetInstance().LogError("GetProcessMemoryInfo失败: %lu", GetLastError());
+        Logger::GetInstance().LogWarning("GetProcessMemoryInfo失败: %lu", GetLastError());
     }
 }
