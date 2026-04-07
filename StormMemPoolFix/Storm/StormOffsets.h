@@ -53,7 +53,10 @@ inline LPCRITICAL_SECTION Storm_g_HeapCriticalSectionPtr(uint8_t index)
 
     if (index >= MAX_CRITICAL_SECTIONS)
     {
-        printf("[ERROR] Invalid heap index after truncation: %u\n", index);
+        char message[128];
+        _snprintf_s(message, sizeof(message), _TRUNCATE,
+            "StormOffsets: invalid heap index after truncation: %u\n", index);
+        OutputDebugStringA(message);
         return nullptr;
     }
 

@@ -1,9 +1,9 @@
 // ======================== StormHook.cpp 完整修复版本 ========================
+#include "pch.h"
 #include "StormHook.h"
 #include "Base/Logger.h"
 #include "Base/MemorySafety.h"
 #include "MemoryPool.h"
-#include "pch.h"
 #include <algorithm>
 #include <cstdint>
 #include <detours.h>
@@ -42,9 +42,6 @@ std::atomic<size_t> g_largeBlockThreshold{
 
 // 线程局部状态（避免递归）
 thread_local bool tls_inHook = false;
-
-// 真实StormHeap探测
-std::atomic<void *> g_defaultStormHeap{nullptr};
 
 // 关闭状态
 std::atomic<bool> g_shutdownMode{false};
@@ -223,9 +220,6 @@ bool Initialize() {
     return false;
   }
 
-  // === 新增：主动探测默认StormHeap* ===
-  StormHook_Internal::ProbeDefaultStormHeapPointer();
-
   Logger::GetInstance().LogInfo("大块拦截阈值: %zu KiB",
                                 GetLargeBlockThreshold() / 1024);
 
@@ -307,7 +301,8 @@ void *AllocateMemory(size_t size, const char *name, DWORD srcLine) {
   // 从 TLSF 分配 16 字节对齐的内存
   void *poolBlock = MemoryPool::AllocateAligned(totalNeeded, 16);
   if (!poolBlock) {
-    Logger::GetInstance().LogError("TLSF分配失败: size=%zu", totalNeeded);
+    Logger::GetInstance().LogWarning(
+        "StormHook: TLSF 分配失败 size=%zu，回退 Storm", totalNeeded);
     tls_inHook = false;
     return nullptr;
   }
@@ -400,7 +395,8 @@ void *ReallocMemory(void *oldPtr, size_t newSize, const char *name,
 
   void *newPtr = AllocateMemory(newSize, name, srcLine);
   if (!newPtr) {
-    Logger::GetInstance().LogError("重分配新块失败: size=%zu", newSize);
+    Logger::GetInstance().LogWarning(
+        "StormHook: TLSF 重分配失败 size=%zu，回退 Storm", newSize);
     tls_inHook = false;
     return nullptr;
   }
@@ -475,7 +471,17 @@ bool IsPointerAligned(void *ptr, size_t alignment) {
   return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
 }
 
-// (ValidateBlockAlignment 方法已因为无锁头而淘汰)
+bool ValidateBlockAlignment(void *userPtr) {
+  if (!userPtr) {
+    return false;
+  }
+
+  if (!IsOurBlock(userPtr)) {
+    return false;
+  }
+
+  return IsPointerAligned(userPtr, 16);
+}
 } // namespace StormHook
 
 // ======================== Hook函数实现 ========================
@@ -496,9 +502,6 @@ void *__fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
   // 回退到原始Storm分配
   void *result =
       SEH_Helpers::CallOrigStormAlloc_SEH(ecx, edx, size, name, srcLine, flags);
-
-  // === 新增：顺手被动抓一次StormHeap ===
-  StormHook_Internal::TryCaptureDefaultHeapFromAllocResult(result);
 
   // 检查是否有异常发生
   DWORD exceptCode = SEH_Helpers::GetLastExceptionCode();

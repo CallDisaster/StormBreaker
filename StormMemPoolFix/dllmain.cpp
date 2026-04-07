@@ -5,8 +5,8 @@
 // Date: 2025-03-02
 // Description: 延缓 Warcraft III 旧版本 Storm.dll 的虚拟内存增长过快的问题
 
-#include "Storm/MemoryPool.h"
 #include "pch.h"
+#include "Storm/MemoryPool.h"
 #include <Base/Logger.h>
 #include <Base/MemorySafety.h>
 #include <Game/PathCapUnlock.h>
@@ -20,6 +20,25 @@
 #include <mimalloc.h>
 #include <windows.h>
 
+
+namespace {
+bool ReadEnvFlag(const char *name) {
+  char buffer[8] = {};
+  DWORD size = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
+  if (size == 0 || size >= sizeof(buffer)) {
+    return false;
+  }
+
+  return _stricmp(buffer, "1") == 0 || _stricmp(buffer, "true") == 0 ||
+         _stricmp(buffer, "yes") == 0 || _stricmp(buffer, "on") == 0;
+}
+
+bool ShouldEnableVerboseLogs() { return ReadEnvFlag("STORMBREAKER_VERBOSE_LOG"); }
+
+bool ShouldCreateDebugConsole() {
+  return ReadEnvFlag("STORMBREAKER_DEBUG_CONSOLE");
+}
+} // namespace
 
 void CreateConsole() {
   // 检查是否已经有控制台
@@ -42,7 +61,7 @@ void CreateConsole() {
   SetConsoleCP(CP_UTF8);
 
   // 设置控制台标题
-  SetConsoleTitleA("StormBreaker - Memory Pool Monitor");
+  SetConsoleTitleA("StormBreaker Debug Console");
 
   // 设置控制台窗口大小
   HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -54,13 +73,8 @@ void CreateConsole() {
     SetConsoleWindowInfo(hConsole, TRUE, &windowSize);
   }
 
-  // 输出欢迎信息
-  printf("=== StormBreaker Memory Pool Monitor ===\n");
-  printf("版本: v1.0 Build %s %s\n", __DATE__, __TIME__);
-  printf("作者: CallDisaster\n");
-  printf("控制台已启动，可以实时查看内存池状态\n");
-  printf("日志文件保存在: .\\StormBreaker\\StormMemory.log\n");
-  printf("=====================================\n\n");
+  printf("StormBreaker debug console enabled.\n");
+  printf("Log file: .\\StormBreaker\\StormMemory.log\n\n");
 }
 
 namespace {
@@ -87,10 +101,10 @@ static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
     return 2;
   }
 
-  if (!InstallPathCapUnlock(2.0f)) {
-    Logger::GetInstance().LogWarning(
-        "寻路容量写入未成功（可能是版本偏移变化），继续运行不影响其他功能");
-  }
+  // if (!InstallPathCapUnlock(2.0f)) {
+  //   Logger::GetInstance().LogWarning(
+  //       "寻路容量写入未成功（可能是版本偏移变化），继续运行不影响其他功能");
+  // }
 
   // 第三步：启动内存监控
   if (!StartMemoryMonitoring()) {
@@ -100,14 +114,6 @@ static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
   g_systemInitialized.store(true, std::memory_order_release);
   Logger::GetInstance().LogInfo("StormBreaker系统异步初始化完成");
 
-  // 在控制台输出系统状态
-  printf("\n=== 初始化完成 ===\n");
-  printf("✓ 内存池已启动\n");
-  printf("✓ Storm Hook已安装\n");
-  printf("✓ 内存监控已启动\n");
-  printf("✓ 日志级别: Info (减少输出)\n");
-  printf("================\n\n");
-
   return 0;
 }
 
@@ -115,32 +121,37 @@ static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
 
 bool InitializeStormBreaker() {
   // 检查 DXVK 版是否已经启动了 StormBreaker 机制
-  if (OpenEventA(EVENT_ALL_ACCESS, FALSE, "DXVK_War3_StormBreaker_Active") !=
-      nullptr) {
-    // 创建控制台用于通告
-    CreateConsole();
-    printf(
-        "\n[系统通知] 检测到新架构 DXVK 内部集成版 StormBreaker 已在运行。\n");
-    printf("[系统通知] 外置兼容器版本将主动停止初始化以避免冲突。\n\n");
+  HANDLE dxvkActiveEvent =
+      OpenEventA(EVENT_ALL_ACCESS, FALSE, "DXVK_War3_StormBreaker_Active");
+  if (dxvkActiveEvent != nullptr) {
+    CloseHandle(dxvkActiveEvent);
+    OutputDebugStringA(
+        "StormBreaker: DXVK integrated StormBreaker is already active; "
+        "standalone hook will stay disabled.\n");
     Logger::GetInstance().LogInfo(
         "检测到 DXVK 版 StormBreaker 正在运行，主动放弃挂钩。");
     // 挂起自身启动，通过返回 false 优雅退出初始化线程
     return false;
   }
 
-  // 创建控制台窗口用于实时查看日志
-  CreateConsole();
-
-  Logger::GetInstance().LogInfo("初始化StormBreaker基础系统...");
-
   // 初始化日志系统（如果尚未初始化）
   if (!Logger::GetInstance().IsInitialized()) {
-    LoggerConfig config = Logger::GetDebugConfig();
-    config.enableConsole = true; // 启用控制台输出
+    const bool enableConsole = ShouldCreateDebugConsole();
+    const bool verbose = ShouldEnableVerboseLogs() || enableConsole;
+    if (enableConsole) {
+      CreateConsole();
+    }
+
+    LoggerConfig config =
+        verbose ? Logger::GetDebugConfig() : Logger::GetDefaultConfig();
+    config.enableConsole = enableConsole;
+    config.flushImmediate = verbose;
     if (!Logger::GetInstance().Initialize(config)) {
       return false;
     }
   }
+
+  Logger::GetInstance().LogInfo("初始化StormBreaker基础系统...");
 
   bool stormOk = InitializeStormOffsets();
   Logger::GetInstance().LogInfo("Storm偏移初始化: %s",
@@ -189,16 +200,11 @@ void ShutdownStormBreaker() {
 
   Logger::GetInstance().LogInfo("StormBreaker系统已关闭");
 
-  // 输出关闭信息到控制台
-  printf("\n=== StormBreaker 正在关闭 ===\n");
-  printf("感谢使用 StormBreaker 内存优化器!\n");
-  printf("按任意键关闭控制台...\n");
-
   Logger::GetInstance().Shutdown();
 
-  // 等待用户按键后关闭控制台（可选）
-  // getchar(); // 取消注释这行可以等待用户按键
-  FreeConsole();
+  if (GetConsoleWindow() != nullptr) {
+    FreeConsole();
+  }
 }
 
 // ======================== Hook安装和卸载函数 ========================
@@ -362,10 +368,10 @@ bool StartMemoryMonitoring() {
     Logger::GetInstance().LogInfo("内存监控启动成功");
     return true;
   } catch (const std::exception &e) {
-    Logger::GetInstance().LogError("内存监控启动失败: %s", e.what());
+    Logger::GetInstance().LogWarning("内存监控启动失败: %s", e.what());
     return false;
   } catch (...) {
-    Logger::GetInstance().LogError("内存监控启动失败: 未知异常");
+    Logger::GetInstance().LogWarning("内存监控启动失败: 未知异常");
     return false;
   }
 }

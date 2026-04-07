@@ -75,7 +75,7 @@ bool InstallPathCapUnlock(float newValue) {
 
     HMODULE hGame = GetGameModule();
     if (!hGame) {
-        Logger::GetInstance().LogError("[PathCap] 未找到 game.dll 模块");
+        Logger::GetInstance().LogWarning("[PathCap] 未找到 game.dll 模块");
         return false;
     }
 
@@ -85,11 +85,11 @@ bool InstallPathCapUnlock(float newValue) {
     // 基础“能读”检查
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<LPCVOID>(table), &mbi, sizeof(mbi))) {
-        Logger::GetInstance().LogError("[PathCap] VirtualQuery 失败");
+        Logger::GetInstance().LogWarning("[PathCap] VirtualQuery 失败");
         return false;
     }
     if (!(mbi.State == MEM_COMMIT)) {
-        Logger::GetInstance().LogError("[PathCap] 目标页不是 MEM_COMMIT");
+        Logger::GetInstance().LogWarning("[PathCap] 目标页不是 MEM_COMMIT");
         return false;
     }
 

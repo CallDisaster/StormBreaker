@@ -73,6 +73,7 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <OutDir>$(ProjectDir)Build\</OutDir>
+    <TargetExt>.asi</TargetExt>
     <ExternalIncludePath>$(ProjectDir)Dependencies\Detours\include;$(ProjectDir)Dependencies\mimalloc-dev\include;$(ProjectDir)Dependencies\spdlog\include;$(ProjectDir)Dependencies\tlsf;$(ExternalIncludePath)</ExternalIncludePath>
     <IncludePath>$(ProjectDir);$(IncludePath)</IncludePath>
     <LibraryPath>E:\Mycode\C++\StormMemPoolFix\StormMemPoolFix\StormMemPoolFix\Dependencies\mimalloc-dev\build\Release;$(ProjectDir)\Dependencies\Detours\lib.X86;$(LibraryPath)</LibraryPath>

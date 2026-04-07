@@ -26,7 +26,7 @@ Logger& Logger::GetInstance() {
 LoggerConfig Logger::GetDefaultConfig() {
     LoggerConfig config;
     config.minLevel = LogLevel::Warning;  // 默认只显示Warning及以上级别
-    config.enableConsole = true;
+    config.enableConsole = false;
     config.enableDebugOutput = true;
     config.enableFile = true;
     config.enableRotation = true;
@@ -43,6 +43,7 @@ LoggerConfig Logger::GetDefaultConfig() {
 LoggerConfig Logger::GetDebugConfig() {
     LoggerConfig config = GetDefaultConfig();
     config.minLevel = LogLevel::Info;  // Debug配置显示Info及以上级别
+    config.enableConsole = true;
     config.flushImmediate = true;
     return config;
 }
@@ -578,8 +579,6 @@ void Logger::CloseLogFile() {
 }
 
 void Logger::PerformRotation() {
-    char backupPath[MAX_PATH];
-
     // 移动现有备份文件
     for (int i = static_cast<int>(m_config.maxBackupFiles) - 1; i > 0; i--) {
         char oldPath[MAX_PATH], newPath[MAX_PATH];
