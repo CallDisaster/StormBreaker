@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(StormBreaker LANGUAGES C CXX)
+project(StormBreaker VERSION 1.3.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   message(FATAL_ERROR "StormBreaker supports only Win32/x86 Warcraft III")
@@ -20,6 +20,7 @@ set(STORMBREAKER_LIBRARY_SOURCES
   Storm/TlsfBackend.cpp
   Storm/tlsf.c
   Dependencies/mimalloc-dev/src/static.c
+  StormBreaker.rc
   dllmain.cpp
 )
 
@@ -38,6 +39,7 @@ function(add_stormbreaker_library target_name output_name default_backend lock_b
     MI_STATIC_LIB
     STORMBREAKER_PINNED_RUNTIME=1
     STORMBREAKER_LARGE_ONLY=1
+    STORMBREAKER_DEFAULT_NATIVE_SMALL_REPAIR=1
     STORMBREAKER_DEFAULT_BACKEND=${default_backend}
     STORMBREAKER_LOCK_MEMORY_BACKEND=${lock_backend}
   )
@@ -146,6 +148,7 @@ if(STORMBREAKER_BUILD_TESTS)
     STORMBREAKER_TESTING
     STORMBREAKER_PINNED_RUNTIME=0
     STORMBREAKER_LARGE_ONLY=0
+    STORMBREAKER_DEFAULT_NATIVE_SMALL_REPAIR=0
     STORMBREAKER_DEFAULT_BACKEND=0
     STORMBREAKER_LOCK_MEMORY_BACKEND=0
   )

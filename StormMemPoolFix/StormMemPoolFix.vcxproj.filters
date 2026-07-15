@@ -90,6 +90,9 @@
     <ClInclude Include="Game\PathCapUnlock.h">
       <Filter>头文件\Game</Filter>
     </ClInclude>
+    <ClInclude Include="StormBreakerVersion.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -140,5 +143,10 @@
     <ClCompile Include="Game\PathCapUnlock.cpp">
       <Filter>源文件\Game</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="StormBreaker.rc">
+      <Filter>资源文件</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>
