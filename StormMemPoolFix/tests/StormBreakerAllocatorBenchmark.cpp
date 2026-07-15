@@ -1,8 +1,10 @@
 #include "pch.h"
 
 #include "Base/LeakProfiler.h"
+#include "Base/MemorySafety.h"
 #include "Storm/MemoryPool.h"
 #include "Storm/StormApi.h"
+#include "Storm/StormHook.h"
 #include "Storm/StormTakeover.h"
 #include "SegregatedArenaBenchmarkAllocator.h"
 #include "rpmalloc.h"
@@ -36,6 +38,7 @@ struct Options {
   std::string profile = "quick";
   std::string callerMode = "static";
   std::string apiMode = "caller";
+  std::string takeoverMode = "full";
   bool fastFree = true;
   bool registryAccounting = true;
   bool registryMembershipFilter = true;
@@ -53,6 +56,7 @@ struct Options {
   bool tlsfMainPoolDecommit = false;
   bool tlsfTopDown = false;
   bool tlsfConstantTimeEmptyCheck = true;
+  uint32_t tlsfWarmEmptyPools = 0;
   bool trimAfterDrain = false;
   uint32_t callerCacheWays = 8;
   uint32_t callerThreadCacheCapacity = 256;
@@ -368,28 +372,59 @@ uint32_t EditorSize(Pcg32& random) noexcept {
   return 1024u * 1024u + random.Bounded(3u * 1024u * 1024u);
 }
 
+struct alignas(8) MockNativeHeader {
+  uint32_t requestedSize;
+  uint32_t cookie;
+  uint32_t stormFlags;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(MockNativeHeader) == 16);
+constexpr uint32_t kMockNativeCookie = 0x53424E41u;
+
+MockNativeHeader* MockNativeHeaderFromUser(const void* pointer) noexcept {
+  return pointer ? const_cast<MockNativeHeader*>(
+                       static_cast<const MockNativeHeader*>(pointer) - 1)
+                 : nullptr;
+}
+
 void* __fastcall MockAlloc(int, int, uint32_t size, const char*, int32_t,
-                           uint32_t flags) {
-  return HeapAlloc(GetProcessHeap(),
-                   (flags & StormApi::kFlagZeroMemory) != 0
-                       ? HEAP_ZERO_MEMORY
-                       : 0,
-                   size == 0 ? 1u : size);
+                            uint32_t flags) {
+  const size_t physicalSize = size == 0 ? 1u : size;
+  auto* header = static_cast<MockNativeHeader*>(HeapAlloc(
+      GetProcessHeap(),
+      (flags & StormApi::kFlagZeroMemory) != 0 ? HEAP_ZERO_MEMORY : 0,
+      sizeof(MockNativeHeader) + physicalSize));
+  if (!header) {
+    return nullptr;
+  }
+  header->requestedSize = size;
+  header->cookie = kMockNativeCookie;
+  // QueryNativeLarge checks user[-5] bit 3. Keep it clear for the native
+  // small-block path represented by this mock.
+  header->stormFlags = 0;
+  header->reserved = 0;
+  return header + 1;
 }
 
 int __stdcall MockFree(void* pointer, const char*, int32_t, uint32_t) {
-  return !pointer || HeapFree(GetProcessHeap(), 0, pointer) ? 1 : 0;
+  if (!pointer) {
+    return 1;
+  }
+  MockNativeHeader* header = MockNativeHeaderFromUser(pointer);
+  return header->cookie == kMockNativeCookie &&
+                 HeapFree(GetProcessHeap(), 0, header)
+             ? 1
+             : 0;
 }
 
 int __stdcall MockGetSize(const void* pointer, const char*, int32_t) {
-  if (!pointer) {
+  const MockNativeHeader* header = MockNativeHeaderFromUser(pointer);
+  if (!header || header->cookie != kMockNativeCookie ||
+      header->requestedSize > INT_MAX) {
     return -1;
   }
-  const SIZE_T size = HeapSize(
-      GetProcessHeap(), 0, const_cast<void*>(pointer));
-  return size == static_cast<SIZE_T>(-1) || size > INT_MAX
-             ? -1
-             : static_cast<int>(size);
+  return static_cast<int>(header->requestedSize);
 }
 
 void* __fastcall MockReAlloc(int, int, void* pointer, uint32_t newSize,
@@ -398,14 +433,25 @@ void* __fastcall MockReAlloc(int, int, void* pointer, uint32_t newSize,
     return MockAlloc(0, 0, newSize, nullptr, 0, flags);
   }
   if (newSize == 0) {
-    HeapFree(GetProcessHeap(), 0, pointer);
+    MockFree(pointer, nullptr, 0, flags);
     return nullptr;
   }
-  return HeapReAlloc(GetProcessHeap(),
-                     (flags & StormApi::kFlagZeroMemory) != 0
-                         ? HEAP_ZERO_MEMORY
-                         : 0,
-                     pointer, newSize);
+  MockNativeHeader* oldHeader = MockNativeHeaderFromUser(pointer);
+  if (!oldHeader || oldHeader->cookie != kMockNativeCookie) {
+    return nullptr;
+  }
+  auto* newHeader = static_cast<MockNativeHeader*>(HeapReAlloc(
+      GetProcessHeap(),
+      (flags & StormApi::kFlagZeroMemory) != 0 ? HEAP_ZERO_MEMORY : 0,
+      oldHeader, sizeof(MockNativeHeader) + newSize));
+  if (!newHeader) {
+    return nullptr;
+  }
+  newHeader->requestedSize = newSize;
+  newHeader->cookie = kMockNativeCookie;
+  newHeader->stormFlags = 0;
+  newHeader->reserved = 0;
+  return newHeader + 1;
 }
 
 uint32_t __stdcall MockGetHeapByCaller(const char* sourceFile,
@@ -429,6 +475,112 @@ StormApi::ResolvedApi MakeMockApi() noexcept {
   api.heapDestroy = &MockHeapDestroy;
   return api;
 }
+
+class NativeStormEngine final {
+public:
+  bool Initialize(const Options&) noexcept { return true; }
+  bool Shutdown(RunResult&) noexcept { return true; }
+
+  void* Allocate(uint32_t size, const char* caller, int32_t line,
+                 uint32_t flags) const noexcept {
+    return MockAlloc(0, 0, size, caller, line, flags);
+  }
+
+  bool Free(void* pointer, const char* caller, int32_t line,
+            uint32_t flags) const noexcept {
+    return MockFree(pointer, caller, line, flags) != 0;
+  }
+
+  void* Reallocate(void* pointer, uint32_t newSize, const char* caller,
+                   int32_t line, uint32_t flags) const noexcept {
+    return MockReAlloc(0, 0, pointer, newSize, caller, line, flags);
+  }
+};
+
+class LegacyLargeEngine final {
+public:
+  bool Initialize(const Options& options) noexcept {
+    if (!SetEnvironmentVariableA("STORMBREAKER_MEMORY_BACKEND",
+                                 options.backend.c_str()) ||
+        !SetEnvironmentVariableA("STORMBREAKER_PROFILER", "off") ||
+        !ConfigureMimallocOptions(options)) {
+      return false;
+    }
+    MemoryPool::SetLatencyTrackingEnabled(false);
+    MemoryPool::Internal::SetTlsfRangeIndexEnabledForTesting(
+        options.tlsfRangeIndex);
+    MemoryPool::Config poolConfig = MemoryPool::GetConfig();
+    poolConfig.initialSize =
+        static_cast<size_t>(options.poolInitialMiB) * 1024u * 1024u;
+    poolConfig.enableStats = options.poolDetailedStats;
+    if (!MemoryPool::SetConfig(poolConfig)) {
+      return false;
+    }
+
+    MemorySafetyConfig safety = MemorySafety::GetDefaultConfig();
+    safety.enableTracking = false;
+    safety.enableValidation = false;
+    safety.enableDeferredFree = false;
+    safety.enableLeakDetection = false;
+    safety.enableCorruptionDetection = false;
+    if (!MemorySafety::GetInstance().Initialize(safety)) {
+      return false;
+    }
+    StormHook::SetRuntimeStatsEnabled(false);
+    StormHook::Testing::SetMinimalLargeHookPathEnabled(true);
+    if (!StormHook::Initialize()) {
+      StormHook::Testing::SetMinimalLargeHookPathEnabled(false);
+      MemorySafety::GetInstance().Shutdown();
+      return false;
+    }
+
+    g_origStormAlloc = reinterpret_cast<Storm_MemAlloc_t>(&MockAlloc);
+    g_origStormFree = reinterpret_cast<Storm_MemFree_t>(&MockFree);
+    g_origStormGetSize = reinterpret_cast<Storm_MemGetSize_t>(&MockGetSize);
+    g_origStormReAlloc = reinterpret_cast<Storm_MemReAlloc_t>(&MockReAlloc);
+    initialized_ = true;
+    return true;
+  }
+
+  bool Shutdown(RunResult& result) noexcept {
+    if (!initialized_) {
+      return false;
+    }
+    result.pool = MemoryPool::GetExtendedStats();
+    const bool drained = StormHook::GetManagedBlockCount() == 0 &&
+                         result.pool.requestedLiveBytes == 0 &&
+                         result.pool.usableLiveBytes == 0;
+    g_origStormAlloc = nullptr;
+    g_origStormFree = nullptr;
+    g_origStormGetSize = nullptr;
+    g_origStormReAlloc = nullptr;
+    StormHook::Testing::SetMinimalLargeHookPathEnabled(false);
+    StormHook::Shutdown();
+    MemorySafety::GetInstance().Shutdown();
+    MemoryPool::Shutdown();
+    initialized_ = false;
+    return drained && !MemoryPool::IsInitialized();
+  }
+
+  void* Allocate(uint32_t size, const char* caller, int32_t line,
+                 uint32_t flags) const noexcept {
+    return Hooked_Storm_MemAlloc(0, 0, size, caller, line, flags);
+  }
+
+  bool Free(void* pointer, const char* caller, int32_t line,
+            uint32_t flags) const noexcept {
+    return Hooked_Storm_MemFree(pointer, caller, line, flags) != 0;
+  }
+
+  void* Reallocate(void* pointer, uint32_t newSize, const char* caller,
+                   int32_t line, uint32_t flags) const noexcept {
+    return Hooked_Storm_MemReAlloc(
+        0, 0, pointer, newSize, caller, line, flags);
+  }
+
+private:
+  bool initialized_ = false;
+};
 
 class WinHeapEngine final {
 public:
@@ -802,7 +954,8 @@ public:
   bool Initialize(const Options& options) noexcept {
     if (!SetEnvironmentVariableA("STORMBREAKER_MEMORY_BACKEND",
                                  options.backend.c_str()) ||
-        !SetEnvironmentVariableA("STORMBREAKER_TAKEOVER_MODE", "full") ||
+        !SetEnvironmentVariableA("STORMBREAKER_TAKEOVER_MODE",
+                                 options.takeoverMode.c_str()) ||
         !ConfigureMimallocOptions(options)) {
       return false;
     }
@@ -1097,7 +1250,8 @@ public:
   bool Initialize(const Options& options) noexcept {
     if (!SetEnvironmentVariableA("STORMBREAKER_MEMORY_BACKEND",
                                  options.backend.c_str()) ||
-        !SetEnvironmentVariableA("STORMBREAKER_TAKEOVER_MODE", "full") ||
+        !SetEnvironmentVariableA("STORMBREAKER_TAKEOVER_MODE",
+                                 options.takeoverMode.c_str()) ||
         !SetEnvironmentVariableA("STORMBREAKER_PROFILER", "off") ||
         !SetEnvironmentVariableA("STORMBREAKER_TELEMETRY", "0") ||
         !ConfigureMimallocOptions(options)) {
@@ -2277,6 +2431,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->callerMode = value;
     } else if (argument == "--api-mode") {
       options->apiMode = value;
+    } else if (argument == "--takeover-mode") {
+      options->takeoverMode = value;
     } else if (argument == "--fast-free") {
       if (std::strcmp(value, "on") == 0) {
         options->fastFree = true;
@@ -2411,6 +2567,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       } else {
         return false;
       }
+    } else if (argument == "--tlsf-warm-empty-pools") {
+      uint64_t parsed = 0;
+      if (!ParseUnsigned64(value, &parsed) || parsed > 8u) {
+        return false;
+      }
+      options->tlsfWarmEmptyPools = static_cast<uint32_t>(parsed);
     } else if (argument == "--trim-after-drain") {
       if (std::strcmp(value, "on") == 0) {
         options->trimAfterDrain = true;
@@ -2585,6 +2747,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     }
   }
   const bool engineValid =
+      options->engine == "native-storm" ||
+      options->engine == "legacy-large" ||
       options->engine == "winheap" ||
       options->engine == "private-heap" ||
       options->engine == "rpmalloc" ||
@@ -2603,6 +2767,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
                            options->callerMode == "dynamic";
   const bool apiModeValid = options->apiMode == "caller" ||
                             options->apiMode == "heap";
+  const bool takeoverModeValid = options->takeoverMode == "large" ||
+                                 options->takeoverMode == "full";
   const bool scenarioValid = options->scenario == "map-load" ||
                              options->scenario == "caller-locality" ||
                              options->scenario == "small-churn" ||
@@ -2627,7 +2793,7 @@ bool ParseOptions(int argc, char** argv, Options* options) {
                          options->engine == "takeover") &&
          (!tlsfOnlyScenario || options->backend == "tlsf") &&
          backendValid && profileValid && callerValid &&
-         apiModeValid && scenarioValid;
+         apiModeValid && takeoverModeValid && scenarioValid;
 }
 
 void PrintMemory(const char* name, const ProcessMemory& memory) {
@@ -2655,7 +2821,8 @@ void PrintResult(const Options& options, const RunResult& result) {
       "\"schema\":1,\"valid\":%s,\"engine\":\"%s\","
       "\"backend\":\"%s\",\"scenario\":\"%s\"," 
       "\"profile\":\"%s\",\"caller_mode\":\"%s\"," 
-      "\"api_mode\":\"%s\",\"fast_free\":%s," 
+      "\"api_mode\":\"%s\",\"takeover_mode\":\"%s\","
+      "\"fast_free\":%s,"
       "\"registry_accounting\":%s,\"registry_membership_filter\":%s,"
       "\"registry_predicted_slot\":%s,"
       "\"registry_hazard_pinning\":%s,"
@@ -2668,6 +2835,7 @@ void PrintResult(const Options& options, const RunResult& result) {
       "\"pool_detailed_stats\":%s,"
       "\"tlsf_main_pool_decommit\":%s,\"tlsf_top_down\":%s,"
       "\"tlsf_constant_time_empty_check\":%s,"
+      "\"tlsf_warm_empty_pools\":%u,"
       "\"trim_after_drain\":%s,"
       "\"caller_cache_ways\":%u,\"caller_thread_cache\":%u,"
       "\"heap_id_slot_hint\":%u,"
@@ -2688,7 +2856,9 @@ void PrintResult(const Options& options, const RunResult& result) {
       "\"rpmalloc_span_map_count\":%u,"
       "\"seed\":%llu,",
       result.valid ? "true" : "false", options.engine.c_str(),
-      options.engine == "winheap" || options.engine == "private-heap" ||
+      options.engine == "native-storm" ||
+              options.engine == "winheap" ||
+              options.engine == "private-heap" ||
               options.engine == "rpmalloc" ||
               options.engine == "rpmalloc-threaded" ||
               options.engine == "segregated-arena" ||
@@ -2698,6 +2868,7 @@ void PrintResult(const Options& options, const RunResult& result) {
       options.scenario.c_str(), options.profile.c_str(),
       options.callerMode.c_str(),
       options.apiMode.c_str(),
+      options.takeoverMode.c_str(),
       options.fastFree ? "true" : "false",
       options.registryAccounting ? "true" : "false",
       options.registryMembershipFilter ? "true" : "false",
@@ -2715,6 +2886,7 @@ void PrintResult(const Options& options, const RunResult& result) {
       options.tlsfMainPoolDecommit ? "true" : "false",
       options.tlsfTopDown ? "true" : "false",
       options.tlsfConstantTimeEmptyCheck ? "true" : "false",
+      options.tlsfWarmEmptyPools,
       options.trimAfterDrain ? "true" : "false",
       options.callerCacheWays,
       options.callerThreadCacheCapacity,
@@ -2844,10 +3016,13 @@ int main(int argc, char** argv) {
     std::fprintf(
         stderr,
         "usage: StormBreakerAllocatorBenchmark --engine "
-        "winheap|private-heap|rpmalloc|rpmalloc-threaded|segregated-arena|"
+        "native-storm|legacy-large|winheap|private-heap|rpmalloc|"
+        "rpmalloc-threaded|"
+        "segregated-arena|"
         "segregated-hybrid|"
         "pool|takeover "
-        "--backend tlsf|mimalloc|hybrid|tlsf-sharded --scenario "
+        "--backend tlsf|mimalloc|hybrid|tlsf-sharded --takeover-mode "
+        "large|full --scenario "
         "map-load|caller-locality|"
         "small-churn|realloc|editor-burst|cross-thread|trim-cycle|"
         "trim-fragmented|"
@@ -2868,6 +3043,7 @@ int main(int argc, char** argv) {
         "--pool-detailed-stats on|off "
         "--tlsf-main-pool-decommit on|off --tlsf-top-down on|off "
         "--tlsf-constant-time-empty-check on|off "
+        "--tlsf-warm-empty-pools 0..8 "
         "--trim-after-drain on|off "
         "--direct-caller-hash on|off "
         "--caller-cache-ways 4|8 --caller-thread-cache 0|64|256|1024 "
@@ -2901,6 +3077,8 @@ int main(int argc, char** argv) {
       options.tlsfTopDown);
   MemoryPool::Internal::SetTlsfConstantTimeEmptyCheckEnabledForTesting(
       options.tlsfConstantTimeEmptyCheck);
+  MemoryPool::Internal::SetTlsfWarmEmptyPoolLimitForTesting(
+      options.tlsfWarmEmptyPools);
   StormHeapRegistry::Testing::SetMembershipFilterEnabled(
       options.registryMembershipFilter);
   StormHeapRegistry::Testing::SetPredictedMainSlotEnabled(
@@ -2912,7 +3090,13 @@ int main(int argc, char** argv) {
                            ? dynamicCaller.c_str()
                            : kStaticCallerName;
   RunResult result{};
-  if (options.engine == "winheap") {
+  if (options.engine == "native-storm") {
+    NativeStormEngine engine;
+    result = Execute(engine, options, caller);
+  } else if (options.engine == "legacy-large") {
+    LegacyLargeEngine engine;
+    result = Execute(engine, options, caller);
+  } else if (options.engine == "winheap") {
     WinHeapEngine engine;
     result = Execute(engine, options, caller);
   } else if (options.engine == "private-heap") {

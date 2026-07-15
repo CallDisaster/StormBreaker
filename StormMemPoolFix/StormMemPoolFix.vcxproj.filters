@@ -113,12 +113,6 @@
     <ClCompile Include="Storm\StormHook.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
-    <ClCompile Include="Storm\StormHeapRegistry.cpp">
-      <Filter>源文件\Storm</Filter>
-    </ClCompile>
-    <ClCompile Include="Storm\StormTakeover.cpp">
-      <Filter>源文件\Storm</Filter>
-    </ClCompile>
     <ClCompile Include="Storm\StormVersionProfile.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>

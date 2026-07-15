@@ -82,6 +82,11 @@ public:
     }
 
     virtual bool IsFromBackend(void* ptr) const = 0;
+    // A lock-free, conservative range filter for hot-path negative lookups.
+    // False must be definitive; true may still require QueryAllocation.
+    virtual bool MayContainAddress(const void* ptr) const {
+        return IsFromBackend(const_cast<void*>(ptr));
+    }
     virtual bool QueryAllocation(void* ptr, size_t* usableSize) const = 0;
     virtual size_t GetBlockSize(void* ptr) const = 0;
     // Visits exact live allocation starts under a backend snapshot gate. The

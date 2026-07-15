@@ -1006,6 +1006,7 @@ bool TestTlsfMainPoolDecommit() {
 }
 
 bool TestTlsfShardedBackend() {
+  MemoryPool::Internal::SetTlsfWarmEmptyPoolLimitForTesting(1);
   CHECK(SetEnvironmentVariableA("STORMBREAKER_MEMORY_BACKEND",
                                 "tlsf-sharded"));
 
@@ -1230,6 +1231,7 @@ bool TestTlsfShardedBackend() {
   CHECK(MemoryPool::Internal::GetPoolCount() == 4);
   CHECK(MemoryPool::GetExtendedStats().reservedBytes ==
         4u * 1024u * 1024u);
+  CHECK(MemoryPool::GetExtendedStats().trimCount >= 1);
 
   CHECK(MemoryPool::ExtendPool(256u * 1024u));
   CHECK(MemoryPool::Internal::GetPoolCount() >= 8);
@@ -1303,6 +1305,7 @@ bool TestTlsfShardedBackend() {
   MemoryPool::Internal::SetTlsfShardAffinityForTesting(SIZE_MAX);
   MemoryPool::Shutdown();
   CHECK(!MemoryPool::IsInitialized());
+  MemoryPool::Internal::SetTlsfWarmEmptyPoolLimitForTesting(0);
   return true;
 }
 

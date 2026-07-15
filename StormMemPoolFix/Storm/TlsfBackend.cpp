@@ -33,6 +33,7 @@ std::atomic<int32_t> g_tlsfShardExtendFailure{-1};
 std::atomic<bool> g_tlsfMainPoolDecommitEnabled{false};
 std::atomic<bool> g_tlsfTopDownEnabled{false};
 std::atomic<bool> g_tlsfConstantTimeEmptyCheckEnabled{true};
+std::atomic<size_t> g_tlsfWarmEmptyPoolLimit{0};
 thread_local int32_t g_tlsfShardAffinityOverride = -1;
 #endif
 
@@ -319,12 +320,43 @@ DWORD TlsfReserveCommitFlags(bool topDown) noexcept {
         (topDown ? MEM_TOP_DOWN : 0u);
 }
 
+constexpr uintptr_t kStormSignedAddressLimit = 0x80000000u;
+
+bool IsStormCompatibleAddressRange(const void* base, size_t size) noexcept {
+    if (!base || size == 0) {
+        return false;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(base);
+    return start < kStormSignedAddressLimit &&
+        size <= kStormSignedAddressLimit - start;
+}
+
+void* EnforceStormCompatibleAddressRange(
+    void* base, size_t size, const char* purpose) noexcept {
+    if (!base || IsStormCompatibleAddressRange(base, size)) {
+        return base;
+    }
+    Logger::GetInstance().LogWarning(
+        "TLSF rejected >=0x80000000 address range: purpose=%s, base=%p, size=%zu",
+        purpose ? purpose : "unknown", base, size);
+    VirtualFree(base, 0, MEM_RELEASE);
+    return nullptr;
+}
+
 bool TlsfConstantTimeEmptyCheckEnabled() noexcept {
 #if defined(STORMBREAKER_TESTING)
     return g_tlsfConstantTimeEmptyCheckEnabled.load(
         std::memory_order_relaxed);
 #else
     return true;
+#endif
+}
+
+size_t TlsfWarmEmptyPoolLimit() noexcept {
+#if defined(STORMBREAKER_TESTING)
+    return g_tlsfWarmEmptyPoolLimit.load(std::memory_order_relaxed);
+#else
+    return 0;
 #endif
 }
 
@@ -598,14 +630,18 @@ public:
             return false;
         }
 
-        mainPool_ = VirtualAlloc(nullptr, config_.initialSize,
-            TlsfReserveCommitFlags(topDownEnabled_), PAGE_READWRITE);
+        mainPool_ = EnforceStormCompatibleAddressRange(
+            VirtualAlloc(nullptr, config_.initialSize,
+                TlsfReserveCommitFlags(topDownEnabled_), PAGE_READWRITE),
+            config_.initialSize, "main");
         if (!mainPool_ && topDownEnabled_) {
             Logger::GetInstance().LogWarning(
                 "TLSF clustered main-pool allocation failed; retrying system placement");
             topDownEnabled_ = false;
-            mainPool_ = VirtualAlloc(nullptr, config_.initialSize,
-                TlsfReserveCommitFlags(false), PAGE_READWRITE);
+            mainPool_ = EnforceStormCompatibleAddressRange(
+                VirtualAlloc(nullptr, config_.initialSize,
+                    TlsfReserveCommitFlags(false), PAGE_READWRITE),
+                config_.initialSize, "main-system-fallback");
         }
         if (!mainPool_) {
             Logger::GetInstance().LogError(
@@ -628,12 +664,23 @@ public:
             return false;
         }
 
-        if (shardDirectory_ &&
-            !shardDirectory_->RegisterRange(
-                mainPool_, config_.initialSize, shardIndex_)) {
+        const bool localRangeRegistered = addressDirectory_.RegisterRange(
+            mainPool_, config_.initialSize, 0);
+        const bool shardRangeRegistered =
+            !shardDirectory_ || shardDirectory_->RegisterRange(
+                                    mainPool_, config_.initialSize, shardIndex_);
+        if (!localRangeRegistered || !shardRangeRegistered) {
             Logger::GetInstance().LogError(
-                "TLSF shard directory rejected main pool: shard=%zu, base=%p, size=%zu",
+                "TLSF address directory rejected main pool: shard=%zu, base=%p, size=%zu",
                 shardIndex_, mainPool_, config_.initialSize);
+            if (localRangeRegistered) {
+                addressDirectory_.UnregisterRange(
+                    mainPool_, config_.initialSize, 0);
+            }
+            if (shardDirectory_ && shardRangeRegistered) {
+                shardDirectory_->UnregisterRange(
+                    mainPool_, config_.initialSize, shardIndex_);
+            }
             tlsfHandle_ = nullptr;
             VirtualFree(mainPool_, 0, MEM_RELEASE);
             mainPool_ = nullptr;
@@ -660,6 +707,7 @@ public:
         LockIfEnabled(lock);
 
         for (const ExtraPool& pool : extraPools_) {
+            addressDirectory_.UnregisterRange(pool.base, pool.size, 0);
             if (shardDirectory_) {
                 shardDirectory_->UnregisterRange(
                     pool.base, pool.size, shardIndex_);
@@ -674,6 +722,8 @@ public:
         extraPools_.clear();
 
         if (mainPool_) {
+            addressDirectory_.UnregisterRange(
+                mainPool_, config_.initialSize, 0);
             if (shardDirectory_) {
                 shardDirectory_->UnregisterRange(
                     mainPool_, config_.initialSize, shardIndex_);
@@ -890,14 +940,25 @@ public:
         if (!tlsfHandle_ || !IsExactAllocatedBlockLocked(ptr)) {
             return 0;
         }
+        void* extraPoolBase = nullptr;
+        if (!IsPointerInRange(ptr, mainPool_, config_.initialSize)) {
+            const ExtraPool* extraPool = FindExtraPoolLocked(ptr);
+            extraPoolBase = extraPool ? extraPool->base : nullptr;
+        }
         const size_t usableSize = SafeTlsfBlockSize(ptr);
         if (usableSize == 0 ||
             (validator && !validator(ptr, usableSize, context))) {
             return 0;
         }
-        return SafeTlsfFree(tlsfHandle_, ptr)
-            ? usableSize
-            : 0;
+        if (!SafeTlsfFree(tlsfHandle_, ptr)) {
+            return 0;
+        }
+        if (extraPoolBase &&
+            ShouldReleaseEmptyExtraPoolLocked(extraPoolBase) &&
+            RemoveEmptyExtraPoolLocked(extraPoolBase)) {
+            trimCount_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return usableSize;
     }
 
     MemoryPool::BatchFreeResult FreeBatch(
@@ -921,6 +982,10 @@ public:
             }
             result.usableBytes += usable;
         }
+        if (result.freedCount != 0 &&
+            ReclaimEmptyExtraPoolsLocked(TlsfWarmEmptyPoolLimit()) != 0) {
+            trimCount_.fetch_add(1, std::memory_order_relaxed);
+        }
         return result;
     }
 
@@ -932,6 +997,11 @@ public:
         std::shared_lock<std::shared_mutex> lock(poolMutex_, std::defer_lock);
         LockIfEnabled(lock);
         return IsFromBackendLocked(ptr);
+    }
+
+    bool MayContainAddress(const void* ptr) const override {
+        return mainPool_ &&
+            addressDirectory_.Lookup(ptr) != kTlsfShardCount;
     }
 
     bool QueryAllocation(void* ptr, size_t* usableSize) const override {
@@ -1343,10 +1413,17 @@ private:
         return extendSize;
     }
 
-    size_t ReclaimEmptyExtraPoolsLocked() {
+    size_t ReclaimEmptyExtraPoolsLocked(size_t warmRegularPoolLimit = 0) {
         size_t reclaimedBytes = 0;
+        size_t warmRegularPools = 0;
         for (auto it = extraPools_.begin(); it != extraPools_.end();) {
             if (!SafeTlsfPoolIsEmpty(it->handle)) {
+                ++it;
+                continue;
+            }
+            if (IsWarmPoolEligible(it->size) &&
+                warmRegularPools < warmRegularPoolLimit) {
+                ++warmRegularPools;
                 ++it;
                 continue;
             }
@@ -1354,6 +1431,7 @@ private:
                 shardDirectory_->UnregisterRange(
                     it->base, it->size, shardIndex_);
             }
+            addressDirectory_.UnregisterRange(it->base, it->size, 0);
             tlsf_remove_pool(tlsfHandle_, it->handle);
             VirtualFree(it->base, 0, MEM_RELEASE);
             reclaimedBytes += it->size;
@@ -1369,6 +1447,40 @@ private:
         return reclaimedBytes;
     }
 
+    bool ShouldReleaseEmptyExtraPoolLocked(void* poolBase) const {
+        const auto found = std::find_if(
+            extraPools_.begin(), extraPools_.end(),
+            [poolBase](const ExtraPool& pool) {
+                return pool.base == poolBase;
+            });
+        if (found == extraPools_.end() ||
+            !SafeTlsfPoolIsEmpty(found->handle)) {
+            return false;
+        }
+        if (!IsWarmPoolEligible(found->size)) {
+            return true;
+        }
+
+        size_t emptyRegularPools = 0;
+        for (const ExtraPool& pool : extraPools_) {
+            if (IsWarmPoolEligible(pool.size) &&
+                SafeTlsfPoolIsEmpty(pool.handle)) {
+                ++emptyRegularPools;
+            }
+        }
+        return emptyRegularPools > TlsfWarmEmptyPoolLimit();
+    }
+
+    bool IsWarmPoolEligible(size_t size) const noexcept {
+        constexpr size_t kWarmGranularityMultiplier = 4;
+        const size_t maximumWarmSize =
+            config_.extendGranularity >
+                    SIZE_MAX / kWarmGranularityMultiplier
+                ? SIZE_MAX
+                : config_.extendGranularity * kWarmGranularityMultiplier;
+        return size <= maximumWarmSize;
+    }
+
     void* AllocateExtraPoolRegion(size_t size) const noexcept {
         if (topDownEnabled_ && mainPool_ && size != 0) {
             uintptr_t lowAddress = reinterpret_cast<uintptr_t>(mainPool_);
@@ -1382,18 +1494,20 @@ private:
                     (lowAddress - size) &
                     ~(static_cast<uintptr_t>(kTlsfShardBudgetAlignment) - 1u);
                 if (candidate >= kTlsfShardBudgetAlignment) {
-                    void* exact = VirtualAlloc(
-                        reinterpret_cast<void*>(candidate), size,
-                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                    void* exact = EnforceStormCompatibleAddressRange(
+                        VirtualAlloc(reinterpret_cast<void*>(candidate), size,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE),
+                        size, "growth-clustered");
                     if (exact != nullptr) {
                         return exact;
                     }
                 }
             }
         }
-        return VirtualAlloc(nullptr, size,
-            TlsfReserveCommitFlags(topDownEnabled_),
-            PAGE_READWRITE);
+        return EnforceStormCompatibleAddressRange(
+            VirtualAlloc(nullptr, size,
+                TlsfReserveCommitFlags(topDownEnabled_), PAGE_READWRITE),
+            size, "growth");
     }
 
     bool AddExtraPool(size_t size, void** addedPoolBase = nullptr) {
@@ -1427,11 +1541,24 @@ private:
             return false;
         }
 
+        if (!addressDirectory_.RegisterRange(newPool, size, 0)) {
+            Logger::GetInstance().LogError(
+                "TLSF address directory rejected growth pool: base=%p, size=%zu",
+                newPool, size);
+            tlsf_remove_pool(tlsfHandle_, poolHandle);
+            VirtualFree(newPool, 0, MEM_RELEASE);
+            if (sharedReservationBudget_) {
+                sharedReservationBudget_->Release(size);
+            }
+            return false;
+        }
+
         if (shardDirectory_ &&
             !shardDirectory_->RegisterRange(newPool, size, shardIndex_)) {
             Logger::GetInstance().LogError(
                 "TLSF shard directory rejected growth pool: shard=%zu, base=%p, size=%zu",
                 shardIndex_, newPool, size);
+            addressDirectory_.UnregisterRange(newPool, size, 0);
             tlsf_remove_pool(tlsfHandle_, poolHandle);
             VirtualFree(newPool, 0, MEM_RELEASE);
             if (sharedReservationBudget_) {
@@ -1450,6 +1577,7 @@ private:
             extraPools_.insert(insertion, {newPool, size, poolHandle});
         }
         catch (...) {
+            addressDirectory_.UnregisterRange(newPool, size, 0);
             if (shardDirectory_) {
                 shardDirectory_->UnregisterRange(
                     newPool, size, shardIndex_);
@@ -1501,6 +1629,7 @@ private:
             shardDirectory_->UnregisterRange(
                 found->base, found->size, shardIndex_);
         }
+        addressDirectory_.UnregisterRange(found->base, found->size, 0);
         tlsf_remove_pool(tlsfHandle_, found->handle);
         VirtualFree(found->base, 0, MEM_RELEASE);
         extraPools_.erase(found);
@@ -1541,6 +1670,7 @@ private:
     mutable AtomicLatencyHistogram lockWaitLatency_;
     SharedTlsfReservationBudget* sharedReservationBudget_ = nullptr;
     TlsfShardDirectory* shardDirectory_ = nullptr;
+    TlsfShardDirectory addressDirectory_{};
     size_t shardIndex_ = 0;
 };
 
@@ -1803,6 +1933,11 @@ public:
             FindAddressShard(ptr, false) != kTlsfShardCount;
     }
 
+    bool MayContainAddress(const void* ptr) const override {
+        return initialized_ &&
+            shardDirectory_.Lookup(ptr) != kTlsfShardCount;
+    }
+
     bool QueryAllocation(void* ptr, size_t* usableSize) const override {
         if (usableSize) {
             *usableSize = 0;
@@ -1980,6 +2115,7 @@ public:
             }
             const auto stats = shard->GetStats();
             aggregate.growthCount += stats.growthCount;
+            aggregate.trimCount += stats.trimCount;
             aggregate.lockWaitCount += stats.lockWaitCount;
             aggregate.lockWaitNanoseconds += stats.lockWaitNanoseconds;
             aggregate.maxLockWaitNanoseconds = (std::max)(
@@ -1988,7 +2124,7 @@ public:
             MergeHistogram(
                 aggregate.lockWaitLatency, stats.lockWaitLatency);
         }
-        aggregate.trimCount = trimCount_.load(std::memory_order_relaxed);
+        aggregate.trimCount += trimCount_.load(std::memory_order_relaxed);
         return aggregate;
     }
 
@@ -2174,6 +2310,11 @@ void SetTlsfTopDownEnabledForTesting(bool enabled) {
 void SetTlsfConstantTimeEmptyCheckEnabledForTesting(bool enabled) {
     g_tlsfConstantTimeEmptyCheckEnabled.store(
         enabled, std::memory_order_relaxed);
+}
+
+void SetTlsfWarmEmptyPoolLimitForTesting(size_t limit) {
+    g_tlsfWarmEmptyPoolLimit.store((std::min)(limit, size_t{8}),
+                                   std::memory_order_relaxed);
 }
 
 void SetTlsfShardAffinityForTesting(size_t shardIndex) {

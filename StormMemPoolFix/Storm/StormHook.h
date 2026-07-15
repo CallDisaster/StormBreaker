@@ -100,6 +100,12 @@ void PostReset();
 bool IsPointerAligned(void *ptr, size_t alignment);
 bool ValidateBlockAlignment(void *userPtr);
 
+#if defined(STORMBREAKER_TESTING)
+namespace Testing {
+void SetMinimalLargeHookPathEnabled(bool enabled) noexcept;
+}
+#endif
+
 // 大块阈值管理
 void SetLargeBlockThreshold(size_t bytes);
 size_t GetLargeBlockThreshold();
