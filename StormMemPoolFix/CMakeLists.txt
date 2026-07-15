@@ -14,6 +14,7 @@ set(STORMBREAKER_LIBRARY_SOURCES
   Storm/MemoryPool.cpp
   Storm/MimallocBackend.cpp
   Storm/StormHook.cpp
+  Storm/StormNativeSmallRepair.cpp
   Storm/StormOffsets.cpp
   Storm/StormVersionProfile.cpp
   Storm/TlsfBackend.cpp
@@ -97,6 +98,7 @@ if(STORMBREAKER_BUILD_TESTS)
     Storm/MimallocBackend.cpp
     Storm/StormHeapRegistry.cpp
     Storm/StormHook.cpp
+    Storm/StormNativeSmallRepair.cpp
     Storm/StormOffsets.cpp
     Storm/StormTakeover.cpp
     Storm/StormVersionProfile.cpp
@@ -114,6 +116,7 @@ if(STORMBREAKER_BUILD_TESTS)
     Storm/MimallocBackend.cpp
     Storm/StormHeapRegistry.cpp
     Storm/StormHook.cpp
+    Storm/StormNativeSmallRepair.cpp
     Storm/StormOffsets.cpp
     Storm/StormTakeover.cpp
     Storm/StormVersionProfile.cpp

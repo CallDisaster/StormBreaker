@@ -5,6 +5,7 @@ used by the StormBreaker research pass.
 """
 
 import idc
+import ida_name
 import ida_loader
 import ida_nalt
 
@@ -34,7 +35,9 @@ def _apply_types(declarations, functions):
 
 def _apply_names(names):
     for rva, name in names.items():
-        if not idc.set_name(_ea(rva), name, idc.SN_FORCE | idc.SN_NOCHECK):
+        if not idc.set_name(
+            _ea(rva), name, ida_name.SN_FORCE | ida_name.SN_NOCHECK
+        ):
             raise RuntimeError("failed to name RVA 0x%X as %s" % (rva, name))
 
 
@@ -114,6 +117,35 @@ typedef struct SMemHeapInfo482 {
   unsigned int liveAllocationCount;
   unsigned int requestedBytes;
 } SMemHeapInfo482;
+typedef struct StormSmallBlockHeader {
+  unsigned short totalBytes;
+  unsigned char alignmentPadding;
+  unsigned char flags;
+  unsigned short arenaHigh16;
+  unsigned short magic6F6D;
+} StormSmallBlockHeader;
+typedef struct StormHeapArena {
+  struct StormHeapArena *next;
+  unsigned int heapId;
+  unsigned int bucketIndex;
+  unsigned int blockSignature;
+  unsigned int currentArena;
+  unsigned int liveAllocationCount;
+  unsigned int requestedLiveBytes;
+  unsigned char *dataStart;
+  unsigned char *bumpEnd;
+  unsigned int adjacentFreeHint;
+  unsigned int commitGranularity;
+  unsigned int committedBytes;
+  unsigned int reservedBytes;
+  unsigned int externalRequestedBytes;
+  unsigned int allocationCalls;
+  unsigned int freeCalls;
+  unsigned int reserved64;
+  StormSmallBlockHeader *freeBins[9];
+  int sourceLine;
+  char sourceName[1];
+} StormHeapArena;
 """
     names = {
         0x2B830: "SMemAlloc_401", 0x2BE40: "SMemFree_403",
@@ -124,8 +156,17 @@ typedef struct SMemHeapInfo482 {
         0x2C180: "SMemHeapCreate_486", 0x2C300: "SMemHeapDestroy_487",
         0x2C3A0: "SMemHeapFree_488", 0x2C5E0: "SMemHeapReAlloc_489",
         0x2C6D0: "SMemHeapSize_490", 0x2C980: "SMemSetOption_496",
+        0x2A350: "StormHeap_Create", 0x2A510: "StormHeap_AllocPage",
+        0x2A920: "StormHeap_RebuildFreeList",
         0x2AA70: "StormHeap_DestroyArenaOrPreservePersistent",
+        0x2AB50: "StormHeap_CleanupAll", 0x2ABF0: "StormHeap_InternalFree",
         0x2AD10: "StormHeap_QueryBlockSizeAndOverhead",
+        0x2AD60: "StormHeap_ComputeIndex", 0x2ADE0: "StormHeap_CommitPages",
+        0x2AE30: "StormHeap_TryGrowInPlace",
+        0x2B3B0: "StormHeap_Alloc", 0x2B4F0: "StormHeap_FreeAndAccount",
+        0x2B560: "StormHeap_ReallocImpl", 0x2B680: "StormHeap_ShrinkInPlace",
+        0x2B790: "StormHeap_SplitFreeBlock",
+        0x5536C: "g_DebugMemoryEnabled", 0x56F74: "g_ProtectMemoryEnabled",
         0x49560: "g_NextExplicitHeapId", 0x56F78: "g_ReallocShuffleEnabled",
     }
     functions = {
@@ -145,6 +186,15 @@ typedef struct SMemHeapInfo482 {
         0x2C5E0: "void *__stdcall SMemHeapReAlloc_489(unsigned int heapId, unsigned int flags, void *pointer, unsigned int newSize);",
         0x2C6D0: "int __stdcall SMemHeapSize_490(unsigned int heapId, unsigned int flags, const void *pointer);",
         0x2C980: "int __stdcall SMemSetOption_496(unsigned int valueBits, unsigned int maskBits);",
+        0x2A350: "StormHeapArena *__fastcall StormHeap_Create(const char *sourceFile, int sourceLine, unsigned int heapId, unsigned int bucketIndex, unsigned int commitGranularity, unsigned int initialCommit, unsigned int reserveBytes);",
+        0x2A510: "void *__fastcall StormHeap_AllocPage(StormHeapArena *arena, unsigned int requestedBytes, unsigned int headerFlags);",
+        0x2A920: "void __fastcall StormHeap_RebuildFreeList(StormHeapArena *arena);",
+        0x2ABF0: "void __fastcall StormHeap_InternalFree(StormHeapArena *arena, StormSmallBlockHeader *block);",
+        0x2AD10: "void __fastcall StormHeap_QueryBlockSizeAndOverhead(StormSmallBlockHeader *block, const void *userPointer, unsigned int *requestedBytes, unsigned int *overheadBytes);",
+        0x2ADE0: "int __fastcall StormHeap_CommitPages(StormHeapArena *arena, unsigned int requiredEndOffset);",
+        0x2AE30: "int __fastcall StormHeap_TryGrowInPlace(StormHeapArena *arena, StormSmallBlockHeader *block, unsigned int oldRequestedBytes, unsigned int newRequestedBytes);",
+        0x2B680: "int __fastcall StormHeap_ShrinkInPlace(StormHeapArena *arena, StormSmallBlockHeader *block, unsigned int oldRequestedBytes, unsigned int newRequestedBytes);",
+        0x2B790: "void __fastcall StormHeap_SplitFreeBlock(StormHeapArena *arena, StormSmallBlockHeader *freeBlock, unsigned int *allocatedTotalBytes, unsigned char *alignmentPadding);",
     }
     comments = {
         0x2C8B0: "Small realloc(ptr,0) normally returns the same valid zero-request block; large/shuffle realloc returns a new zero-request block. Flag 0x10 forbids moving.",
@@ -153,6 +203,17 @@ typedef struct SMemHeapInfo482 {
         0x2C180: "486 requires null baseAddress; explicit IDs begin at 0x80000001 and size rounds to at least 4 KiB.",
         0x2C300: "487 frees ordinary blocks but preserves 0x08000000 persistent blocks and their heap arena.",
         0x2C980: "496 bits: 1 Debug Memory, 2 error handling, 4 Protect Memory, 8 fill pattern. Realloc Shuffle is separate.",
+        0x2A350: "Arena layout verified: 112-byte fixed prefix plus source name, rounded to 8. Initial automatic arena reserves 64 KiB and commits 4 KiB.",
+        0x2A58F: "Free-list bin is min(totalBytes >> 5, 8): eight 32-byte ranges and one catch-all bin for every block >=256 bytes.",
+        0x2A592: "Deferred coalescing runs only when adjacentFreeHint >= 4 and the request's exact bin is empty.",
+        0x2A5A5: "Search selects the first nonempty bin at or above the request bin.",
+        0x2A5D4: "Only this selected bin is traversed. Approximate best fit stops when remainder is below a growing 16+4n tolerance.",
+        0x2A603: "Confirmed fragmentation flaw: if the selected bin contains only undersized blocks, allocation falls through to bump growth without checking higher bins that may fit.",
+        0x2A66E: "When bump growth exceeds reserve, the next arena doubles reserve up to 256 MiB and initially commits one eighth.",
+        0x2A920: "Rebuild scans dataStart..bumpEnd, coalesces adjacent free blocks while combined total fits uint16, and reconstructs all nine bins.",
+        0x2B4F0: "Accounting defect: allocation adds requested bytes, but small free subtracts total block bytes (requested + header + padding). Large free subtracts placeholder bytes.",
+        0x2B680: "Shrink inserts a >=16-byte remainder into a free bin. It does not set the following block's previous-free hint, delaying the coalescing heuristic.",
+        0x2B790: "This is a split helper, not a coalescer: allocate the front of a selected free block, absorb remainder <16, or enqueue the remainder.",
     }
     _apply_types(declarations, functions)
     _apply_names(names)

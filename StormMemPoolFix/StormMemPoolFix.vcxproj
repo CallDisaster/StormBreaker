@@ -112,6 +112,7 @@
     <ClInclude Include="Storm\StormApi.h" />
     <ClInclude Include="Storm\StormHeapRegistry.h" />
     <ClInclude Include="Storm\StormHook.h" />
+    <ClInclude Include="Storm\StormNativeSmallRepair.h" />
     <ClInclude Include="Storm\StormOffsets.h" />
     <ClInclude Include="Storm\StormTakeover.h" />
     <ClInclude Include="Storm\StormVersionProfile.h" />
@@ -135,6 +136,7 @@
     <ClCompile Include="Storm\MemoryPool.cpp" />
     <ClCompile Include="Storm\MimallocBackend.cpp" />
     <ClCompile Include="Storm\StormHook.cpp" />
+    <ClCompile Include="Storm\StormNativeSmallRepair.cpp" />
     <ClCompile Include="Storm\StormOffsets.cpp" />
     <ClCompile Include="Storm\StormVersionProfile.cpp" />
     <ClCompile Include="Storm\TlsfBackend.cpp" />

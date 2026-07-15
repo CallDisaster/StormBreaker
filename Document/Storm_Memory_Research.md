@@ -1,6 +1,6 @@
 # Storm / Game Memory Research
 
-Last updated: 2026-07-13
+Last updated: 2026-07-15
 
 ## Scope
 
@@ -54,12 +54,12 @@ known RVAs when named `GetProcAddress` lookups fail.
 | `0x1502ABF0` | `StormHeap_InternalFree` | free/coalesce a block or release external VA |
 | `0x1502AD60` | `StormHeap_ComputeIndex` | derive logical heap ID from caller metadata |
 | `0x1502ADE0` | `StormHeap_CommitPages` | commit more pages inside a reserved arena |
-| `0x1502AE30` | unnamed grow helper | attempt in-place small-block growth |
+| `0x1502AE30` | `StormHeap_TryGrowInPlace` | attempt in-place small-block growth |
 | `0x1502B3B0` | `StormHeap_Alloc` | allocation wrapper, fill/zero and accounting |
-| `0x1502B4F0` | unnamed free wrapper | size/accounting, poison and internal free |
+| `0x1502B4F0` | `StormHeap_FreeAndAccount` | size/accounting, poison and internal free |
 | `0x1502B560` | `StormHeap_ReallocImpl` | in-place resize or allocate/copy/free |
-| `0x1502B680` | unnamed shrink helper | shrink/split a small block in place |
-| `0x1502B790` | `StormHeap_CombineFreeBlocks` | split/coalesce free ranges |
+| `0x1502B680` | `StormHeap_ShrinkInPlace` | shrink/split a small block in place |
+| `0x1502B790` | `StormHeap_SplitFreeBlock` | split a free range for allocation |
 | `0x1502B920` | memory shutdown | disable manager and destroy all Storm heaps |
 
 ### Heap topology
@@ -105,6 +105,10 @@ checks a `0x12B1` tail canary.
 The heap pointer is reconstructed from the stored high 16 bits. This is why a
 private StormBreaker block must never be passed to an original Storm free,
 realloc, size or heap-query routine.
+
+The exact arena layout, bin search, fragmentation bounds, executable model and
+the experimental native repair are documented in
+[`Storm_Native_Small_Pool.md`](Storm_Native_Small_Pool.md).
 
 ### Large-block boundary and layout
 
@@ -162,12 +166,14 @@ threshold or global mode.
 
 ### Accounting defect
 
-`StormHeap_Alloc` adds the requested size to `g_TotalAllocatedMemory`.
-The free wrapper subtracts the Storm block's stored total size. For external
-large allocations this stored value belongs to the small placeholder rather
-than the real payload, causing the counter to retain most of the released large
-allocation. StormBreaker's native-large counter correction addresses this
-specific mismatch.
+`StormHeap_Alloc` adds the requested size to `g_TotalAllocatedMemory`, while the
+free wrapper subtracts the Storm block's stored total size. For a normal small
+block this subtracts requested bytes plus header and alignment, so repeated
+small allocate/free cycles drift the counter downward. For an external large
+allocation the stored value belongs to the small placeholder rather than the
+real payload, so the counter instead retains most of the released allocation.
+StormBreaker's native-large counter correction addresses the large mismatch;
+the native small mismatch remains part of Storm's own accounting.
 
 Ordinal 406 returns this global counter. A full takeover must either hook the
 query to report combined native plus managed live bytes or explicitly accept

@@ -13,6 +13,7 @@
 #include <Base/MemorySafety.h>
 #include <Game/PathCapUnlock.h>
 #include <Storm/StormHook.h>
+#include <Storm/StormNativeSmallRepair.h>
 #include <Storm/StormOffsets.h>
 #include <Storm/StormTakeover.h>
 #include <Storm/StormVersionProfile.h>
@@ -313,6 +314,8 @@ void EmitControlPanelStatus() noexcept {
   const MemoryPool::ExtendedPoolStats pool = MemoryPool::GetExtendedStats();
   const StormHook::RuntimeStats hook = StormHook::GetRuntimeStats();
 #if STORMBREAKER_LARGE_ONLY
+  const StormNativeSmallRepair::RuntimeStats nativeRepair =
+      StormNativeSmallRepair::GetRuntimeStats();
   const char *backend = MemoryPool::GetBackendName();
   const char *buildIdentity = MemoryPool::GetBuildBackendIdentity();
   const unsigned long long liveBlocks =
@@ -330,14 +333,19 @@ void EmitControlPanelStatus() noexcept {
       "[ControlPanel] ready=%s hooks=%s backend=%s build=%s "
       "mode=large-four-hook threshold=0x%zX liveBlocks=%llu live=%llu MiB "
       "requested=%llu MiB reserved=%llu MiB committed=%llu MiB "
-      "managedAlloc=%llu managedFree=%llu fallback=%llu failures=%llu",
+      "managedAlloc=%llu managedFree=%llu fallback=%llu failures=%llu "
+      "nativeSmallRepair=%s repairCalls=%u promotions=%u rebuilds=%u "
+      "invalidSkips=%u bypasses=%u",
       ready ? "yes" : "no", hooks ? "yes" : "no", backend,
       buildIdentity, StormHook::GetLargeBlockThreshold(), liveBlocks, liveMiB,
       requestedMiB, reservedMiB, committedMiB,
       static_cast<unsigned long long>(hook.managedAllocations),
       static_cast<unsigned long long>(hook.managedFrees),
       static_cast<unsigned long long>(hook.fallbackAllocations),
-      static_cast<unsigned long long>(hook.failures));
+      static_cast<unsigned long long>(hook.failures),
+      StormNativeSmallRepair::GetModeName(), nativeRepair.calls,
+      nativeRepair.promotions, nativeRepair.rebuilds,
+      nativeRepair.invalidArenaSkips, nativeRepair.bypasses);
   Logger::GetInstance().FlushLogs();
 
   if (GetConsoleWindow() != nullptr) {
@@ -354,6 +362,8 @@ void EmitControlPanelStatus() noexcept {
         "  reserved=%llu MiB, committed=%llu MiB\n"
         "  managed alloc=%llu, managed free=%llu, fallback=%llu, "
         "failures=%llu\n"
+        "  native small repair=%s, calls=%u, promotions=%u, rebuilds=%u, "
+        "invalid skips=%u, bypasses=%u\n"
         "  next refresh in %lu seconds\n",
         ready ? "YES" : "NO", hooks ? "YES" : "NO", backend,
         buildIdentity, StormHook::GetLargeBlockThreshold(), liveBlocks,
@@ -362,6 +372,9 @@ void EmitControlPanelStatus() noexcept {
         static_cast<unsigned long long>(hook.managedFrees),
         static_cast<unsigned long long>(hook.fallbackAllocations),
         static_cast<unsigned long long>(hook.failures),
+        StormNativeSmallRepair::GetModeName(), nativeRepair.calls,
+        nativeRepair.promotions, nativeRepair.rebuilds,
+        nativeRepair.invalidArenaSkips, nativeRepair.bypasses,
         ControlPanelIntervalMilliseconds() / 1000);
     std::fflush(stdout);
   }
@@ -798,6 +811,11 @@ bool InstallStormHooks() {
         "大块Hook版本校验失败；保持原生Storm不变: %ls", failure);
     return false;
   }
+  if (!StormNativeSmallRepair::Configure(verified)) {
+    Logger::GetInstance().LogError(
+        "STORMBREAKER_NATIVE_SMALL_REPAIR 配置无效或 Storm 内部函数校验失败");
+    return false;
+  }
 
   g_origStormAlloc = reinterpret_cast<Storm_MemAlloc_t>(verified.alloc);
   g_origStormFree = reinterpret_cast<Storm_MemFree_t>(verified.free);
@@ -813,6 +831,7 @@ bool InstallStormHooks() {
     g_origStormFree = nullptr;
     g_origStormGetSize = nullptr;
     g_origStormReAlloc = nullptr;
+    StormNativeSmallRepair::Reset();
   };
   LONG result = DetourTransactionBegin();
   if (result != NO_ERROR) {
@@ -840,7 +859,7 @@ bool InstallStormHooks() {
     }
     return true;
   };
-  const bool attached =
+  bool attached =
       attach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
              reinterpret_cast<PVOID>(Hooked_Storm_MemAlloc),
              "401 SMemAlloc") &&
@@ -853,6 +872,15 @@ bool InstallStormHooks() {
       attach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
              reinterpret_cast<PVOID>(Hooked_Storm_MemReAlloc),
              "405 SMemReAlloc");
+  if (attached) {
+    const LONG repairResult = StormNativeSmallRepair::Attach();
+    if (repairResult != NO_ERROR) {
+      Logger::GetInstance().LogError(
+          "DetourAttach(StormHeap_AllocPage native repair)失败: %ld",
+          repairResult);
+      attached = false;
+    }
+  }
   if (!attached) {
     DetourTransactionAbort();
     clearOriginals();
@@ -868,8 +896,10 @@ bool InstallStormHooks() {
 
   g_hooksInstalled.store(true, std::memory_order_release);
   Logger::GetInstance().LogInfo(
-      "Storm大块Hook安装成功: ordinals 401/403/404/405, threshold=0x%zX",
-      StormHook::GetLargeBlockThreshold());
+      "Storm大块Hook安装成功: ordinals 401/403/404/405, threshold=0x%zX, "
+      "native-small-repair=%s",
+      StormHook::GetLargeBlockThreshold(),
+      StormNativeSmallRepair::GetModeName());
   PublishTelemetrySnapshot();
   return true;
 #else
@@ -1049,7 +1079,7 @@ bool UninstallStormHooks() {
     }
     return true;
   };
-  const bool detached =
+  bool detached =
       detach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
              reinterpret_cast<PVOID>(Hooked_Storm_MemAlloc),
              "401 SMemAlloc") &&
@@ -1062,6 +1092,15 @@ bool UninstallStormHooks() {
       detach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
              reinterpret_cast<PVOID>(Hooked_Storm_MemReAlloc),
              "405 SMemReAlloc");
+  if (detached) {
+    const LONG repairResult = StormNativeSmallRepair::Detach();
+    if (repairResult != NO_ERROR) {
+      Logger::GetInstance().LogError(
+          "DetourDetach(StormHeap_AllocPage native repair)失败: %ld",
+          repairResult);
+      detached = false;
+    }
+  }
   if (!detached) {
     DetourTransactionAbort();
     Logger::GetInstance().LogError(
@@ -1080,6 +1119,7 @@ bool UninstallStormHooks() {
   g_origStormFree = nullptr;
   g_origStormGetSize = nullptr;
   g_origStormReAlloc = nullptr;
+  StormNativeSmallRepair::Reset();
   PublishTelemetrySnapshot();
   return true;
 #else
