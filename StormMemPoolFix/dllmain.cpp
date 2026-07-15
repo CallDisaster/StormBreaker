@@ -9,6 +9,7 @@
 #include "Base/LeakProfiler.h"
 #include "Base/Telemetry.h"
 #include "Storm/MemoryPool.h"
+#include "StormBreakerVersion.h"
 #include <Base/Logger.h>
 #include <Base/MemorySafety.h>
 #include <Game/PathCapUnlock.h>
@@ -126,7 +127,8 @@ void CreateConsole() {
     SetConsoleWindowInfo(hConsole, TRUE, &windowSize);
   }
 
-  printf("StormBreaker debug console enabled.\n");
+  printf("StormBreaker v%s debug console enabled.\n",
+         StormBreakerVersion::kVersion);
   printf("Log file: .\\StormBreaker\\StormMemory.log\n\n");
   printf("Set STORMBREAKER_DISABLE_DEBUG_CONSOLE=1 to disable this console.\n\n");
   printf("Set STORMBREAKER_VERBOSE_LOG=1 for per-allocation debug logs.\n");
@@ -330,13 +332,14 @@ void EmitControlPanelStatus() noexcept {
       pool.committedBytes / (1024u * 1024u));
 
   Logger::GetInstance().LogInfo(
-      "[ControlPanel] ready=%s hooks=%s backend=%s build=%s "
+      "[ControlPanel] version=%s ready=%s hooks=%s backend=%s build=%s "
       "mode=large-four-hook threshold=0x%zX liveBlocks=%llu live=%llu MiB "
       "requested=%llu MiB reserved=%llu MiB committed=%llu MiB "
       "managedAlloc=%llu managedFree=%llu fallback=%llu failures=%llu "
       "nativeSmallRepair=%s repairCalls=%u promotions=%u rebuilds=%u "
       "invalidSkips=%u bypasses=%u",
-      ready ? "yes" : "no", hooks ? "yes" : "no", backend,
+      StormBreakerVersion::kVersion, ready ? "yes" : "no",
+      hooks ? "yes" : "no", backend,
       buildIdentity, StormHook::GetLargeBlockThreshold(), liveBlocks, liveMiB,
       requestedMiB, reservedMiB, committedMiB,
       static_cast<unsigned long long>(hook.managedAllocations),
@@ -351,11 +354,12 @@ void EmitControlPanelStatus() noexcept {
   if (GetConsoleWindow() != nullptr) {
     char title[128]{};
     std::snprintf(title, sizeof(title),
-                  "StormBreaker Large Block - %s - %s", backend,
+                  "StormBreaker v%s Large Block - %s - %s",
+                  StormBreakerVersion::kVersion, backend,
                   hooks ? "HOOKED" : "NOT HOOKED");
     SetConsoleTitleA(title);
     std::printf(
-        "\n[StormBreaker Large Block Control Panel] READY=%s HOOKS=%s "
+        "\n[StormBreaker v%s Large Block Control Panel] READY=%s HOOKS=%s "
         "BACKEND=%s\n"
         "  build identity=%s, takeover=large-four-hook, threshold=0x%zX\n"
         "  live blocks=%llu, live=%llu MiB, requested=%llu MiB\n"
@@ -365,7 +369,8 @@ void EmitControlPanelStatus() noexcept {
         "  native small repair=%s, calls=%u, promotions=%u, rebuilds=%u, "
         "invalid skips=%u, bypasses=%u\n"
         "  next refresh in %lu seconds\n",
-        ready ? "YES" : "NO", hooks ? "YES" : "NO", backend,
+        StormBreakerVersion::kVersion, ready ? "YES" : "NO",
+        hooks ? "YES" : "NO", backend,
         buildIdentity, StormHook::GetLargeBlockThreshold(), liveBlocks,
         liveMiB, requestedMiB, reservedMiB, committedMiB,
         static_cast<unsigned long long>(hook.managedAllocations),
@@ -539,7 +544,8 @@ bool StopControlPanel() {
 // 工作线程函数 - 在Loader Lock外执行所有重活
 static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
 
-  Logger::GetInstance().LogInfo("开始异步初始化StormBreaker系统...");
+  Logger::GetInstance().LogInfo("开始异步初始化 StormBreaker v%s...",
+                                StormBreakerVersion::kVersion);
 
   // 第一步：初始化基础系统
   if (!InitializeStormBreaker()) {
@@ -568,7 +574,8 @@ static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
   }
 
   g_systemInitialized.store(true, std::memory_order_release);
-  Logger::GetInstance().LogInfo("StormBreaker系统异步初始化完成");
+  Logger::GetInstance().LogInfo("StormBreaker v%s 系统异步初始化完成",
+                                StormBreakerVersion::kVersion);
   if (!StartControlPanel()) {
     Logger::GetInstance().LogWarning(
         "控制面板线程启动失败；文件日志仍可用于确认加载状态");

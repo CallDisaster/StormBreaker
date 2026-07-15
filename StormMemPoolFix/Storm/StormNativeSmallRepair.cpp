@@ -5,6 +5,14 @@
 
 #include <cstring>
 
+#ifndef STORMBREAKER_DEFAULT_NATIVE_SMALL_REPAIR
+#define STORMBREAKER_DEFAULT_NATIVE_SMALL_REPAIR 0
+#endif
+
+static_assert(STORMBREAKER_DEFAULT_NATIVE_SMALL_REPAIR >= 0 &&
+              STORMBREAKER_DEFAULT_NATIVE_SMALL_REPAIR <= 2,
+              "native small repair default must be off/search/coalesce");
+
 namespace StormNativeSmallRepair {
 namespace {
 
@@ -28,6 +36,9 @@ volatile LONG g_rebuilds = 0;
 volatile LONG g_invalidArenaSkips = 0;
 volatile LONG g_bypasses = 0;
 
+constexpr Mode kCompiledDefaultMode =
+    static_cast<Mode>(STORMBREAKER_DEFAULT_NATIVE_SMALL_REPAIR);
+
 struct Candidate {
   NativeFreeBlock* block = nullptr;
   NativeFreeBlock** link = nullptr;
@@ -36,15 +47,20 @@ struct Candidate {
 
 bool ReadMode(Mode* mode) noexcept {
   char value[32]{};
+  SetLastError(ERROR_SUCCESS);
   const DWORD length = GetEnvironmentVariableA(
       "STORMBREAKER_NATIVE_SMALL_REPAIR", value,
       static_cast<DWORD>(sizeof(value)));
-  if (length == 0 || _stricmp(value, "off") == 0) {
-    *mode = Mode::Off;
+  if (length == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+    *mode = kCompiledDefaultMode;
     return true;
   }
-  if (length >= sizeof(value)) {
+  if (length == 0 || length >= sizeof(value)) {
     return false;
+  }
+  if (_stricmp(value, "off") == 0) {
+    *mode = Mode::Off;
+    return true;
   }
   if (_stricmp(value, "search") == 0) {
     *mode = Mode::Search;

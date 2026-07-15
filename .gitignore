@@ -366,3 +366,11 @@ FodyWeavers.xsd
 # Local reverse-engineering artifacts and binary drops
 Document/*.dll
 Document/*.i64
+
+# Local reverse-engineering, benchmark and release output
+/.ida-mcp/
+/autotest_results/
+/stormbreaker_*_results/
+/dist/
+/StormMemPoolFix/Build/StormBreaker-*.asi
+/StormMemPoolFix/Build/StormBreaker-variants.json

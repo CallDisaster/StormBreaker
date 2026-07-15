@@ -1,0 +1,35 @@
+#include <windows.h>
+#include "StormBreakerVersion.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION STORMBREAKER_VERSION_MAJOR,STORMBREAKER_VERSION_MINOR,STORMBREAKER_VERSION_PATCH,STORMBREAKER_VERSION_BUILD
+ PRODUCTVERSION STORMBREAKER_VERSION_MAJOR,STORMBREAKER_VERSION_MINOR,STORMBREAKER_VERSION_PATCH,STORMBREAKER_VERSION_BUILD
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "CallDisaster\0"
+      VALUE "FileDescription", "StormBreaker Warcraft III memory optimizer\0"
+      VALUE "FileVersion", STORMBREAKER_VERSION_FILE_STRING "\0"
+      VALUE "InternalName", "StormBreaker\0"
+      VALUE "LegalCopyright", "Copyright (c) CallDisaster\0"
+      VALUE "OriginalFilename", "StormBreaker.asi\0"
+      VALUE "ProductName", "StormBreaker\0"
+      VALUE "ProductVersion", STORMBREAKER_VERSION_STRING "\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
