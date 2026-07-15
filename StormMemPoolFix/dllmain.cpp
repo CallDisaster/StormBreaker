@@ -6,12 +6,16 @@
 // Description: 延缓 Warcraft III 旧版本 Storm.dll 的虚拟内存增长过快的问题
 
 #include "pch.h"
+#include "Base/LeakProfiler.h"
+#include "Base/Telemetry.h"
 #include "Storm/MemoryPool.h"
 #include <Base/Logger.h>
 #include <Base/MemorySafety.h>
 #include <Game/PathCapUnlock.h>
 #include <Storm/StormHook.h>
 #include <Storm/StormOffsets.h>
+#include <Storm/StormTakeover.h>
+#include <cstdlib>
 #include <cstdio>
 #include <detours.h>
 #include <fcntl.h>
@@ -35,8 +39,51 @@ bool ReadEnvFlag(const char *name) {
 
 bool ShouldEnableVerboseLogs() { return ReadEnvFlag("STORMBREAKER_VERBOSE_LOG"); }
 
+bool ShouldEnableMemorySafety() {
+  return ReadEnvFlag("STORMBREAKER_MEMORY_SAFETY");
+}
+
+bool ShouldEnableTelemetry() {
+  return ReadEnvFlag("STORMBREAKER_TELEMETRY");
+}
+
+bool ShouldEnableMemoryMonitor() {
+  return ReadEnvFlag("STORMBREAKER_MEMORY_MONITOR");
+}
+
+bool ShouldEnableControlPanel() {
+  return !ReadEnvFlag("STORMBREAKER_DISABLE_CONTROL_PANEL");
+}
+
 bool ShouldCreateDebugConsole() {
-  return ReadEnvFlag("STORMBREAKER_DEBUG_CONSOLE");
+  if (ReadEnvFlag("STORMBREAKER_DISABLE_DEBUG_CONSOLE")) {
+    return false;
+  }
+  return true;
+}
+
+static HMODULE g_pinnedModule = nullptr;
+static char g_artifactLogDirectory[32768] = {};
+
+bool PinModuleUntilProcessExit() {
+  if (g_pinnedModule) {
+    return true;
+  }
+
+  HMODULE pinned = nullptr;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_PIN,
+                         reinterpret_cast<LPCSTR>(&PinModuleUntilProcessExit),
+                         &pinned)) {
+    g_pinnedModule = pinned;
+    OutputDebugStringA(
+        "StormBreaker: module pinned until process exit to survive ASI "
+        "loader unload\n");
+    return true;
+  } else {
+    OutputDebugStringA("StormBreaker: failed to pin module\n");
+    return false;
+  }
 }
 } // namespace
 
@@ -75,12 +122,342 @@ void CreateConsole() {
 
   printf("StormBreaker debug console enabled.\n");
   printf("Log file: .\\StormBreaker\\StormMemory.log\n\n");
+  printf("Set STORMBREAKER_DISABLE_DEBUG_CONSOLE=1 to disable this console.\n\n");
+  printf("Set STORMBREAKER_VERBOSE_LOG=1 for per-allocation debug logs.\n");
+  printf("Set STORMBREAKER_MEMORY_SAFETY=1 for full block tracking.\n\n");
+  printf("Control panel status is flushed immediately every 60 seconds.\n\n");
 }
 
 namespace {
 static HANDLE g_initThread = nullptr;
 static std::atomic<bool> g_systemInitialized{false};
 static std::atomic<bool> g_hooksInstalled{false};
+static std::atomic<bool> g_telemetryStarted{false};
+static HANDLE g_controlPanelStopEvent = nullptr;
+static HANDLE g_controlPanelThread = nullptr;
+
+StormBreaker::Telemetry::MemoryBackend GetTelemetryBackend() {
+  if (!MemoryPool::IsInitialized()) {
+    return StormBreaker::Telemetry::MemoryBackend::Off;
+  }
+  switch (MemoryPool::GetBackendKind()) {
+  case MemoryPool::BackendKind::Tlsf:
+    return StormBreaker::Telemetry::MemoryBackend::Tlsf;
+  case MemoryPool::BackendKind::Mimalloc:
+    return StormBreaker::Telemetry::MemoryBackend::Mimalloc;
+  case MemoryPool::BackendKind::TlsfSharded:
+    return StormBreaker::Telemetry::MemoryBackend::TlsfSharded;
+  case MemoryPool::BackendKind::Hybrid:
+    return StormBreaker::Telemetry::MemoryBackend::Hybrid;
+  default:
+    return StormBreaker::Telemetry::MemoryBackend::Off;
+  }
+}
+
+uint64_t HistogramPercentile(const MemoryPool::LatencyHistogramStats &stats,
+                             uint64_t percentile) {
+  if (stats.sampleCount == 0) {
+    return 0;
+  }
+  const uint64_t target =
+      (stats.sampleCount / 100) * percentile +
+      ((stats.sampleCount % 100) * percentile + 99) / 100;
+  uint64_t cumulative = 0;
+  for (size_t index = 0;
+       index < MemoryPool::kLatencyHistogramBucketCount + 1; ++index) {
+    cumulative += stats.bucketCounts[index];
+    if (cumulative >= target) {
+      return index < MemoryPool::kLatencyHistogramBucketCount
+                 ? stats.upperBoundsNanoseconds[index]
+                 : stats.maxNanoseconds;
+    }
+  }
+  return stats.maxNanoseconds;
+}
+
+void PublishTelemetrySnapshot() noexcept {
+  using namespace StormBreaker;
+
+  if (!g_telemetryStarted.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  Telemetry::RuntimeSnapshot runtime{};
+  runtime.hooksInstalled = g_hooksInstalled.load(std::memory_order_acquire);
+  runtime.memoryBackend = GetTelemetryBackend();
+  Telemetry::UpdateRuntime(runtime);
+
+  const StormHook::RuntimeStats hookStats = StormHook::GetRuntimeStats();
+  Telemetry::HookSnapshot hook{};
+  hook.allocCalls = hookStats.allocCalls;
+  hook.freeCalls = hookStats.freeCalls;
+  hook.reallocCalls = hookStats.reallocCalls;
+  hook.getSizeCalls = hookStats.getSizeCalls;
+  hook.cleanupCalls = hookStats.cleanupCalls;
+  hook.resetCalls = hookStats.resetCalls;
+  hook.bypassCalls = hookStats.bypassCalls;
+  hook.failures = hookStats.failures;
+  Telemetry::UpdateHook(hook);
+
+  Telemetry::BackendSnapshot backend{};
+  backend.managedAllocations = hookStats.managedAllocations;
+  backend.managedFrees = hookStats.managedFrees;
+  backend.nativeAllocations = hookStats.nativeAllocations;
+  backend.nativeFrees = hookStats.nativeFrees;
+  backend.managedBytes = StormHook::GetTotalManagedSize();
+  backend.nativeBytes = hookStats.nativeAllocatedBytes;
+  backend.fallbackAllocations = hookStats.fallbackAllocations;
+  backend.failures = hookStats.failures;
+  Telemetry::UpdateBackend(backend);
+
+  const MemoryPool::ExtendedPoolStats poolStats =
+      MemoryPool::GetExtendedStats();
+  Telemetry::PoolSnapshot pool{};
+  pool.requestedLiveBytes = poolStats.requestedLiveBytes;
+  pool.usableLiveBytes = poolStats.usableLiveBytes;
+  pool.reservedBytes = poolStats.reservedBytes;
+  pool.committedBytes = poolStats.committedBytes;
+  pool.peakRequestedLiveBytes = poolStats.peakRequestedLiveBytes;
+  pool.peakUsableLiveBytes = poolStats.peakUsableLiveBytes;
+  pool.peakReservedBytes = poolStats.peakReservedBytes;
+  pool.peakCommittedBytes = poolStats.peakCommittedBytes;
+  pool.requestedLiveBudgetBytes = poolStats.requestedLiveBudgetBytes;
+  pool.allocationCount = poolStats.allocCount;
+  pool.freeCount = poolStats.freeCount;
+  pool.reallocCount = poolStats.reallocCount;
+  pool.failureCount = poolStats.failureCount;
+  pool.extendCount = poolStats.extendCount;
+  pool.trimCount = poolStats.trimCount;
+  pool.lockWaitCount = poolStats.lockWaitCount;
+  pool.lockWaitNanoseconds = poolStats.lockWaitNanoseconds;
+  pool.maxLockWaitNanoseconds = poolStats.maxLockWaitNanoseconds;
+  Telemetry::UpdatePool(pool);
+
+  Telemetry::LatencySnapshot latency{};
+  latency.sampleCount = poolStats.operationLatency.sampleCount;
+  latency.totalNanoseconds = poolStats.operationLatency.totalNanoseconds;
+  latency.maxNanoseconds = poolStats.operationLatency.maxNanoseconds;
+  latency.p50Nanoseconds =
+      HistogramPercentile(poolStats.operationLatency, 50);
+  latency.p95Nanoseconds =
+      HistogramPercentile(poolStats.operationLatency, 95);
+  latency.p99Nanoseconds =
+      HistogramPercentile(poolStats.operationLatency, 99);
+  latency.allocateP99Nanoseconds =
+      HistogramPercentile(poolStats.allocateLatency, 99);
+  latency.freeP99Nanoseconds =
+      HistogramPercentile(poolStats.freeLatency, 99);
+  latency.reallocateP99Nanoseconds =
+      HistogramPercentile(poolStats.reallocateLatency, 99);
+  latency.copyP99Nanoseconds =
+      HistogramPercentile(poolStats.copyLatency, 99);
+  latency.growthP99Nanoseconds =
+      HistogramPercentile(poolStats.growthLatency, 99);
+  latency.lockWaitP99Nanoseconds =
+      HistogramPercentile(poolStats.lockWaitLatency, 99);
+  Telemetry::UpdateLatency(latency);
+
+  const LeakProfiler::HealthSnapshot health =
+      LeakProfiler::GetHealthSnapshot();
+  Telemetry::ProfilerHealthSnapshot profiler{};
+  profiler.eventsEnqueued = health.eventsEnqueued;
+  profiler.eventsWritten = health.eventsWritten;
+  profiler.dropped = health.dropped;
+  profiler.recursionSkips = health.recursionSkips;
+  profiler.writeErrors = health.writeErrors;
+  profiler.managedEvents = health.managedEvents;
+  profiler.nativeEvents = health.nativeEvents;
+  profiler.fallbackEvents = health.fallbackEvents;
+  profiler.degradedEvents = health.degradedEvents;
+  profiler.queueCapacity = health.queueCapacity;
+  profiler.queueDepth = health.queueDepth;
+  profiler.mode = static_cast<uint8_t>(health.mode);
+  profiler.incomplete = health.incomplete;
+  profiler.writerRunning = health.writerRunning;
+  Telemetry::UpdateProfilerHealth(profiler);
+
+  const LeakProfiler::TakeoverSnapshot takeover =
+      StormTakeover::GetTelemetrySnapshot();
+  LeakProfiler::UpdateTakeoverSnapshot(takeover);
+  Telemetry::UpdateTakeover(takeover);
+}
+
+DWORD ControlPanelIntervalMilliseconds() noexcept {
+  constexpr DWORD kDefaultSeconds = 60;
+  char value[16]{};
+  const DWORD length = GetEnvironmentVariableA(
+      "STORMBREAKER_STATUS_INTERVAL_SEC", value,
+      static_cast<DWORD>(sizeof(value)));
+  if (length == 0 || length >= sizeof(value)) {
+    return kDefaultSeconds * 1000;
+  }
+
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 5 || parsed > 3600) {
+    return kDefaultSeconds * 1000;
+  }
+  return static_cast<DWORD>(parsed * 1000);
+}
+
+void EmitControlPanelStatus() noexcept {
+  const bool ready = g_systemInitialized.load(std::memory_order_acquire);
+  const bool hooks = g_hooksInstalled.load(std::memory_order_acquire);
+  const MemoryPool::ExtendedPoolStats pool = MemoryPool::GetExtendedStats();
+  const StormHook::RuntimeStats hook = StormHook::GetRuntimeStats();
+  const StormTakeover::RuntimeStats takeover =
+      StormTakeover::GetRuntimeStats();
+  const unsigned long long liveBlocks = static_cast<unsigned long long>(
+      takeover.liveBlocks);
+  const unsigned long long liveMiB = static_cast<unsigned long long>(
+      takeover.liveRequestedBytes / (1024u * 1024u));
+  const unsigned long long requestedMiB = static_cast<unsigned long long>(
+      pool.requestedLiveBytes / (1024u * 1024u));
+  const unsigned long long reservedMiB = static_cast<unsigned long long>(
+      pool.reservedBytes / (1024u * 1024u));
+  const unsigned long long committedMiB = static_cast<unsigned long long>(
+      pool.committedBytes / (1024u * 1024u));
+  const unsigned long long failures = static_cast<unsigned long long>(
+      takeover.failures);
+  const unsigned long long rejected = static_cast<unsigned long long>(
+      takeover.rejectedPointers);
+  const unsigned long long degraded = static_cast<unsigned long long>(
+      takeover.degradedCalls);
+  const unsigned long long fallback = static_cast<unsigned long long>(
+      takeover.fallbackCalls);
+  const unsigned long long blockEnumCalls = static_cast<unsigned long long>(
+      takeover.blockEnumerationCalls);
+  const unsigned long long blockEnumBuilds = static_cast<unsigned long long>(
+      takeover.blockEnumerationSnapshotBuilds);
+  const unsigned long long heapEnumCalls = static_cast<unsigned long long>(
+      takeover.heapEnumerationCalls);
+  const unsigned long long heapEnumRebuilds = static_cast<unsigned long long>(
+      takeover.heapEnumerationRebuilds);
+  const unsigned long long destroySnapshots = static_cast<unsigned long long>(
+      takeover.heapDestroySnapshots);
+  const unsigned long long destroyBlocks = static_cast<unsigned long long>(
+      takeover.heapDestroySnapshotBlocks);
+  const unsigned long long callerCacheHits = static_cast<unsigned long long>(
+      takeover.callerHeapCacheHits);
+  const unsigned long long callerCacheMisses = static_cast<unsigned long long>(
+      takeover.callerHeapCacheMisses);
+  const unsigned long long callerCacheBypasses =
+      static_cast<unsigned long long>(takeover.callerHeapCacheBypasses);
+  const unsigned long long callerCacheSaturated =
+      static_cast<unsigned long long>(takeover.callerHeapCacheSaturated);
+  const unsigned long long heapIdHintHits =
+      static_cast<unsigned long long>(takeover.heapIdSlotHintHits);
+  const unsigned long long heapIdHintMisses =
+      static_cast<unsigned long long>(takeover.heapIdSlotHintMisses);
+  const unsigned int callerCacheEntries = takeover.callerHeapCacheEntries;
+  const char *backend = MemoryPool::GetBackendName();
+  const char *buildIdentity = MemoryPool::GetBuildBackendIdentity();
+
+  Logger::GetInstance().LogInfo(
+      "[ControlPanel] ready=%s hooks=%s backend=%s build=%s mode=%s "
+      "threshold=%u liveBlocks=%llu "
+      "live=%llu MiB requested=%llu MiB reserved=%llu MiB committed=%llu MiB "
+      "failures=%llu rejected=%llu fallback=%llu degraded=%llu "
+      "last=%s/ord%u/heap%08X/flags%08X/size%u/route:%s "
+      "callerHash=%s "
+      "blockEnum=%llu/%llu heapEnum=%llu/%llu destroySnapshots=%llu/%llu "
+      "callerCache=%llu/%llu/%llu/%llu entries=%u heapIdHint=%llu/%llu",
+      ready ? "yes" : "no", hooks ? "yes" : "no", backend, buildIdentity,
+      StormTakeover::ModeName(takeover.mode), takeover.threshold, liveBlocks,
+      liveMiB, requestedMiB, reservedMiB, committedMiB, failures, rejected,
+      fallback, degraded,
+      StormTakeover::DegradedReasonName(takeover.lastDegradedReason),
+      static_cast<unsigned>(takeover.lastOrdinal), takeover.lastHeapId,
+      takeover.lastStormFlags, takeover.lastRequestedSize,
+      StormTakeover::RouteName(takeover.lastRoute),
+      takeover.directCallerHash ? "direct-verified" : "native-trampoline",
+      blockEnumCalls, blockEnumBuilds, heapEnumCalls,
+      heapEnumRebuilds, destroySnapshots, destroyBlocks, callerCacheHits,
+      callerCacheMisses, callerCacheBypasses, callerCacheSaturated,
+      callerCacheEntries, heapIdHintHits, heapIdHintMisses);
+  Logger::GetInstance().FlushLogs();
+
+  if (GetConsoleWindow() != nullptr) {
+    char title[128]{};
+    std::snprintf(title, sizeof(title),
+                  "StormBreaker Control Panel - %s - %s", backend,
+                  hooks ? "HOOKED" : "NOT HOOKED");
+    SetConsoleTitleA(title);
+    std::printf(
+        "\n[StormBreaker Control Panel] READY=%s HOOKS=%s BACKEND=%s\n"
+        "  build identity=%s, takeover=%s, threshold=%u\n"
+        "  live blocks=%llu, live=%llu MiB, requested=%llu MiB\n"
+        "  reserved=%llu MiB, committed=%llu MiB\n"
+        "  failures=%llu, rejected=%llu, fallback=%llu, degraded=%llu\n"
+        "  last reason=%s, ordinal=%u, heap=%08X, flags=%08X, size=%u, "
+        "route=%s\n"
+        "  caller hash=%s\n"
+        "  block enumeration calls=%llu, snapshot builds=%llu\n"
+        "  heap enumeration calls=%llu, snapshot rebuilds=%llu\n"
+        "  heap destroy snapshots=%llu, blocks collected=%llu\n"
+        "  caller heap cache hits=%llu, misses=%llu, bypasses=%llu, "
+        "saturated=%llu, entries=%u\n"
+        "  next refresh in %lu seconds\n",
+        ready ? "YES" : "NO", hooks ? "YES" : "NO", backend, buildIdentity,
+        StormTakeover::ModeName(takeover.mode), takeover.threshold, liveBlocks,
+        liveMiB, requestedMiB, reservedMiB, committedMiB, failures, rejected,
+        fallback, degraded,
+        StormTakeover::DegradedReasonName(takeover.lastDegradedReason),
+        static_cast<unsigned>(takeover.lastOrdinal), takeover.lastHeapId,
+        takeover.lastStormFlags, takeover.lastRequestedSize,
+        StormTakeover::RouteName(takeover.lastRoute),
+        takeover.directCallerHash ? "direct-verified" : "native-trampoline",
+        blockEnumCalls, blockEnumBuilds, heapEnumCalls,
+        heapEnumRebuilds, destroySnapshots, destroyBlocks, callerCacheHits,
+        callerCacheMisses, callerCacheBypasses, callerCacheSaturated,
+        callerCacheEntries,
+        ControlPanelIntervalMilliseconds() / 1000);
+    std::fflush(stdout);
+  }
+}
+
+DWORD WINAPI ControlPanelThreadMain(LPVOID) {
+  EmitControlPanelStatus();
+  const DWORD interval = ControlPanelIntervalMilliseconds();
+  while (WaitForSingleObject(g_controlPanelStopEvent, interval) ==
+         WAIT_TIMEOUT) {
+    EmitControlPanelStatus();
+  }
+  return 0;
+}
+
+bool StartControlPanel() {
+  if (!ShouldEnableControlPanel() || g_controlPanelThread != nullptr) {
+    return true;
+  }
+  g_controlPanelStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!g_controlPanelStopEvent) {
+    return false;
+  }
+  g_controlPanelThread =
+      CreateThread(nullptr, 0, ControlPanelThreadMain, nullptr, 0, nullptr);
+  if (!g_controlPanelThread) {
+    CloseHandle(g_controlPanelStopEvent);
+    g_controlPanelStopEvent = nullptr;
+    return false;
+  }
+  return true;
+}
+
+bool StopControlPanel() {
+  if (!g_controlPanelThread) {
+    return true;
+  }
+  SetEvent(g_controlPanelStopEvent);
+  if (WaitForSingleObject(g_controlPanelThread, 5000) != WAIT_OBJECT_0) {
+    return false;
+  }
+  CloseHandle(g_controlPanelThread);
+  CloseHandle(g_controlPanelStopEvent);
+  g_controlPanelThread = nullptr;
+  g_controlPanelStopEvent = nullptr;
+  return true;
+}
 } // namespace
 
 // 工作线程函数 - 在Loader Lock外执行所有重活
@@ -107,12 +484,19 @@ static DWORD WINAPI StormBreakerWorkerThread(LPVOID) {
   // }
 
   // 第三步：启动内存监控
-  if (!StartMemoryMonitoring()) {
+  if (ShouldEnableMemoryMonitor() && !StartMemoryMonitoring()) {
     Logger::GetInstance().LogWarning("内存监控启动失败，但系统可继续运行");
+  } else if (!ShouldEnableMemoryMonitor()) {
+    Logger::GetInstance().LogInfo(
+        "内存监控线程默认关闭，可用 STORMBREAKER_MEMORY_MONITOR=1 启用");
   }
 
   g_systemInitialized.store(true, std::memory_order_release);
   Logger::GetInstance().LogInfo("StormBreaker系统异步初始化完成");
+  if (!StartControlPanel()) {
+    Logger::GetInstance().LogWarning(
+        "控制面板线程启动失败；文件日志仍可用于确认加载状态");
+  }
 
   return 0;
 }
@@ -134,18 +518,28 @@ bool InitializeStormBreaker() {
     return false;
   }
 
+  const bool verbose = ShouldEnableVerboseLogs();
+  const bool enableMemorySafety = verbose || ShouldEnableMemorySafety();
+  const bool enableTelemetry = ShouldEnableTelemetry();
+
   // 初始化日志系统（如果尚未初始化）
   if (!Logger::GetInstance().IsInitialized()) {
     const bool enableConsole = ShouldCreateDebugConsole();
-    const bool verbose = ShouldEnableVerboseLogs() || enableConsole;
     if (enableConsole) {
       CreateConsole();
     }
 
     LoggerConfig config =
-        verbose ? Logger::GetDebugConfig() : Logger::GetDefaultConfig();
+        verbose ? Logger::GetDebugConfig() : Logger::GetReleaseConfig();
     config.enableConsole = enableConsole;
     config.flushImmediate = verbose;
+    const DWORD artifactLength = GetEnvironmentVariableA(
+        "STORMBREAKER_ARTIFACT_DIR", g_artifactLogDirectory,
+        static_cast<DWORD>(sizeof(g_artifactLogDirectory)));
+    if (artifactLength > 0 &&
+        artifactLength < sizeof(g_artifactLogDirectory)) {
+      config.logDirectory = g_artifactLogDirectory;
+    }
     if (!Logger::GetInstance().Initialize(config)) {
       return false;
     }
@@ -156,24 +550,82 @@ bool InitializeStormBreaker() {
   bool stormOk = InitializeStormOffsets();
   Logger::GetInstance().LogInfo("Storm偏移初始化: %s",
                                 stormOk ? "成功" : "失败");
+  if (!stormOk) {
+    Logger::GetInstance().LogError(
+        "当前 Storm.dll 不是已验证的 Warcraft III 1.27a，拒绝初始化内存接管");
+    return false;
+  }
 
   // 初始化内存池
+  MemoryPool::SetLatencyTrackingEnabled(enableTelemetry);
   if (!MemoryPool::Initialize()) {
     Logger::GetInstance().LogError("内存池初始化失败");
     return false;
   }
 
-  // 初始化内存安全系统
-  if (!MemorySafety::GetInstance().Initialize()) {
+  // 完整块跟踪会在每次分配/释放时维护哈希表，仅在显式诊断模式启用。
+  MemorySafetyConfig safetyConfig = MemorySafety::GetDefaultConfig();
+  if (!enableMemorySafety) {
+    safetyConfig.enableTracking = false;
+    safetyConfig.enableValidation = false;
+    safetyConfig.enableDeferredFree = false;
+    safetyConfig.enableLeakDetection = false;
+    safetyConfig.enableCorruptionDetection = false;
+  }
+
+  if (!MemorySafety::GetInstance().Initialize(safetyConfig)) {
     Logger::GetInstance().LogError("内存安全系统初始化失败");
+    MemoryPool::Shutdown();
     return false;
   }
 
   // 初始化StormHook系统
+  StormHook::SetRuntimeStatsEnabled(enableTelemetry);
   if (!StormHook::Initialize()) {
     Logger::GetInstance().LogError("StormHook系统初始化失败");
+    MemorySafety::GetInstance().Shutdown();
+    MemoryPool::Shutdown();
     return false;
   }
+
+  if (!StormTakeover::Initialize()) {
+    Logger::GetInstance().LogError("Storm全导出接管层初始化失败");
+    StormHook::Shutdown();
+    MemorySafety::GetInstance().Shutdown();
+    MemoryPool::Shutdown();
+    return false;
+  }
+
+  if (!StormBreaker::LeakProfiler::StartFromEnvironment()) {
+    Logger::GetInstance().LogError("LeakProfiler初始化失败");
+    StormTakeover::Shutdown();
+    StormHook::Shutdown();
+    MemorySafety::GetInstance().Shutdown();
+    MemoryPool::Shutdown();
+    return false;
+  }
+  if (enableTelemetry) {
+    StormBreaker::Telemetry::SetSnapshotProvider(&PublishTelemetrySnapshot);
+    if (!StormBreaker::Telemetry::Start()) {
+      Logger::GetInstance().LogError("遥测输出初始化失败");
+      StormBreaker::Telemetry::SetSnapshotProvider(nullptr);
+      StormBreaker::LeakProfiler::Stop();
+      StormTakeover::Shutdown();
+      StormHook::Shutdown();
+      MemorySafety::GetInstance().Shutdown();
+      MemoryPool::Shutdown();
+      return false;
+    }
+    g_telemetryStarted.store(true, std::memory_order_release);
+    PublishTelemetrySnapshot();
+  } else {
+    Logger::GetInstance().LogInfo(
+        "metrics 与详细延迟统计默认关闭，可用 STORMBREAKER_TELEMETRY=1 启用");
+  }
+  Logger::GetInstance().LogInfo(
+      "LeakProfiler模式: %s",
+      StormBreaker::LeakProfiler::ModeName(
+          StormBreaker::LeakProfiler::GetMode()));
 
   Logger::GetInstance().LogInfo("StormBreaker基础系统初始化完成");
   return true;
@@ -182,16 +634,59 @@ bool InitializeStormBreaker() {
 void ShutdownStormBreaker() {
   Logger::GetInstance().LogInfo("关闭StormBreaker系统...");
 
-  // 停止内存监控
-  StopMemoryMonitoring();
+  const size_t liveManagedBlocks = static_cast<size_t>(
+      StormTakeover::GetRuntimeStats().liveBlocks);
+  const uint64_t livePoolBytes =
+      MemoryPool::GetExtendedStats().requestedLiveBytes;
+  if (g_hooksInstalled.load(std::memory_order_acquire) &&
+      (liveManagedBlocks != 0 || livePoolBytes != 0)) {
+    Logger::GetInstance().LogWarning(
+        "拒绝关闭：仍有 %zu 个托管块、%llu 字节池内存，必须保持 Hook 与后端存活",
+        liveManagedBlocks,
+        static_cast<unsigned long long>(livePoolBytes));
+    return;
+  }
 
   // 卸载Hook
   if (g_hooksInstalled.load(std::memory_order_acquire)) {
-    UninstallStormHooks();
-    g_hooksInstalled.store(false, std::memory_order_release);
+    if (!UninstallStormHooks()) {
+      Logger::GetInstance().LogError(
+          "拒绝关闭：Detours 未完整卸载，保留 Hook 与内存池");
+      return;
+    }
   }
 
+  if (!StopControlPanel()) {
+    Logger::GetInstance().LogError(
+        "拒绝继续关闭：控制面板线程仍可能读取 Hook 与内存池");
+    return;
+  }
+
+  // 停止内存监控
+  if (!StopMemoryMonitoring()) {
+    Logger::GetInstance().LogError(
+        "拒绝继续关闭：内存监控线程仍可能访问后端");
+    return;
+  }
+
+  if (g_telemetryStarted.load(std::memory_order_acquire)) {
+    PublishTelemetrySnapshot();
+    if (!StormBreaker::Telemetry::Stop()) {
+      Logger::GetInstance().LogError(
+          "拒绝继续关闭：遥测线程仍可能访问后端");
+      return;
+    }
+    g_telemetryStarted.store(false, std::memory_order_release);
+    StormBreaker::Telemetry::SetSnapshotProvider(nullptr);
+  }
+  StormBreaker::LeakProfiler::Stop();
+
   // 关闭各个子系统
+  if (!StormTakeover::Shutdown()) {
+    Logger::GetInstance().LogError(
+        "拒绝继续关闭：全导出接管层仍有存活块或Hook");
+    return;
+  }
   StormHook::Shutdown();
   MemorySafety::GetInstance().Shutdown();
   MemoryPool::Shutdown();
@@ -211,6 +706,21 @@ void ShutdownStormBreaker() {
 
 bool InstallStormHooks() {
   Logger::GetInstance().LogInfo("安装Storm Hook...");
+
+  if (g_hooksInstalled.load(std::memory_order_acquire)) {
+    return true;
+  }
+  HMODULE verifiedStorm = GetModuleHandleA("Storm.dll");
+  if (!verifiedStorm || !StormTakeover::Install(verifiedStorm)) {
+    Logger::GetInstance().LogError(
+        "全导出Storm Hook安装失败；保持原生Storm不变");
+    return false;
+  }
+  g_hooksInstalled.store(true, std::memory_order_release);
+  PublishTelemetrySnapshot();
+  return true;
+
+#if 0 // Retained only as a source-level reference for the legacy large hook.
 
   if (g_hooksInstalled.load(std::memory_order_acquire)) {
     Logger::GetInstance().LogInfo("Storm Hook已安装，跳过重复安装");
@@ -259,27 +769,65 @@ bool InstallStormHooks() {
   g_origCleanupAll = reinterpret_cast<StormHeap_CleanupAll_t>(pCleanup);
   g_origResetMemoryManager = reinterpret_cast<ResetMemoryManager_t>(pReset);
 
+  if (!g_origStormAlloc || !g_origStormFree || !g_origStormReAlloc) {
+    Logger::GetInstance().LogError(
+        "缺少必须的 SMemAlloc/SMemFree/SMemReAlloc 地址，拒绝安装 Hook");
+    return false;
+  }
+
   // 使用Detours安装Hook
-  DetourTransactionBegin();
-  DetourUpdateThread(GetCurrentThread());
+  LONG result = DetourTransactionBegin();
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError("DetourTransactionBegin失败: %ld", result);
+    return false;
+  }
+
+  result = DetourUpdateThread(GetCurrentThread());
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError("DetourUpdateThread失败: %ld", result);
+    DetourTransactionAbort();
+    return false;
+  }
+
+  auto attach = [&](PVOID *target, PVOID hook, const char *name) -> bool {
+    const LONG attachResult = DetourAttach(target, hook);
+    if (attachResult != NO_ERROR) {
+      Logger::GetInstance().LogError("DetourAttach(%s)失败: %ld", name,
+                                     attachResult);
+      return false;
+    }
+    return true;
+  };
 
   // Hook主要的内存函数
-  DetourAttach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
-               Hooked_Storm_MemAlloc);
-  DetourAttach(&reinterpret_cast<PVOID &>(g_origStormFree),
-               Hooked_Storm_MemFree);
-  DetourAttach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
-               Hooked_Storm_MemReAlloc);
+  if (!attach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
+              reinterpret_cast<PVOID>(Hooked_Storm_MemAlloc), "SMemAlloc") ||
+      !attach(&reinterpret_cast<PVOID &>(g_origStormFree),
+              reinterpret_cast<PVOID>(Hooked_Storm_MemFree), "SMemFree") ||
+      !attach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
+              reinterpret_cast<PVOID>(Hooked_Storm_MemReAlloc),
+              "SMemReAlloc")) {
+    DetourTransactionAbort();
+    return false;
+  }
   if (g_origStormGetSize) {
-    DetourAttach(&reinterpret_cast<PVOID &>(g_origStormGetSize),
-                 Hooked_Storm_MemGetSize);
+    if (!attach(&reinterpret_cast<PVOID &>(g_origStormGetSize),
+                reinterpret_cast<PVOID>(Hooked_Storm_MemGetSize),
+                "SMemGetSize")) {
+      DetourTransactionAbort();
+      return false;
+    }
   } else {
     Logger::GetInstance().LogWarning(
         "未能定位 SMemGetSize，相关兼容功能将被禁用");
   }
   if (g_origResetMemoryManager) {
-    DetourAttach(&reinterpret_cast<PVOID &>(g_origResetMemoryManager),
-                 Hooked_ResetMemoryManager);
+    if (!attach(&reinterpret_cast<PVOID &>(g_origResetMemoryManager),
+                reinterpret_cast<PVOID>(Hooked_ResetMemoryManager),
+                "ResetMemoryManager")) {
+      DetourTransactionAbort();
+      return false;
+    }
   } else {
     Logger::GetInstance().LogWarning(
         "未能定位 ResetMemoryManager，Reset 协同功能暂不可用");
@@ -287,11 +835,15 @@ bool InstallStormHooks() {
 
   // Hook清理函数（如果找到的话）
   if (g_origCleanupAll) {
-    DetourAttach(&reinterpret_cast<PVOID &>(g_origCleanupAll),
-                 Hooked_StormHeap_CleanupAll);
+    if (!attach(&reinterpret_cast<PVOID &>(g_origCleanupAll),
+                reinterpret_cast<PVOID>(Hooked_StormHeap_CleanupAll),
+                "SMemHeapCleanupAll")) {
+      DetourTransactionAbort();
+      return false;
+    }
   }
 
-  LONG result = DetourTransactionCommit();
+  result = DetourTransactionCommit();
   if (result != NO_ERROR) {
     Logger::GetInstance().LogError("Detours事务提交失败: %ld", result);
     return false;
@@ -299,50 +851,112 @@ bool InstallStormHooks() {
 
   Logger::GetInstance().LogInfo("Storm Hook安装成功");
   g_hooksInstalled.store(true, std::memory_order_release);
+  PublishTelemetrySnapshot();
   return true;
+#endif
 }
 
-void UninstallStormHooks() {
+bool UninstallStormHooks() {
   if (!g_hooksInstalled.load(std::memory_order_acquire)) {
-    return;
+    return true;
+  }
+  if (!StormTakeover::Uninstall()) {
+    Logger::GetInstance().LogError(
+        "全导出Detours未完整卸载；保留trampoline、Hook和内存池");
+    return false;
+  }
+  g_hooksInstalled.store(false, std::memory_order_release);
+  PublishTelemetrySnapshot();
+  return true;
+
+#if 0 // Retained only as a source-level reference for the legacy large hook.
+  if (!g_hooksInstalled.load(std::memory_order_acquire)) {
+    return true;
   }
 
   Logger::GetInstance().LogInfo("卸载Storm Hook...");
 
-  DetourTransactionBegin();
-  DetourUpdateThread(GetCurrentThread());
+  LONG result = DetourTransactionBegin();
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogWarning("DetourTransactionBegin(卸载)失败: %ld",
+                                     result);
+    return false;
+  }
+
+  result = DetourUpdateThread(GetCurrentThread());
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogWarning("DetourUpdateThread(卸载)失败: %ld",
+                                     result);
+    DetourTransactionAbort();
+    return false;
+  }
+
+  auto detach = [&](PVOID *target, PVOID hook, const char *name) -> bool {
+    const LONG detachResult = DetourDetach(target, hook);
+    if (detachResult != NO_ERROR) {
+      Logger::GetInstance().LogWarning("DetourDetach(%s)失败: %ld", name,
+                                       detachResult);
+      return false;
+    }
+    return true;
+  };
 
   if (g_origStormAlloc) {
-    DetourDetach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
-                 Hooked_Storm_MemAlloc);
+    if (!detach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
+                reinterpret_cast<PVOID>(Hooked_Storm_MemAlloc), "SMemAlloc")) {
+      DetourTransactionAbort();
+      return false;
+    }
   }
   if (g_origStormFree) {
-    DetourDetach(&reinterpret_cast<PVOID &>(g_origStormFree),
-                 Hooked_Storm_MemFree);
+    if (!detach(&reinterpret_cast<PVOID &>(g_origStormFree),
+                reinterpret_cast<PVOID>(Hooked_Storm_MemFree), "SMemFree")) {
+      DetourTransactionAbort();
+      return false;
+    }
   }
   if (g_origStormReAlloc) {
-    DetourDetach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
-                 Hooked_Storm_MemReAlloc);
+    if (!detach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
+                reinterpret_cast<PVOID>(Hooked_Storm_MemReAlloc),
+                "SMemReAlloc")) {
+      DetourTransactionAbort();
+      return false;
+    }
   }
   if (g_origStormGetSize) {
-    DetourDetach(&reinterpret_cast<PVOID &>(g_origStormGetSize),
-                 Hooked_Storm_MemGetSize);
+    if (!detach(&reinterpret_cast<PVOID &>(g_origStormGetSize),
+                reinterpret_cast<PVOID>(Hooked_Storm_MemGetSize),
+                "SMemGetSize")) {
+      DetourTransactionAbort();
+      return false;
+    }
   }
   if (g_origResetMemoryManager) {
-    DetourDetach(&reinterpret_cast<PVOID &>(g_origResetMemoryManager),
-                 Hooked_ResetMemoryManager);
+    if (!detach(&reinterpret_cast<PVOID &>(g_origResetMemoryManager),
+                reinterpret_cast<PVOID>(Hooked_ResetMemoryManager),
+                "ResetMemoryManager")) {
+      DetourTransactionAbort();
+      return false;
+    }
   }
   if (g_origCleanupAll) {
-    DetourDetach(&reinterpret_cast<PVOID &>(g_origCleanupAll),
-                 Hooked_StormHeap_CleanupAll);
+    if (!detach(&reinterpret_cast<PVOID &>(g_origCleanupAll),
+                reinterpret_cast<PVOID>(Hooked_StormHeap_CleanupAll),
+                "SMemHeapCleanupAll")) {
+      DetourTransactionAbort();
+      return false;
+    }
   }
 
-  LONG result = DetourTransactionCommit();
+  result = DetourTransactionCommit();
   if (result != NO_ERROR) {
     Logger::GetInstance().LogWarning("Detours卸载失败: %ld", result);
-  } else {
-    Logger::GetInstance().LogInfo("Storm Hook卸载成功");
+    return false;
   }
+
+  Logger::GetInstance().LogInfo("Storm Hook卸载成功");
+  g_hooksInstalled.store(false, std::memory_order_release);
+  PublishTelemetrySnapshot();
 
   // 清空函数指针
   g_origStormAlloc = nullptr;
@@ -351,12 +965,16 @@ void UninstallStormHooks() {
   g_origStormGetSize = nullptr;
   g_origCleanupAll = nullptr;
   g_origResetMemoryManager = nullptr;
+  return true;
+#endif
 }
 
 // ======================== 内存监控启动/停止 ========================
 
 namespace {
-static MemoryMonitor g_memoryMonitor;
+// Avoid a MemoryMonitor destructor running from CRT process detach under the
+// loader lock. It is deleted only by the explicit clean shutdown path.
+static MemoryMonitor *g_memoryMonitor = nullptr;
 static std::atomic<DWORD> g_lastStatsTime{0};
 } // namespace
 
@@ -364,7 +982,14 @@ bool StartMemoryMonitoring() {
   Logger::GetInstance().LogInfo("启动内存监控...");
 
   try {
-    g_memoryMonitor.StartMonitoring(5000); // 5秒间隔
+    if (!g_memoryMonitor) {
+      g_memoryMonitor = new (std::nothrow) MemoryMonitor();
+    }
+    if (!g_memoryMonitor) {
+      Logger::GetInstance().LogWarning("内存监控器分配失败");
+      return false;
+    }
+    g_memoryMonitor->StartMonitoring(5000); // 5秒间隔
     Logger::GetInstance().LogInfo("内存监控启动成功");
     return true;
   } catch (const std::exception &e) {
@@ -376,14 +1001,22 @@ bool StartMemoryMonitoring() {
   }
 }
 
-void StopMemoryMonitoring() {
+bool StopMemoryMonitoring() {
   Logger::GetInstance().LogInfo("停止内存监控...");
 
   try {
-    g_memoryMonitor.StopMonitoring();
+    if (g_memoryMonitor) {
+      if (!g_memoryMonitor->StopMonitoring()) {
+        return false;
+      }
+      delete g_memoryMonitor;
+      g_memoryMonitor = nullptr;
+    }
     Logger::GetInstance().LogInfo("内存监控已停止");
+    return true;
   } catch (...) {
     Logger::GetInstance().LogWarning("停止内存监控时发生异常");
+    return false;
   }
 }
 
@@ -394,6 +1027,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
   case DLL_PROCESS_ATTACH: {
     // 在Loader Lock下只做最基本的操作
     DisableThreadLibraryCalls(hModule);
+    if (!PinModuleUntilProcessExit()) {
+      return FALSE;
+    }
 
     // 立即启动工作线程处理所有复杂初始化
     g_initThread = CreateThread(nullptr,                  // 默认安全属性
@@ -418,18 +1054,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
   }
 
   case DLL_PROCESS_DETACH: {
-    // 等待初始化完成（如果还在进行中）
-    if (!g_systemInitialized.load(std::memory_order_acquire)) {
-      // 给一个合理的等待时间
-      for (int i = 0;
-           i < 50 && !g_systemInitialized.load(std::memory_order_acquire);
-           ++i) {
-        Sleep(100);
-      }
-    }
-
-    // 执行清理
-    ShutdownStormBreaker();
+    OutputDebugStringA(
+        lpReserved != nullptr
+            ? "StormBreaker: process exit; hooks and pools left for OS reclaim\n"
+            : "StormBreaker: unexpected explicit detach; no teardown under loader lock\n");
     break;
   }
 

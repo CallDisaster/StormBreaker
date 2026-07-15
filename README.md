@@ -1,183 +1,185 @@
 # StormBreaker
 
-StormBreaker 是一个面向 `Warcraft III 1.27a` 的 `Storm.dll` 内存兼容与优化插件。项目通过 Hook `SMemAlloc / SMemFree / SMemReAlloc / SMemGetSize` 等接口，将 `64 KiB` 以上的大块分配转移到 `TLSF` 内存池，同时保留 Storm 原生的小块分配路径，并在 `ResetMemoryManager` 和 `SMemHeapCleanupAll` 场景下提供兼容处理、日志与监控能力。
+StormBreaker 是面向 Warcraft III 1.27a x86 的 Storm 内存 API 兼容与优化插件。它具备在 Storm 导出边界接管 ordinals `401/403/404/405/406/481-490/496` 的能力，保留原生 Storm 数据结构不变，并支持 TLSF、mimalloc v3.3.2 与 hybrid 后端。
 
-它的目标不是重写整个 Storm 内存系统，而是在尽量保持原有行为的前提下，降低旧版 Storm 内存统计持续增长带来的稳定性风险。
+当前生产安全默认值仍是 `large/tlsf`：只托管 `>= 0xFE7C` 的请求。`full/hybrid` 已完成实现和离线测试，但必须通过真实地图与 WorldEdit 的内存、延迟和 32 位地址空间门槛后才能晋级为默认。
 
-## 设计目标
+## 版本门禁
 
-- 保留 Storm 原生小块分配行为，避免直接重写内部堆结构。
-- 仅拦截大块分配，减少对 `Storm_g_TotalAllocatedMemory` 的持续压力。
-- 在释放、重分配和取大小等调用上保持兼容行为。
-- 在 `ResetMemoryManager` 和 `SMemHeapCleanupAll` 场景下尽量安全退让。
-- 提供日志、监控与基础内存安全检查能力，便于排查问题。
+安装任何内存 Hook 前会同时校验 PE32/x86、SHA-256、导出 RVA 和 relocation-safe 函数前导字节。未知版本会保持原生 Storm 完整运行，不进行部分安装。
 
-## About
+| 模块 | 已验证 SHA-256 |
+| --- | --- |
+| `Storm.dll` | `F8F519CFAA6275A5172A014F0ABED2212284390A33F1194677155A7D408E63EB` |
+| `Game.dll` | `E04D1716603C075EB0C8E1E21CF1093A664ADC5249EFAB396BFA08D7B09D0C3A` |
+| `WorldEdit.exe` | `5F645DB7C436ED2DE0C52712D98ACAF75E518847E6234D4CC1E5C5BEE2D76DFC` |
 
-如果你需要一条适合仓库首页、项目介绍或 GitHub About 的短文案，可以直接使用下面这版：
-
-> 面向 Warcraft III 1.27a 的 Storm.dll 内存兼容与优化插件：通过 Hook 与 TLSF 接管大块分配路径，保留原生小块行为，并改善旧版 Storm 的内存边界稳定性。
+War3 运行时要求匹配 `Storm.dll + Game.dll`；WorldEdit 运行时要求匹配 `Storm.dll + WorldEdit.exe`。
 
 ## 当前实现
 
-### 大块拦截策略
+### 全导出接管
 
-- 默认仅拦截 `>= 64 KiB` 的分配请求。
-- 小于阈值的请求直接回退到原始 Storm 分配器。
-- 大块请求进入 TLSF 内存池，默认配置如下：
-  - 初始池大小：`64 MiB`
-  - 扩展粒度：`16 MiB`
-  - 最大池大小：`1 GiB`
-  - 对齐：`16` 字节
+为保证分阶段兼容，`large` 生产档只安装 `401/403/404/405` 核心 Hook；`32k/8k/2k/256/full` 才安装完整 `401-496` 导出面。这样 large 不再改变 Game 可观察的 406/482/496 行为，也缩短 Detours 暂停其他线程的时间。
 
-### Storm 兼容层
+- `401/403/404/405`：通用 alloc/free/size/realloc，按每个指针的受保护头与后端所有权在托管和原生域之间分流。
+- `406`：在全导出档返回原生存量与托管 requested-live 的统一 32 位计数，并同步三个可选输出参数；不再暴露后端头部和 size-class 舍入差异。
+- `481/482`：枚举托管块、原生堆、托管逻辑堆和唯一后端汇总记录；原生游标顺序保持不变。
+- `483/484`：保持 Storm 的调用点 heap ID 算法，并为托管指针返回解码后的 heap ID。
+- `485-490`：支持显式 heap 的创建、分配、销毁、释放、重分配和取大小。
+- `496`：镜像 Debug Memory、Protect Memory、fill pattern 和 Realloc Shuffle 状态，同时转发原函数。
 
-当前兼容方案已经更新为“私有识别头 + Hook 兼容分流”，而不是早期的“伪造真实 Storm 堆头”方案。
+项目不 Hook Storm 内部 `StormHeap_*`，也不存在可用的 `ResetMemoryManager` 导出。历史兼容 helper 仍在源码中供旧路径单元测试使用，但正式安装事务只覆盖上述导出 API。
 
-- 每个托管块在用户指针前写入一个 `16` 字节的私有头：
-  - `magic`
-  - `requestedSize`
-  - `sizeCookie`
-  - `headerSize`
-  - `rejectTag`
-- `SMemFree` 和 `SMemReAlloc` 会先判断是否为 StormBreaker 托管块。
-- `SMemGetSize` 对托管块直接返回记录的请求大小，对非托管块回退到原始 Storm 实现。
-- 这种设计避免继续依赖真实 `StormHeap*` 指针，也降低了 Reset 后修复头部指针的复杂度。
+### 块头与 heap registry
 
-### 安全期处理
+- 小于 `0xFE7C` 的托管块使用 8 字节头，保持 Storm 普通小块相同的固定头开销。
+- 大块使用 16 字节头，记录 requested size、heap ID、route 和校验信息。
+- 进程密钥由 `BCryptGenRandom` 生成；校验绑定用户指针、大小、heap ID 和 route。
+- 后端精确验证分配起点；损坏指针或 65,536 项近期释放表命中时拒绝操作，绝不落入原生 Storm。
+- 固定 16,384 项 heap registry 记录 active/destroying/tombstone、来源、存活/峰值统计与在途引用，不在热路径扩容 STL 容器。
+- registry 条目保持 64 字节对齐并压缩为 2 MiB 固定存储；caller-derived heap ID 使用进程级 16,384 项、8 路组相联的只增缓存。命中无锁且跨线程共享，每次查找最多检查 8 项，缓存饱和只旁路到原生 483，不会退化为整表扫描。
+- 显式托管 heap 保留一个原生零尺寸 sentinel，使 Protect/OOM 兼容委托和持久块销毁行为仍有有效原生 shell。
 
-- `SMemHeapCleanupAll` 与 `ResetMemoryManager` 被 Hook 后，会进入“不安全期”。
-- 不安全期内，大块分配会回退到原始 Storm 分配路径。
-- 进入 Reset 前会：
-  - 通知 `MemorySafety` 进入不安全期
-  - 刷新延迟释放队列
-  - 尝试回收完全空闲的 TLSF 扩展池
-- Reset 完成后再退出不安全期并恢复常规处理。
+### ReAlloc 与 Storm flags
 
-### 内存池与监控
+- 零尺寸分配返回可释放的非空块；托管零尺寸 realloc 保持 Storm 语义，不按 CRT `free` 处理。
+- `0x08` 清零新块或增长尾部。
+- `0x10` 禁止移动；无法原地增长时返回空且旧块保持有效。
+- Realloc Shuffle 强制移动。
+- Storm 原生大块 realloc 总是移动；托管大块现在同样采用分配、复制、释放，仅小块允许原地扩缩。
+- Debug Memory 提供尾哨兵和填充值；fill pattern 使用 Storm 的 `0xEE/0xDD` 约定。
+- Protect Memory 委托原生 Storm 并记录 degraded reason。
+- mimalloc 使用 `mi_expand`，TLSF 支持真实原地 realloc；允许移动时才进行跨 route 分配、复制和释放。
+- 原生大块只有在确认旧块已经释放后才修正 Storm 的泄漏式计数。
 
-- TLSF 支持扩展池注册和完全空闲池回收。
-- `MemorySafety` 负责跟踪托管块、延迟释放、验证、泄漏检测与损坏检测。
-- `MemoryMonitor` 会周期性输出：
-  - 进程 `PrivateBytes / WorkingSet`
-  - TLSF 使用情况
-  - Storm 内部统计
-  - StormBreaker 当前托管块数量和托管字节数
+### 后端与生命周期
 
-### 其他功能
+- `tlsf`：默认后端，初始 64 MiB、常规 16 MiB 扩展粒度，支持池遍历、空扩展池回收与原地 realloc。扩容按 TLSF 的真实二级尺寸桶上界计算；超过常规粒度的大对象改用 64 KiB 紧配池，并只在分配失败的冷路径回收不匹配的空池。生产默认使用 Windows system 布局；`clustered` 高地址布局只保留为离线诊断选项，因为真实 Warcraft III 测试出现了无响应/崩溃。
+- `mimalloc`：专用 first-class heap，只调用显式 `mi_` API，不覆盖 CRT、全局 malloc 或 new/delete。
+- `hybrid`：小块走 mimalloc，`> 0xFE7B` 的大块走 TLSF。large 模式不会产生 mimalloc 路由，因此延迟初始化该 heap，避免额外保留约 128 MiB VA。
+- mimalloc 默认关闭分配线程上的定时自动 purge；空页仍可在 heap 内复用，显式内存压力/Trim 会临时启用强制 purge。这样不会用每秒一次的 Windows decommit 换取游戏长帧。
+- 所有后端共用 1 GiB requested-live 预算。
+- Hook 安装/卸载会将进程线程加入同一 Detours 事务；失败则整体回滚或保留 trampoline、Hook 与后端。
+- Release 模块永久 pin 到进程退出。进程退出的 `DLL_PROCESS_DETACH` 不拆 Hook、不销毁仍可能被 Storm 使用的池。
 
-- 初始化完成后会尝试安装寻路容量补丁 `PathCapUnlock`。
-- 寻路容量写入失败不会阻止主内存系统继续工作。
-
-## 代码结构
+## 配置
 
 ```text
-Document/
-  StormBreaker_Overview.md      设计背景与实现说明
-  401(不包含报错函数).txt      Storm 分配路径分析资料
-  Free(不含报错函数).txt       Storm 释放路径分析资料
-  ReAlloc.txt                  Storm 重分配路径分析资料
-
-StormMemPoolFix/
-  dllmain.cpp                  DLL 入口、异步初始化、Hook 安装
-  Storm/
-    StormHook.cpp/.h           Storm Hook 与兼容分流
-    MemoryPool.cpp/.h          TLSF 内存池封装
-    StormOffsets.cpp/.h        Storm.dll 偏移与全局状态读取
-    tlsf.c/.h                  TLSF 实现
-  Base/
-    Logger.cpp/.h              日志系统
-    MemroySafety.cpp
-    MemorySafety.h             内存跟踪、延迟释放、监控
-  Game/
-    PathCapUnlock.cpp/.h       寻路容量补丁
-  Build/
-    StormBreaker.asi           默认输出产物
+STORMBREAKER_TAKEOVER_MODE=large|32k|8k|2k|256|full
+STORMBREAKER_MEMORY_BACKEND=tlsf|mimalloc|hybrid|tlsf-sharded
+STORMBREAKER_TLSF_ADDRESS_POLICY=clustered|system
+STORMBREAKER_PROFILER=off|sampled|full
+STORMBREAKER_TELEMETRY=0|1
+STORMBREAKER_ARTIFACT_DIR=<directory>
+STORMBREAKER_MIMALLOC_PURGE_DELAY_MS=-1..3600000
+STORMBREAKER_MIMALLOC_ARENA_RESERVE_MIB=0|8|16|32|64|128
+STORMBREAKER_MIMALLOC_PAGE_FULL_RETAIN=-1..8
+STORMBREAKER_MIMALLOC_PAGE_MAX_CANDIDATES=1..16
 ```
 
-## 构建说明
+默认值是 `large/tlsf/system/profiler-off/telemetry-off`。可显式设置 `STORMBREAKER_TLSF_ADDRESS_POLICY=clustered` 运行高地址布局诊断；clustered 主池若无法分配，会记录警告并自动退回 system 布局。非法 takeover/backend/address-policy 值或指定后端初始化失败会拒绝初始化。`tlsf-sharded` 已实现但未通过标准 map-load 与内存门槛，只用于离线诊断。
+`STORMBREAKER_MIMALLOC_PURGE_DELAY_MS` 默认为 `-1`（关闭自动 purge）；非负值用于诊断上游 mimalloc 的延迟策略。
+其余 mimalloc 参数只用于离线诊断：arena 的 `0` 表示上游 x86 默认 128 MiB，满页保留与候选页搜索默认分别为 `2/4`。当前没有任何组合通过相对 TLSF 的 3% 内存门槛。
 
-### 推荐方式
+可选诊断开关：
 
-当前有效的主构建入口是 Visual Studio 工程：
+- `STORMBREAKER_MEMORY_SAFETY=1`：启用旧兼容层的完整块追踪和周期验证。
+- `STORMBREAKER_VERBOSE_LOG=1`：启用高频调试日志，会影响分配性能。
+- `STORMBREAKER_MEMORY_MONITOR=1`：启用旧版周期内存监控。
+- `STORMBREAKER_DISABLE_DEBUG_CONSOLE=1`：不创建控制台。
+- `STORMBREAKER_DISABLE_CONTROL_PANEL=1`：关闭控制面板心跳，基准测试会设置它。
+- `STORMBREAKER_STATUS_INTERVAL_SEC=5..3600`：心跳周期，默认 60 秒。
 
-- 工程文件：`StormMemPoolFix/StormMemPoolFix.vcxproj`
-- 推荐配置：`Release | Win32`
-- 输出文件：`StormMemPoolFix/Build/StormBreaker.asi`
+Hook 成功后控制面板立即输出一次 `READY=YES HOOKS=YES`，随后每 60 秒刷新并 flush 到 `./StormBreaker/StormMemory.log`。
+日志轮转保留 `.1-.5`，支持覆盖最老备份；共享/重命名失败会退避 60 秒，避免每条日志重复关闭和重开文件。
+full 模式下 ordinal 482 的 native/managed heap 快照只在一轮枚举开始时构建一次；控制面板的 `heap enumeration calls/snapshot rebuilds` 可验证整轮游标没有重复全表扫描。
+控制面板同时输出 `callerCache=hits/misses/bypasses/saturated entries=N`。`bypasses` 表示动态或非核心映像 caller 不能安全长期缓存，`saturated` 表示目标组已满，`entries` 是当前精确占用量；事件计数在线程内按 4,096 次批量汇总，供诊断趋势使用。无论命中率如何，查找成本都被限制为最多 8 个槽位。
 
-如果使用解决方案文件：
+`callerHash=direct-verified` 表示启动时已用 8 组探针对比 Storm ordinal 483，随后直接执行完全一致的 31 位调用点哈希；验证失败会保留原 trampoline。近期释放表使用单乘法 Fibonacci 索引，在不改变 65,536 项容量和跨线程 double-free 拒绝语义的前提下，减少分配/释放热路径指令并改善连续对齐地址的槽位覆盖。`heapIdHint=hits/misses` 仅用于实验诊断，生产容量为 0。
 
-- 解决方案文件：`StormBreaker.sln`
-- 平台名使用 `x86`，它映射到工程内的 `Win32`
+## Profiler 与遥测
 
-示例：
+LeakProfiler 使用预分配的 65,536 项 MPSC ring；Hook 热路径不做文件 I/O、符号化或 STL 扩容。输出 `SBLP` 二进制流，每秒 checkpoint，可在尾部截断后恢复：
 
 ```powershell
-msbuild StormMemPoolFix\StormMemPoolFix.vcxproj /t:Build /p:Configuration=Release /p:Platform=Win32
+python tools\analyze_leak_profile.py <leak_profile.sblp> --output report.json
 ```
+
+`sampled` 完整记录托管块，对原生小块按指针哈希 1/256 采样；`full` 仅用于短时诊断。Reset 只作为启发式 epoch marker，Cleanup 只作为 marker；单次进程报告 survivor，连续跨两个以上 epoch 增长才标记 leak candidate。
+
+`STORMBREAKER_TELEMETRY=1` 每秒写 `metrics_<pid>.jsonl`，包含实际 backend/mode、Hook 状态、requested/usable/reserved/committed、fallback/degraded 原因、延迟直方图和 profiler 丢失状态。控制面板的 `last` 字段还会显示最近一次降级请求的精确 `size`，用于区分真实预算耗尽与后端扩容问题。
+
+## 构建
+
+Visual Studio 入口：
 
 ```powershell
 msbuild StormBreaker.sln /t:Build /p:Configuration=Release /p:Platform=x86
 ```
 
-### 依赖
+CMake 可同时生成诊断变体和 x86 测试：
 
-仓库内已包含项目使用到的主要依赖：
-
-- Microsoft Detours
-- TLSF
-- spdlog
-- nlohmann/json
-- mimalloc
-
-其中，当前主内存拦截路径使用的是 `TLSF`；`mimalloc` 目前不是 StormBreaker 大块接管逻辑的核心分配器。
-
-## 部署与运行
-
-### 适用环境
-
-- 游戏版本：`Warcraft III 1.27a`
-- 架构：`x86`
-- 目标模块：`Storm.dll`
-
-### 加载方式
-
-- 可以通过注入器或宿主加载器加载 `StormBreaker.dll / StormBreaker.asi`
-- 插件在 `DllMain` 中只创建工作线程，真正初始化在 Loader Lock 之外执行
-- 只要 `Storm.dll` 已经映射，插件就可以在运行中途加载
-
-### 建议的注入时机
-
-- 越早越好，最好在资源高峰加载前完成 Hook 安装
-- 插件接管之前已经发生的大块分配，仍然会计入 Storm 原始统计
-
-### 日志与控制台
-
-- 初始化时会自动创建控制台窗口
-- 日志默认写入：
-
-```text
-.\StormBreaker\StormMemory.log
+```powershell
+cmake -S StormMemPoolFix -B build-stormbreaker -A Win32 `
+  -DSTORMBREAKER_BUILD_TESTS=ON -DSTORMBREAKER_BUILD_VARIANTS=ON
+cmake --build build-stormbreaker --config Release --target `
+  StormBreakerTests StormBreaker StormBreakerTLSF StormBreakerMimalloc StormBreakerHybrid
 ```
 
-## 实现边界与限制
+输出位于 `StormMemPoolFix/Build/`：
 
-- 当前偏移表按现有 `Storm.dll / game.dll` 版本维护，若目标版本变化，需要更新：
-  - `StormMemPoolFix/Storm/StormOffsets.cpp`
-  - `StormMemPoolFix/Game/PathCapUnlock.cpp`
-- 小块分配仍由原始 Storm 管理，这是一项有意保留的兼容策略。
-- 兼容层依赖 Hook 覆盖面；它不是一个脱离 Storm Hook 独立运行的通用内存管理器。
-- 仓库中的 `StormMemPoolFix/CMakeLists.txt` 不是本插件的主构建入口，不建议将其作为 StormBreaker 的实际构建脚本。
+- `StormBreaker.asi`：默认 TLSF，可由环境变量选择后端和 takeover mode。
+- `StormBreaker-TLSF.asi`：后端锁定 TLSF。
+- `StormBreaker-mimalloc.asi`：后端锁定 mimalloc。
+- `StormBreaker-hybrid.asi`：后端锁定 hybrid。
 
-## 当前状态
+四份产物构建并验证完成后，用下列命令重新生成发布清单。脚本会先校验所有 ASI 均为 x86 且开启 LAA，再原子更新尺寸与 SHA-256；任一产物不合格时保留旧清单：
 
-根据当前仓库代码检查，主线实现具备以下状态：
+```powershell
+python tools/write_stormbreaker_variant_manifest.py
+```
 
-- `SMemAlloc / SMemFree / SMemReAlloc / SMemGetSize` Hook 已实现
-- `SMemHeapCleanupAll` 与 `ResetMemoryManager` 协同逻辑已实现
-- `64 KiB` 大块阈值与 `16` 字节对齐策略已落实
-- `Release | Win32` 工程构建已验证通过
+锁定版只锁后端；takeover mode 仍由 `STORMBREAKER_TAKEOVER_MODE` 选择。
+
+## 测试
+
+```powershell
+ctest --test-dir build-stormbreaker -C Release --output-on-failure
+python -m unittest tools.test_analyze_leak_profile `
+  tools.test_stormbreaker_benchmark `
+  tools.tests.test_stormbreaker_benchmark_extended -v
+```
+
+StormBreaker 自有 runner 位于 `tools/stormbreaker_benchmark.py`。它只调用 AutoTest 的启动/停止能力，不修改 AutoTest；每轮强制 isolated desktop，拒绝运行目录中的真实 `d3d9.dll`，并验证系统 d3d9、Storm、Game、ASI 路径与 SHA。固定五组为 `off`、`large-tlsf`、`full-tlsf`、`full-mimalloc`、`full-hybrid`。
+
+直接崩溃烟测使用 `tools/stormbreaker_crash_smoke.py`。当前非隔离目标为 `E:\Work\Warcraft III`；runner 只终止路径校验后的本轮自有 PID，部署前后备份/恢复 ASI，并在系统 Commit 余量或进程 Commit 触及保护线时将轮次标为 guard-stop，而不是误报为崩溃。
+
+`full/hybrid` 只有在以下真实工作负载门槛全部通过后才能晋级：地图 ready 回退不超过 5%，Private/Commit/Virtual 的配对 95% CI 上界不超过 `large/tlsf` 3%，Hook p99 不恶化超过 10%，Virtual 增长斜率下降至少 20%，最大连续空闲区提升至少 10%，且超过 10 ms 的分配停顿下降至少 20%。
+
+## 代码结构
+
+```text
+StormMemPoolFix/Storm/StormTakeover.*       全导出 Hook 与兼容分流
+StormMemPoolFix/Storm/StormVersionProfile.* 版本、SHA、RVA 与前导字节门禁
+StormMemPoolFix/Storm/StormHeapRegistry.*   固定容量逻辑 heap registry
+StormMemPoolFix/Storm/MemoryPool.*          后端路由、预算、统计与生命周期
+StormMemPoolFix/Storm/*Backend.cpp          TLSF/mimalloc 实现
+StormMemPoolFix/Base/LeakProfiler.*         MPSC ring 与 SBLP writer
+StormMemPoolFix/Base/Telemetry.*            metrics JSONL
+StormMemPoolFix/tests/                      x86 单元/压力/mock Storm 测试
+tools/                                      runner、离线解析器与 IDA 注释脚本
+Document/Storm_Memory_Research.md           已验证逆向结论与实现边界
+```
+
+## 限制
+
+- 全接管能减少 Storm 每调用点 arena 导致的 32 位虚拟地址碎片，但不等于一定降低 working set 或缩短首次进图时间。
+- 官方 Game/WorldEdit 已静态审计；动态 Warden 或第三方插件仍可能形成未知调用边界，因此每个指针都必须保持 mixed-domain 路由。
+- 全导出档的 406 托管部分报告 requested-live；large 档直接保留 Storm 原生 406。Game 会用它计算资源差值和默认纹理 key，因此仍需真实渲染工作负载验证。
+- registry 容量固定为 16,384。表满后用 32 KiB、四哈希 membership filter 对确定不存在的 ID 做 O(1) 拒绝；已存在 ID 仍精确查找。耗尽会明确记录并退化到原生 heap，不会静默伪装成已接管。
+- 当前没有运行真实 War3/WorldEdit 晋级基准；默认值不会自动切换到 `full/hybrid`。
 
 ## 许可证
 
-本项目采用 `MIT License`。详见 [LICENSE.txt](LICENSE.txt)。
+本项目采用 MIT License，详见 `LICENSE.txt`。

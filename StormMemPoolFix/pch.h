@@ -19,6 +19,6 @@
 bool InitializeStormBreaker();
 void ShutdownStormBreaker();
 bool InstallStormHooks();
-void UninstallStormHooks();
+bool UninstallStormHooks();
 bool StartMemoryMonitoring();
-void StopMemoryMonitoring();
+bool StopMemoryMonitoring();

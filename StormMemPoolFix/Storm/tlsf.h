@@ -78,10 +78,20 @@ void tlsf_remove_pool(tlsf_t tlsf, pool_t pool);
 void* tlsf_malloc(tlsf_t tlsf, size_t bytes);
 void* tlsf_memalign(tlsf_t tlsf, size_t align, size_t bytes);
 void* tlsf_realloc(tlsf_t tlsf, void* ptr, size_t size);
+/* Resize without moving. Failure leaves the original allocation untouched. */
+void* tlsf_realloc_in_place(tlsf_t tlsf, void* ptr, size_t size);
 void tlsf_free(tlsf_t tlsf, void* ptr);
+
+/* StormBreaker disables the legacy process-global small-block cache. */
+void tlsf_toggle_optimized_memory_locality(int enable);
 
 /* Returns internal block size, not original request size */
 size_t tlsf_block_size(void* ptr);
+/* Returns nonzero for a free block (and for NULL). */
+int tlsf_block_is_free(void* ptr);
+/* Validates that ptr is the exact start of a live block in one VM range. */
+int tlsf_block_is_valid_in_range(void* ptr, void* range_base,
+                                 size_t range_size);
 
 /* Overheads/limits of internal structures. */
 size_t tlsf_size(void);
@@ -90,10 +100,14 @@ size_t tlsf_block_size_min(void);
 size_t tlsf_block_size_max(void);
 size_t tlsf_pool_overhead(void);
 size_t tlsf_alloc_overhead(void);
+/* Minimum fresh-pool size whose TLSF class can satisfy this allocation. */
+size_t tlsf_allocation_pool_size(size_t bytes, size_t align);
 
 /* Debugging. */
 typedef void (*tlsf_walker)(void* ptr, size_t size, int used, void* user);
 void tlsf_walk_pool(pool_t pool, tlsf_walker walker, void* user);
+/* O(1): true only for one coalesced free block followed by the sentinel. */
+int tlsf_pool_is_empty(pool_t pool);
 /* Returns nonzero if any internal consistency check fails. */
 int tlsf_check(tlsf_t tlsf);
 int tlsf_check_pool(pool_t pool);

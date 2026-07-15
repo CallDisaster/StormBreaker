@@ -3,13 +3,13 @@ vcpkg_from_github(
   REPO microsoft/mimalloc
   HEAD_REF master
 
-  # The "REF" can be a commit hash, branch name (dev2), or a version (v2.2.1).
-  # REF "v${VERSION}"
-  REF 866ce5b89db1dbc3e66bbf89041291fd16329518
-
+  # The "REF" can be a commit hash, branch name (dev3), or a version (v3.3.2).
+  REF "v${VERSION}"
+  
   # The sha512 is the hash of the tar.gz bundle.
-  # (To get the sha512, run `vcpkg install mimalloc[override] --overlay-ports=<dir of this file>` and copy the sha from the error message.)
-  SHA512 0b0e5ff823c49b9534b8c32800679806c5d7c29020af058da043c3e6e36ae3c32a1cdd5a21ece97dd60bc7dd4703967f683beac435dbb8514638a6cc55e5dea8
+  # (To get the sha512, run `vcpkg install "mimalloc[override]" --overlay-ports=<dir of this file>` and copy the sha from the error message.)
+  # (and maybe `vcpkg remove mimalloc` first to remove any previous install)
+  SHA512 601bdf622d0bc7521edf0cc73d1caec9d976bcd1faa689ff48cc18a9a6a3b2294b571fc71d3266b38907bc5aad10a41d92d03d2cdde139a30b08357ee7bc25c5
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
@@ -18,6 +18,9 @@ vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
     guarded     MI_GUARDED
     secure      MI_SECURE
     override    MI_OVERRIDE
+    optarch     MI_OPT_ARCH
+    nooptarch   MI_NO_OPT_ARCH
+    optsimd     MI_OPT_SIMD
     xmalloc     MI_XMALLOC
     asm         MI_SEE_ASM
 )
@@ -26,16 +29,14 @@ string(COMPARE EQUAL "${VCPKG_LIBRARY_LINKAGE}" "dynamic" MI_BUILD_SHARED)
 
 vcpkg_cmake_configure(
   SOURCE_PATH "${SOURCE_PATH}"
-  OPTIONS_RELEASE
-    -DMI_OPT_ARCH=ON
   OPTIONS
     -DMI_USE_CXX=ON
     -DMI_BUILD_TESTS=OFF
     -DMI_BUILD_OBJECT=ON
-    ${FEATURE_OPTIONS}
     -DMI_BUILD_STATIC=${MI_BUILD_STATIC}
     -DMI_BUILD_SHARED=${MI_BUILD_SHARED}
     -DMI_INSTALL_TOPLEVEL=ON
+    ${FEATURE_OPTIONS}
 )
 
 vcpkg_cmake_install()

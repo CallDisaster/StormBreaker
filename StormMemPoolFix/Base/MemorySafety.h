@@ -151,7 +151,8 @@ private:
 private:
     MemorySafetyConfig m_config;
     std::atomic<bool>  m_initialized{ false };
-    std::atomic<bool>  m_inUnsafePeriod{ false };
+    std::atomic<bool>  m_shuttingDown{ false };
+    std::atomic<uint32_t> m_unsafePeriodDepth{ 0 };
 
     // 内存块跟踪
     mutable SRWLOCK m_blocksLock = SRWLOCK_INIT;
@@ -211,7 +212,7 @@ public:
     ~MemoryMonitor();
 
     void StartMonitoring(DWORD intervalMs = 5000);
-    void StopMonitoring();
+    bool StopMonitoring();
     bool IsMonitoring() const;
     void PrintProcessMemory();
 

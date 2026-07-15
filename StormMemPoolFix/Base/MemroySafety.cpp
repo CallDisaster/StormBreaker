@@ -19,8 +19,8 @@ namespace {
 // ======================== MemorySafety实现 ========================
 
 MemorySafety& MemorySafety::GetInstance() {
-    static MemorySafety instance;
-    return instance;
+    static MemorySafety* instance = new MemorySafety();
+    return *instance;
 }
 
 MemorySafetyConfig MemorySafety::GetDefaultConfig() {
@@ -42,6 +42,8 @@ bool MemorySafety::Initialize(const MemorySafetyConfig& config) {
     }
 
     m_config = config;
+    m_shuttingDown.store(false, std::memory_order_release);
+    m_unsafePeriodDepth.store(0, std::memory_order_release);
 
     // 初始化临界区
     InitializeCriticalSection(&m_deferredLock);
@@ -60,7 +62,8 @@ bool MemorySafety::Initialize(const MemorySafetyConfig& config) {
 }
 
 void MemorySafety::Shutdown() {
-    if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
+    if (!m_initialized.load(std::memory_order_acquire) ||
+        m_shuttingDown.exchange(true, std::memory_order_acq_rel)) {
         return; // 未初始化
     }
 
@@ -84,8 +87,12 @@ void MemorySafety::Shutdown() {
     // 清理跟踪数据
     ClearAllTracking();
 
+    // 以上路径依赖 IsInitialized()；完成排空后才对外关闭。
+    m_initialized.store(false, std::memory_order_release);
+
     // 清理临界区
     DeleteCriticalSection(&m_deferredLock);
+    m_shuttingDown.store(false, std::memory_order_release);
 
     Logger::GetInstance().LogInfo("内存安全系统已关闭");
 }
@@ -100,12 +107,6 @@ bool MemorySafety::RegisterMemoryBlock(void* rawPtr, void* userPtr, size_t size,
         return false;
     }
 
-    // 检查是否超过最大跟踪数量
-    if (m_trackedBlocks.size() >= m_config.maxTrackedBlocks) {
-        Logger::GetInstance().LogWarning("达到最大跟踪块数量限制: %zu", m_config.maxTrackedBlocks);
-        return false;
-    }
-
     MemoryBlockInfo info;
     info.rawPtr = rawPtr;
     info.userPtr = userPtr;
@@ -117,6 +118,12 @@ bool MemorySafety::RegisterMemoryBlock(void* rawPtr, void* userPtr, size_t size,
     info.isValid = true;
 
     AcquireSRWLockExclusive(&m_blocksLock);
+
+    if (m_trackedBlocks.size() >= m_config.maxTrackedBlocks) {
+        ReleaseSRWLockExclusive(&m_blocksLock);
+        Logger::GetInstance().LogWarning("达到最大跟踪块数量限制: %zu", m_config.maxTrackedBlocks);
+        return false;
+    }
 
     // 检查是否已存在
     if (m_trackedBlocks.find(userPtr) != m_trackedBlocks.end()) {
@@ -262,27 +269,29 @@ bool MemorySafety::ValidateAllBlocks() const {
 
     Logger::GetInstance().LogInfo("开始验证所有内存块...");
 
+    std::vector<MemoryBlockInfo> snapshot;
     AcquireSRWLockShared(&m_blocksLock);
+    snapshot.reserve(m_trackedBlocks.size());
+    for (const auto& pair : m_trackedBlocks) {
+        snapshot.push_back(pair.second);
+    }
+    ReleaseSRWLockShared(&m_blocksLock);
 
-    size_t totalBlocks = m_trackedBlocks.size();
+    size_t totalBlocks = snapshot.size();
     size_t validBlocks = 0;
     size_t invalidBlocks = 0;
 
-    for (const auto& pair : m_trackedBlocks) {
-        ReleaseSRWLockShared(&m_blocksLock);
-
-        if (ValidateMemoryBlock(pair.first)) {
+    for (const auto& info : snapshot) {
+        if (info.isValid && !IsBlockCorrupted(info)) {
             validBlocks++;
         }
         else {
             invalidBlocks++;
+            NotifyValidationFailure(info.userPtr, "块已释放、越界或不再属于当前后端");
         }
-
-        AcquireSRWLockShared(&m_blocksLock);
     }
 
-    ReleaseSRWLockShared(&m_blocksLock);
-
+    const_cast<MemorySafety*>(this)->m_stats.validationCount += totalBlocks;
     const_cast<MemorySafety*>(this)->m_stats.lastValidationTime = GetTickCount();
     const_cast<MemorySafety*>(this)->m_stats.validationFailures += invalidBlocks;
 
@@ -301,23 +310,20 @@ size_t MemorySafety::ValidateAndRepairBlocks() {
 
     std::vector<void*> blocksToRemove;
 
+    std::vector<MemoryBlockInfo> snapshot;
     AcquireSRWLockShared(&m_blocksLock);
-
+    snapshot.reserve(m_trackedBlocks.size());
     for (const auto& pair : m_trackedBlocks) {
-        void* userPtr = pair.first;
-        const MemoryBlockInfo& info = pair.second;
-
-        ReleaseSRWLockShared(&m_blocksLock);
-
-        if (IsBlockCorrupted(info)) {
-            blocksToRemove.push_back(userPtr);
-            Logger::GetInstance().LogWarning("发现损坏块，将移除跟踪: %p", userPtr);
-        }
-
-        AcquireSRWLockShared(&m_blocksLock);
+        snapshot.push_back(pair.second);
     }
-
     ReleaseSRWLockShared(&m_blocksLock);
+
+    for (const auto& info : snapshot) {
+        if (IsBlockCorrupted(info)) {
+            blocksToRemove.push_back(info.userPtr);
+            Logger::GetInstance().LogWarning("发现损坏块，将移除跟踪: %p", info.userPtr);
+        }
+    }
 
     // 移除损坏的块
     for (void* ptr : blocksToRemove) {
@@ -427,27 +433,34 @@ size_t MemorySafety::GetDeferredFreeQueueSize() const {
 }
 
 void MemorySafety::EnterUnsafePeriod() {
-    m_inUnsafePeriod.store(true, std::memory_order_release);
-
-    if (m_unsafePeriodCallback) {
-        m_unsafePeriodCallback(true);
+    if (m_unsafePeriodDepth.fetch_add(1, std::memory_order_acq_rel) == 0) {
+        if (m_unsafePeriodCallback) {
+            m_unsafePeriodCallback(true);
+        }
+        Logger::GetInstance().LogDebug("进入不安全期");
     }
-
-    Logger::GetInstance().LogInfo("进入不安全期");
 }
 
 void MemorySafety::ExitUnsafePeriod() {
-    m_inUnsafePeriod.store(false, std::memory_order_release);
-
-    if (m_unsafePeriodCallback) {
-        m_unsafePeriodCallback(false);
+    uint32_t current = m_unsafePeriodDepth.load(std::memory_order_acquire);
+    while (current != 0) {
+        if (m_unsafePeriodDepth.compare_exchange_weak(
+                current, current - 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            if (current == 1) {
+                if (m_unsafePeriodCallback) {
+                    m_unsafePeriodCallback(false);
+                }
+                Logger::GetInstance().LogDebug("退出不安全期");
+            }
+            return;
+        }
     }
-
-    Logger::GetInstance().LogInfo("退出不安全期");
+    Logger::GetInstance().LogWarning("忽略未配对的不安全期退出");
 }
 
 bool MemorySafety::IsInUnsafePeriod() const {
-    return m_inUnsafePeriod.load(std::memory_order_acquire);
+    return m_unsafePeriodDepth.load(std::memory_order_acquire) != 0;
 }
 
 void MemorySafety::SetUnsafePeriodCallback(void (*callback)(bool entering)) {
@@ -522,13 +535,15 @@ std::vector<MemorySafety::CorruptionInfo> MemorySafety::DetectCorruption() const
         return corruptions;
     }
 
+    std::vector<MemoryBlockInfo> snapshot;
     AcquireSRWLockShared(&m_blocksLock);
-
+    snapshot.reserve(m_trackedBlocks.size());
     for (const auto& pair : m_trackedBlocks) {
-        const MemoryBlockInfo& info = pair.second;
+        snapshot.push_back(pair.second);
+    }
+    ReleaseSRWLockShared(&m_blocksLock);
 
-        ReleaseSRWLockShared(&m_blocksLock);
-
+    for (const auto& info : snapshot) {
         if (IsBlockCorrupted(info)) {
             CorruptionInfo corruption;
             corruption.userPtr = info.userPtr;
@@ -538,11 +553,7 @@ std::vector<MemorySafety::CorruptionInfo> MemorySafety::DetectCorruption() const
 
             corruptions.push_back(corruption);
         }
-
-        AcquireSRWLockShared(&m_blocksLock);
     }
-
-    ReleaseSRWLockShared(&m_blocksLock);
 
     const_cast<MemorySafety*>(this)->m_stats.corruptionDetections++;
 
@@ -689,7 +700,8 @@ void MemorySafety::ProcessDeferredFreeItem(const DeferredFreeItem& item) {
 
     // 3) 释放：仅当拿到 rawPtr 才释放；否则跳过，避免 TLSF 损坏
     if (got && info.rawPtr) {
-        MemoryPool::FreeSafe(info.rawPtr);
+        MemoryPool::FreeKnownSizeUntracked(
+            info.rawPtr, info.size + sizeof(StormAllocHeader));
         Logger::GetInstance().LogDebug(
             "处理延迟释放(raw): user=%p, raw=%p, size=%zu",
             item.ptr, info.rawPtr, item.size);
@@ -783,9 +795,9 @@ void MemoryMonitor::StartMonitoring(DWORD intervalMs) {
     Logger::GetInstance().LogInfo("增强版内存监控器已启动，间隔=%lu ms", intervalMs);
 }
 
-void MemoryMonitor::StopMonitoring() {
+bool MemoryMonitor::StopMonitoring() {
     if (!m_running.exchange(false, std::memory_order_acq_rel)) {
-        return; // 未运行
+        return true; // 未运行
     }
 
     if (m_stopEvent) {
@@ -793,7 +805,12 @@ void MemoryMonitor::StopMonitoring() {
     }
 
     if (m_thread) {
-        WaitForSingleObject(m_thread, 5000);
+        const DWORD waitResult = WaitForSingleObject(m_thread, 5000);
+        if (waitResult != WAIT_OBJECT_0) {
+            Logger::GetInstance().LogWarning(
+                "内存监控线程未在超时内退出，保留线程与事件句柄以避免悬空访问");
+            return false;
+        }
         CloseHandle(m_thread);
         m_thread = nullptr;
     }
@@ -804,6 +821,7 @@ void MemoryMonitor::StopMonitoring() {
     }
 
     Logger::GetInstance().LogInfo("增强版内存监控器已停止");
+    return true;
 }
 
 bool MemoryMonitor::IsMonitoring() const {
