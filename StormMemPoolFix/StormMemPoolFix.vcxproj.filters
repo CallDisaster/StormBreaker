@@ -54,6 +54,9 @@
     <ClInclude Include="Storm\StormHook.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
+    <ClInclude Include="Storm\StormNativeSmallRepair.h">
+      <Filter>头文件\Storm</Filter>
+    </ClInclude>
     <ClInclude Include="Storm\StormApi.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
@@ -111,6 +114,9 @@
       <Filter>源文件\Dependencies</Filter>
     </ClCompile>
     <ClCompile Include="Storm\StormHook.cpp">
+      <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Storm\StormNativeSmallRepair.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
     <ClCompile Include="Storm\StormVersionProfile.cpp">

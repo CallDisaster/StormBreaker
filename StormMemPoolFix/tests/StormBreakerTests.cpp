@@ -6,6 +6,7 @@
 #include "Storm/MemoryPool.h"
 #include "Storm/StormHook.h"
 #include "Storm/StormHeapRegistry.h"
+#include "Storm/StormNativeSmallRepair.h"
 #include "Storm/StormTakeover.h"
 #include "Storm/StormVersionProfile.h"
 #include "Storm/tlsf.h"
@@ -1977,6 +1978,42 @@ bool TestProfilerRing() {
   return true;
 }
 
+bool TestNativeSmallRepairFreeListPromotion() {
+  using namespace StormNativeSmallRepair;
+  alignas(8) static uint8_t storage[0x10000];
+  std::memset(storage, 0, sizeof(storage));
+  auto* arena = reinterpret_cast<NativeArena*>(storage);
+  arena->reservedBytes = sizeof(storage);
+  arena->committedBytes = 0x1000;
+  arena->dataStart = storage + 112;
+  arena->bumpEnd = arena->dataStart + 128;
+
+  auto* tooSmall = reinterpret_cast<NativeFreeBlock*>(arena->dataStart);
+  tooSmall->totalBytes = 32;
+  tooSmall->flags = 0x02;
+  auto* fitting = reinterpret_cast<NativeFreeBlock*>(arena->dataStart + 32);
+  fitting->totalBytes = 64;
+  fitting->flags = 0x02;
+  arena->freeBins[1] = tooSmall;
+  arena->freeBins[2] = fitting;
+
+  CHECK(RepairFreeLists(arena, 56) == RepairResult::PromotedHigherBin);
+  CHECK(arena->freeBins[1] == fitting);
+  CHECK(fitting->next == tooSmall);
+  CHECK(arena->freeBins[2] == nullptr);
+
+  // Original Storm consumes the promoted head before the repair hook returns.
+  arena->freeBins[1] = fitting->next;
+  fitting->next = nullptr;
+  CHECK(RepairFreeLists(arena, 32) == RepairResult::FitAlreadyAvailable);
+
+  tooSmall->next = tooSmall;
+  arena->freeBins[1] = tooSmall;
+  arena->freeBins[2] = nullptr;
+  CHECK(RepairFreeLists(arena, 56) == RepairResult::InvalidArena);
+  return true;
+}
+
 bool TestVersionProfilesWhenAvailable() {
   wchar_t root[MAX_PATH]{};
   const DWORD length = GetEnvironmentVariableW(
@@ -2062,7 +2099,9 @@ int main() {
                    TestDirectCallerHeapHash() &&
                    TestRecentFreedHashDistribution() &&
                    TestHeapEnumerationSnapshotCache() &&
-                  TestProfilerRing() && TestVersionProfilesWhenAvailable();
+                  TestProfilerRing() &&
+                  TestNativeSmallRepairFreeListPromotion() &&
+                  TestVersionProfilesWhenAvailable();
   Logger::GetInstance().Shutdown();
   return ok ? 0 : 1;
 }
