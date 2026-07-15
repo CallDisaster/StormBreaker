@@ -122,7 +122,7 @@ private:
     void WriteToFile(LogLevel level, const char* message);
     bool OpenLogFile();
     void CloseLogFile();
-    void PerformRotation();
+    bool PerformRotation();
     void FormatMessage(char* buffer, size_t bufferSize, LogLevel level, const char* message);
 
 private:
@@ -141,6 +141,7 @@ private:
     // 文件信息
     char m_logFilePath[MAX_PATH];
     std::atomic<size_t> m_currentFileSize{ 0 };
+    std::atomic<DWORD> m_nextRotationAttempt{ 0 };
 };
 
 // ======================== 便利宏 ========================

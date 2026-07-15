@@ -31,6 +31,9 @@
     <Filter Include="头文件\Game">
       <UniqueIdentifier>{f1435e13-7af7-4151-b3c5-54f0b3fc9856}</UniqueIdentifier>
     </Filter>
+    <Filter Include="源文件\Dependencies">
+      <UniqueIdentifier>{1d7415e7-d32a-4d8d-bda6-ab76dbd318f4}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framework.h">
@@ -45,10 +48,28 @@
     <ClInclude Include="Storm\MemoryPool.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
+    <ClInclude Include="Storm\MemoryBackend.h">
+      <Filter>头文件\Storm</Filter>
+    </ClInclude>
     <ClInclude Include="Storm\StormHook.h">
       <Filter>头文件\Storm</Filter>
     </ClInclude>
+    <ClInclude Include="Storm\StormApi.h">
+      <Filter>头文件\Storm</Filter>
+    </ClInclude>
+    <ClInclude Include="Storm\StormHeapRegistry.h">
+      <Filter>头文件\Storm</Filter>
+    </ClInclude>
+    <ClInclude Include="Storm\StormTakeover.h">
+      <Filter>头文件\Storm</Filter>
+    </ClInclude>
+    <ClInclude Include="Storm\StormVersionProfile.h">
+      <Filter>头文件\Storm</Filter>
+    </ClInclude>
     <ClInclude Include="Base\fp_call.h">
+      <Filter>头文件\Base</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\LeakProfiler.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
     <ClInclude Include="Storm\tlsf.h">
@@ -58,6 +79,9 @@
       <Filter>头文件\Base</Filter>
     </ClInclude>
     <ClInclude Include="Base\MemorySafety.h">
+      <Filter>头文件\Base</Filter>
+    </ClInclude>
+    <ClInclude Include="Base\Telemetry.h">
       <Filter>头文件\Base</Filter>
     </ClInclude>
     <ClInclude Include="Game\PathCapUnlock.h">
@@ -77,7 +101,25 @@
     <ClCompile Include="Storm\MemoryPool.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
+    <ClCompile Include="Storm\MimallocBackend.cpp">
+      <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Storm\TlsfBackend.cpp">
+      <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Dependencies\mimalloc-dev\src\static.c">
+      <Filter>源文件\Dependencies</Filter>
+    </ClCompile>
     <ClCompile Include="Storm\StormHook.cpp">
+      <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Storm\StormHeapRegistry.cpp">
+      <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Storm\StormTakeover.cpp">
+      <Filter>源文件\Storm</Filter>
+    </ClCompile>
+    <ClCompile Include="Storm\StormVersionProfile.cpp">
       <Filter>源文件\Storm</Filter>
     </ClCompile>
     <ClCompile Include="Storm\tlsf.c">
@@ -86,7 +128,13 @@
     <ClCompile Include="Base\Logger.cpp">
       <Filter>源文件\Base</Filter>
     </ClCompile>
+    <ClCompile Include="Base\LeakProfiler.cpp">
+      <Filter>源文件\Base</Filter>
+    </ClCompile>
     <ClCompile Include="Base\MemroySafety.cpp">
+      <Filter>源文件\Base</Filter>
+    </ClCompile>
+    <ClCompile Include="Base\Telemetry.cpp">
       <Filter>源文件\Base</Filter>
     </ClCompile>
     <ClCompile Include="Game\PathCapUnlock.cpp">

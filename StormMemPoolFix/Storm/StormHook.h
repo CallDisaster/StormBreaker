@@ -4,7 +4,6 @@
 #include <Windows.h>
 #include <atomic>
 #include <stdint.h>
-#include <unordered_map>
 
 // 前向声明Logger，避免包含问题
 class Logger;
@@ -24,6 +23,8 @@ struct StormAllocHeader {
 
 static_assert(sizeof(StormAllocHeader) == 16,
               "StormAllocHeader must be exactly 16 bytes");
+static_assert(sizeof(void *) == 4 && sizeof(size_t) == 4,
+              "StormBreaker supports only the 32-bit Warcraft III ABI");
 
 // ======================== 统一标识常量 ========================
 constexpr uint32_t STORMBREAKER_MAGIC = 0x53425431u; // 'SBT1'
@@ -33,6 +34,37 @@ constexpr uint16_t STORM_FRONT_MAGIC = 0x6F6D;       // Storm前置魔数
 
 // ======================== 全局状态管理 ========================
 namespace StormHook {
+enum class ManagedReallocDisposition : uint8_t {
+  NotManaged,
+  Succeeded,
+  Freed,
+  Failed,
+};
+
+struct ManagedReallocResult {
+  ManagedReallocDisposition disposition =
+      ManagedReallocDisposition::NotManaged;
+  void *pointer = nullptr;
+};
+
+struct RuntimeStats {
+  uint64_t allocCalls = 0;
+  uint64_t freeCalls = 0;
+  uint64_t reallocCalls = 0;
+  uint64_t getSizeCalls = 0;
+  uint64_t cleanupCalls = 0;
+  uint64_t resetCalls = 0;
+  uint64_t bypassCalls = 0;
+  uint64_t failures = 0;
+  uint64_t managedAllocations = 0;
+  uint64_t managedFrees = 0;
+  uint64_t nativeAllocations = 0;
+  uint64_t nativeFrees = 0;
+  uint64_t nativeAllocatedBytes = 0;
+  uint64_t fallbackAllocations = 0;
+  uint64_t managedAllocationFailures = 0;
+};
+
 // 初始化和清理
 bool Initialize();
 void Shutdown();
@@ -45,8 +77,9 @@ bool IsInUnsafePeriod();
 void *AllocateMemory(size_t size, const char *name = nullptr,
                      DWORD srcLine = 0);
 bool FreeMemory(void *ptr);
-void *ReallocMemory(void *oldPtr, size_t newSize, const char *name = nullptr,
-                    DWORD srcLine = 0);
+ManagedReallocResult TryReallocMemory(void *oldPtr, size_t newSize,
+                                      const char *name = nullptr,
+                                      DWORD srcLine = 0);
 
 // 清理和维护
 void FlushManagedBlocks();
@@ -55,6 +88,9 @@ void ProcessDeferredFree();
 // 统计信息
 size_t GetManagedBlockCount();
 size_t GetTotalManagedSize();
+RuntimeStats GetRuntimeStats();
+void SetRuntimeStatsEnabled(bool enabled);
+bool IsRuntimeStatsEnabled();
 
 // Reset协同
 void PrepareForReset();
@@ -117,6 +153,7 @@ namespace StormHook_Internal {
 void SetupStormTlsfHeader(void *userPtr, size_t size);
 bool QueryManagedBlock(void *userPtr, StormAllocHeader **outOriginalHeader,
                        size_t *outOriginalSize);
+bool IsRejectedManagedPointer(void *userPtr);
 void PoisonManagedHeader(StormAllocHeader *hdr);
 
 // 状态管理

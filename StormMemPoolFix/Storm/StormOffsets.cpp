@@ -8,6 +8,7 @@
 #include "pch.h"
 #include "StormOffsets.h"
 #include "Base/Logger.h"
+#include "StormVersionProfile.h"
 
  // 这里可以在初始化时赋予正确的Storm.dll基址
 uintptr_t gStormDllBase = 0;
@@ -40,24 +41,21 @@ bool InitializeStormOffsets() {
         return false;
     }
 
-    gStormDllBase = reinterpret_cast<uintptr_t>(hStorm);
-    Logger::GetInstance().LogInfo("StormOffsets: Storm.dll 基址=%p", hStorm);
-
-    // 验证几个关键偏移
-    __try {
-        bool memSysInit = Storm_g_MemorySystemInitialized;
-        size_t totalMem = Storm_g_TotalAllocatedMemory;
-        Logger::GetInstance().LogInfo(
-            "StormOffsets: Storm内存系统 已初始化=%s, 总内存=%zu",
-            memSysInit ? "是" : "否", totalMem);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::GetInstance().LogWarning(
-            "StormOffsets: 偏移验证失败，内部统计功能将被禁用");
+    StormApi::ResolvedApi verified{};
+    wchar_t failure[256]{};
+    if (!StormVersionProfile::ResolveVerified127a(
+            hStorm, &verified, failure, ARRAYSIZE(failure))) {
+        Logger::GetInstance().LogError(
+            "StormOffsets: 严格版本校验失败: %ls", failure);
         gStormDllBase = 0;
         return false;
     }
+
+    gStormDllBase = verified.base;
+    Logger::GetInstance().LogInfo(
+        "StormOffsets: 已锁定 Warcraft III 1.27a Storm.dll，基址=%p",
+        hStorm);
+    return true;
 }
 
 /**

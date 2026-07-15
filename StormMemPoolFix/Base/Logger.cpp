@@ -19,8 +19,8 @@ namespace {
 // ======================== Logger实现 ========================
 
 Logger& Logger::GetInstance() {
-    static Logger instance;
-    return instance;
+    static Logger* instance = new Logger();
+    return *instance;
 }
 
 LoggerConfig Logger::GetDefaultConfig() {
@@ -42,7 +42,7 @@ LoggerConfig Logger::GetDefaultConfig() {
 
 LoggerConfig Logger::GetDebugConfig() {
     LoggerConfig config = GetDefaultConfig();
-    config.minLevel = LogLevel::Info;  // Debug配置显示Info及以上级别
+    config.minLevel = LogLevel::Debug;
     config.enableConsole = true;
     config.flushImmediate = true;
     return config;
@@ -74,6 +74,7 @@ bool Logger::Initialize(const LoggerConfig& config) {
     m_totalLines.store(0, std::memory_order_relaxed);
     m_totalBytes.store(0, std::memory_order_relaxed);
     m_droppedMessages.store(0, std::memory_order_relaxed);
+    m_nextRotationAttempt.store(0, std::memory_order_relaxed);
 
     // 初始化文件输出
     if (m_config.enableFile) {
@@ -102,7 +103,7 @@ bool Logger::Initialize(const LoggerConfig& config) {
 }
 
 void Logger::Shutdown() {
-    if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
+    if (!m_initialized.load(std::memory_order_acquire)) {
         return; // 未初始化
     }
 
@@ -118,6 +119,9 @@ void Logger::Shutdown() {
 
     // 最后刷新
     FlushLogs();
+
+    // 上面的最终日志仍依赖 IsInitialized()；写完后才关闭入口。
+    m_initialized.store(false, std::memory_order_release);
 
     // 关闭文件
     CloseLogFile();
@@ -330,9 +334,14 @@ void Logger::SetFlushImmediate(bool enable) {
 }
 
 void Logger::FlushLogs() {
+    if (!IsInitialized()) {
+        return;
+    }
+    EnterCriticalSection(&m_criticalSection);
     if (m_logFile != INVALID_HANDLE_VALUE) {
         FlushFileBuffers(m_logFile);
     }
+    LeaveCriticalSection(&m_criticalSection);
 }
 
 void Logger::RotateLogFile() {
@@ -345,12 +354,20 @@ void Logger::RotateLogFile() {
     EnterCriticalSection(&m_criticalSection);
 
     CloseLogFile();
-    PerformRotation();
-    OpenLogFile();
+    const bool rotated = PerformRotation();
+    const bool reopened = OpenLogFile();
+    m_nextRotationAttempt.store(
+        rotated && reopened ? 0u : GetTickCount() + 60000u,
+        std::memory_order_relaxed);
 
     LeaveCriticalSection(&m_criticalSection);
 
-    LogInfo("日志轮转完成");
+    if (rotated && reopened) {
+        LogInfo("日志轮转完成");
+    }
+    else {
+        LogWarning("日志轮转失败，将延迟后重试");
+    }
 }
 
 void Logger::ClearLogFile() {
@@ -453,9 +470,23 @@ void Logger::WriteLog(LogLevel level, const char* message) {
     // 检查文件轮转
     if (m_config.enableFile && m_config.enableRotation &&
         m_currentFileSize.load(std::memory_order_relaxed) >= m_config.maxFileSize) {
-        CloseLogFile();
-        PerformRotation();
-        OpenLogFile();
+        const DWORD now = GetTickCount();
+        const DWORD retryAt =
+            m_nextRotationAttempt.load(std::memory_order_relaxed);
+        if (retryAt == 0 || static_cast<LONG>(now - retryAt) >= 0) {
+            CloseLogFile();
+            const bool rotated = PerformRotation();
+            const bool reopened = OpenLogFile();
+            if (rotated && reopened) {
+                m_nextRotationAttempt.store(0, std::memory_order_relaxed);
+            }
+            else {
+                // A sharing violation must not turn every allocation log into
+                // repeated close/rename/open calls.
+                m_nextRotationAttempt.store(now + 60000u,
+                                            std::memory_order_relaxed);
+            }
+        }
     }
 
     // 写入各个输出目标
@@ -551,7 +582,7 @@ bool Logger::OpenLogFile() {
     m_logFile = CreateFileA(
         m_logFilePath,
         FILE_APPEND_DATA,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
@@ -578,27 +609,44 @@ void Logger::CloseLogFile() {
     }
 }
 
-void Logger::PerformRotation() {
-    // 移动现有备份文件
-    for (int i = static_cast<int>(m_config.maxBackupFiles) - 1; i > 0; i--) {
-        char oldPath[MAX_PATH], newPath[MAX_PATH];
+bool Logger::PerformRotation() {
+    bool success = true;
+    const size_t backups = m_config.maxBackupFiles;
 
-        if (i == 1) {
-            strcpy_s(oldPath, m_logFilePath);
+    if (backups == 0) {
+        if (!DeleteFileA(m_logFilePath) &&
+            GetLastError() != ERROR_FILE_NOT_FOUND) {
+            success = false;
         }
-        else {
-            _snprintf_s(oldPath, sizeof(oldPath), _TRUNCATE,
-                "%s.%d", m_logFilePath, i - 1);
-        }
-
-        _snprintf_s(newPath, sizeof(newPath), _TRUNCATE,
-            "%s.%d", m_logFilePath, i);
-
-        MoveFileA(oldPath, newPath);
+        return success;
     }
 
-    // 重置文件大小计数
-    m_currentFileSize.store(0, std::memory_order_relaxed);
+    char source[MAX_PATH]{};
+    char destination[MAX_PATH]{};
+    _snprintf_s(destination, sizeof(destination), _TRUNCATE,
+                "%s.%zu", m_logFilePath, backups);
+    if (!DeleteFileA(destination) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        success = false;
+    }
+
+    for (size_t index = backups; index > 1; --index) {
+        _snprintf_s(source, sizeof(source), _TRUNCATE,
+                    "%s.%zu", m_logFilePath, index - 1);
+        _snprintf_s(destination, sizeof(destination), _TRUNCATE,
+                    "%s.%zu", m_logFilePath, index);
+        if (GetFileAttributesA(source) != INVALID_FILE_ATTRIBUTES &&
+            !MoveFileExA(source, destination, MOVEFILE_REPLACE_EXISTING)) {
+            success = false;
+        }
+    }
+
+    _snprintf_s(destination, sizeof(destination), _TRUNCATE,
+                "%s.1", m_logFilePath);
+    if (GetFileAttributesA(m_logFilePath) != INVALID_FILE_ATTRIBUTES &&
+        !MoveFileExA(m_logFilePath, destination, MOVEFILE_REPLACE_EXISTING)) {
+        success = false;
+    }
+    return success;
 }
 
 void Logger::FormatMessage(char* buffer, size_t bufferSize, LogLevel level, const char* message) {

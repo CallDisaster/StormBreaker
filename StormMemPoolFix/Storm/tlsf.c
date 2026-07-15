@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -387,8 +388,10 @@ int test_optimized_bitops() {
 
 	// 测试大值（仅测试fls_sizet）
 	size_t large_values[] = {
+#if defined(TLSF_64BIT)
 		(size_t)1 << 32,          // 只有第33位设置
 		((size_t)1 << 32) | 1,    // 第33位和第1位设置
+#endif
 		(size_t)-1                // 所有位设置
 	};
 
@@ -1205,6 +1208,23 @@ void tlsf_walk_pool(pool_t pool, tlsf_walker walker, void* user)
 	}
 }
 
+int tlsf_pool_is_empty(pool_t pool)
+{
+	block_header_t* block;
+	block_header_t* next;
+	if (!pool)
+	{
+		return 0;
+	}
+	block = offset_to_block(pool, -(int)block_header_overhead);
+	if (!block_is_free(block) || block_is_last(block))
+	{
+		return 0;
+	}
+	next = block_next(block);
+	return next && block_is_last(next) && !block_is_free(next);
+}
+
 size_t tlsf_block_size(void* ptr)
 {
 	size_t size = 0;
@@ -1214,6 +1234,66 @@ size_t tlsf_block_size(void* ptr)
 		size = block_size(block);
 	}
 	return size;
+}
+
+int tlsf_block_is_free(void* ptr)
+{
+	if (ptr)
+	{
+		const block_header_t* block = block_from_ptr(ptr);
+		return block_is_free(block);
+	}
+	return 1;
+}
+
+int tlsf_block_is_valid_in_range(void* ptr, void* range_base,
+	size_t range_size)
+{
+	uintptr_t address;
+	uintptr_t range_begin;
+	uintptr_t range_end;
+	uintptr_t block_floor;
+	block_header_t* block;
+	block_header_t* next;
+	size_t size;
+
+	if (!ptr || !range_base || range_size < block_start_offset)
+		return 0;
+	address = (uintptr_t)ptr;
+	range_begin = (uintptr_t)range_base;
+	if (range_size > UINTPTR_MAX - range_begin)
+		return 0;
+	range_end = range_begin + range_size;
+	block_floor = range_begin >= block_header_overhead
+		? range_begin - block_header_overhead : 0;
+	if (address < range_begin || address >= range_end ||
+		(address & (ALIGN_SIZE - 1)) != 0)
+		return 0;
+
+	block = block_from_ptr(ptr);
+	if ((uintptr_t)block < block_floor ||
+		(uintptr_t)block > range_end - block_header_overhead)
+		return 0;
+	size = block_size(block);
+	if (size < block_size_min || size >= block_size_max ||
+		(size & (ALIGN_SIZE - 1)) != 0 || size < block_header_overhead)
+		return 0;
+	if (size - block_header_overhead > range_end - address)
+		return 0;
+	next = block_next(block);
+	if ((uintptr_t)next < block_floor ||
+		(uintptr_t)next > range_end - block_header_overhead ||
+		block_is_prev_free(next) || block_is_free(block))
+		return 0;
+	if (block_is_prev_free(block))
+	{
+		block_header_t* previous = block->prev_phys_block;
+		if (!previous || (uintptr_t)previous < block_floor ||
+			(uintptr_t)previous > range_end - block_header_overhead ||
+			!block_is_free(previous) || block_next(previous) != block)
+			return 0;
+	}
+	return 1;
 }
 
 int tlsf_check_pool(pool_t pool)
@@ -1262,6 +1342,78 @@ size_t tlsf_pool_overhead(void)
 size_t tlsf_alloc_overhead(void)
 {
 	return block_header_overhead;
+}
+
+size_t tlsf_allocation_pool_size(size_t bytes, size_t align)
+{
+	size_t adjusted;
+	size_t searchable;
+	size_t required;
+
+	if (!bytes || !align || (align & (align - 1)) != 0)
+	{
+		return 0;
+	}
+	if (align < ALIGN_SIZE)
+	{
+		align = ALIGN_SIZE;
+	}
+
+	if (bytes > SIZE_MAX - (ALIGN_SIZE - 1))
+	{
+		return 0;
+	}
+	adjusted = adjust_request_size(bytes, ALIGN_SIZE);
+	if (!adjusted)
+	{
+		return 0;
+	}
+	searchable = adjusted;
+	if (align > ALIGN_SIZE)
+	{
+		const size_t gap_minimum = sizeof(block_header_t);
+		size_t size_with_gap;
+		if (adjusted > SIZE_MAX - align ||
+			adjusted + align > SIZE_MAX - gap_minimum)
+		{
+			return 0;
+		}
+		size_with_gap = adjusted + align + gap_minimum;
+		if (size_with_gap > SIZE_MAX - (align - 1))
+		{
+			return 0;
+		}
+		searchable = adjust_request_size(size_with_gap, align);
+		if (!searchable)
+		{
+			return 0;
+		}
+	}
+
+	/* mapping_search rounds to the next second-level class. A fresh pool
+	** must map to that class too, not merely contain the unrounded request.
+	*/
+	if (searchable >= SMALL_BLOCK_SIZE)
+	{
+		const int shift = tlsf_fls_sizet(searchable) - SL_INDEX_COUNT_LOG2;
+		const size_t round = (tlsf_cast(size_t, 1) << shift) - 1;
+		if (searchable > SIZE_MAX - round)
+		{
+			return 0;
+		}
+		searchable += round;
+	}
+	if (searchable >= block_size_max || searchable > SIZE_MAX - (ALIGN_SIZE - 1))
+	{
+		return 0;
+	}
+	searchable = align_up(searchable, ALIGN_SIZE);
+	if (searchable > SIZE_MAX - tlsf_pool_overhead())
+	{
+		return 0;
+	}
+	required = searchable + tlsf_pool_overhead();
+	return required;
 }
 
 pool_t tlsf_add_pool(tlsf_t tlsf, void* mem, size_t bytes)
@@ -1365,31 +1517,27 @@ tlsf_t tlsf_create(void* mem) {
     if (test_ffs_fls()) {
         return 0;
     }
-    
-    // 添加优化位操作测试
-    if (!test_optimized_bitops()) {
-        // 如果测试失败，日志已经输出，优化已禁用
-        LogMessage("[TLSF] 使用原始位操作函数");
-    } else {
-        LogMessage("[TLSF] 使用优化位操作函数");
-    }
 #endif
-	// 添加优化位操作测试
+
+#if defined(_DEBUG) || defined(STORMBREAKER_TESTING)
+	// Run implementation self-tests only in diagnostic/test binaries. Release
+	// ASIs use the same table but must not benchmark it while War3 is starting.
 	if (!test_optimized_bitops()) {
-		// 如果测试失败，日志已经输出，优化已禁用
 		printf("[TLSF] 使用原始位操作函数");
 	}
 	else {
 		printf("[TLSF] 使用优化位操作函数");
 	}
 
-	// 验证映射优化
 	if (!test_optimized_mapping_thorough()) {
 		printf("[TLSF] 使用原始映射函数");
 	}
 	else {
 		printf("[TLSF] 使用优化映射函数");
 	}
+#else
+	initialize_mapping_table();
+#endif
 
 	//// 验证映射优化
 	//if (!test_optimized_block_search()) {
@@ -1610,6 +1758,48 @@ void* tlsf_realloc(tlsf_t tlsf, void* ptr, size_t size)
 	}
 
 	return p;
+}
+
+void* tlsf_realloc_in_place(tlsf_t tlsf, void* ptr, size_t size)
+{
+	control_t* control;
+	block_header_t* block;
+	block_header_t* next;
+	size_t cursize;
+	size_t combined;
+	size_t adjust;
+
+	/* This API never implements realloc's allocate/free edge cases. */
+	if (!tlsf || !ptr || size == 0)
+	{
+		return 0;
+	}
+
+	control = tlsf_cast(control_t*, tlsf);
+	block = block_from_ptr(ptr);
+	next = block_next(block);
+	cursize = block_size(block);
+	adjust = adjust_request_size(size, ALIGN_SIZE);
+	if (adjust == 0)
+	{
+		return 0;
+	}
+
+	tlsf_assert(!block_is_free(block) && "block already marked as free");
+	if (adjust > cursize)
+	{
+		combined = cursize + block_size(next) + block_header_overhead;
+		if (!block_is_free(next) || adjust > combined)
+		{
+			return 0;
+		}
+
+		block_merge_next(control, block);
+		block_mark_as_used(block);
+	}
+
+	block_trim_used(control, block, adjust);
+	return ptr;
 }
 
 // 优化的块插入函数
@@ -1934,9 +2124,7 @@ int test_optimized_block_search() {
 		// 如果fl值超出范围，跳过此测试
 		if (fl_orig >= FL_INDEX_COUNT) continue;
 
-		// 保存原始值用于恢复
-		int save_fl_orig = fl_orig;
-		int save_sl_orig = sl_orig;
+		// 保存优化路径的输入用于恢复
 		int save_fl_opt = fl_opt;
 		int save_sl_opt = sl_opt;
 
