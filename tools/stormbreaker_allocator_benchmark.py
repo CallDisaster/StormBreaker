@@ -30,6 +30,7 @@ DEFAULT_EXECUTABLE = (
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "stormbreaker_allocator_benchmark_results"
 
 DIRECT_ENGINES = (
+    "native-storm",
     "winheap",
     "private-heap",
     "rpmalloc",
@@ -37,7 +38,7 @@ DIRECT_ENGINES = (
     "segregated-arena",
     "segregated-hybrid",
 )
-ENGINES = (*DIRECT_ENGINES, "pool", "takeover")
+ENGINES = (*DIRECT_ENGINES, "legacy-large", "pool", "takeover")
 DEFAULT_ENGINES = ("winheap", "takeover")
 DEFAULT_BACKENDS = ("tlsf", "mimalloc", "hybrid")
 BACKENDS = (*DEFAULT_BACKENDS, "tlsf-sharded")

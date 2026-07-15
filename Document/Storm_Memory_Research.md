@@ -870,3 +870,28 @@ process Commit peak fell from about 1090 MiB to 867 MiB, but that process-level
 number is workload-state sensitive and is not treated as statistically
 significant. These runs validate crash behavior and allocator health, not
 map-ready timing.
+
+### Large-only production branch split (2026-07-15)
+
+The full exported-API implementation was frozen on
+`codex/full-takeover-experiment` at `c0c426f`. The production candidate moved
+to `codex/large-block-optimized`. This is an architectural rollback, not only
+a threshold change: the ASI installs ordinals 401/403/404/405, does not
+initialize the heap registry, and does not link `StormTakeover.cpp` or
+`StormHeapRegistry.cpp`. Ordinals 406/481-490/496 and all native small arenas
+remain entirely inside Storm.
+
+The modern single-TLSF backend was retained. It contributes the class-aware
+growth calculation, 64 KiB tight large pools, O(1) empty-pool detection,
+lock-free 64 KiB ownership directory, immutable pinned backend publication,
+growth rollback, and immediate empty extension release. Every managed region
+must end at or below `0x80000000`; a high LAA allocation is released and
+rejected before TLSF can return a pointer to Game or Storm.
+
+Seven exact-mock standard small-churn pairs measured a 1.56% median wall
+overhead for the four-hook path relative to direct native calls, with both
+sampled p99 values at 400 ns. Retaining one empty 16 MiB growth pool had a
+1.04% median wall regression over seven standard map-load pairs and always
+retained the extra 16 MiB, so production keeps zero warm growth pools. These
+are offline framework measurements; the native mock is a Windows heap and
+cannot predict Storm's real large-VirtualAlloc map-load benefit.

@@ -15,6 +15,7 @@
 #include <Storm/StormHook.h>
 #include <Storm/StormOffsets.h>
 #include <Storm/StormTakeover.h>
+#include <Storm/StormVersionProfile.h>
 #include <cstdlib>
 #include <cstdio>
 #include <detours.h>
@@ -23,6 +24,10 @@
 #include <iostream>
 #include <mimalloc.h>
 #include <windows.h>
+
+#ifndef STORMBREAKER_LARGE_ONLY
+#define STORMBREAKER_LARGE_ONLY 0
+#endif
 
 
 namespace {
@@ -276,8 +281,10 @@ void PublishTelemetrySnapshot() noexcept {
   profiler.writerRunning = health.writerRunning;
   Telemetry::UpdateProfilerHealth(profiler);
 
-  const LeakProfiler::TakeoverSnapshot takeover =
-      StormTakeover::GetTelemetrySnapshot();
+  LeakProfiler::TakeoverSnapshot takeover{};
+#if !STORMBREAKER_LARGE_ONLY
+  takeover = StormTakeover::GetTelemetrySnapshot();
+#endif
   LeakProfiler::UpdateTakeoverSnapshot(takeover);
   Telemetry::UpdateTakeover(takeover);
 }
@@ -305,6 +312,61 @@ void EmitControlPanelStatus() noexcept {
   const bool hooks = g_hooksInstalled.load(std::memory_order_acquire);
   const MemoryPool::ExtendedPoolStats pool = MemoryPool::GetExtendedStats();
   const StormHook::RuntimeStats hook = StormHook::GetRuntimeStats();
+#if STORMBREAKER_LARGE_ONLY
+  const char *backend = MemoryPool::GetBackendName();
+  const char *buildIdentity = MemoryPool::GetBuildBackendIdentity();
+  const unsigned long long liveBlocks =
+      static_cast<unsigned long long>(StormHook::GetManagedBlockCount());
+  const unsigned long long liveMiB = static_cast<unsigned long long>(
+      StormHook::GetTotalManagedSize() / (1024u * 1024u));
+  const unsigned long long requestedMiB = static_cast<unsigned long long>(
+      pool.requestedLiveBytes / (1024u * 1024u));
+  const unsigned long long reservedMiB = static_cast<unsigned long long>(
+      pool.reservedBytes / (1024u * 1024u));
+  const unsigned long long committedMiB = static_cast<unsigned long long>(
+      pool.committedBytes / (1024u * 1024u));
+
+  Logger::GetInstance().LogInfo(
+      "[ControlPanel] ready=%s hooks=%s backend=%s build=%s "
+      "mode=large-four-hook threshold=0x%zX liveBlocks=%llu live=%llu MiB "
+      "requested=%llu MiB reserved=%llu MiB committed=%llu MiB "
+      "managedAlloc=%llu managedFree=%llu fallback=%llu failures=%llu",
+      ready ? "yes" : "no", hooks ? "yes" : "no", backend,
+      buildIdentity, StormHook::GetLargeBlockThreshold(), liveBlocks, liveMiB,
+      requestedMiB, reservedMiB, committedMiB,
+      static_cast<unsigned long long>(hook.managedAllocations),
+      static_cast<unsigned long long>(hook.managedFrees),
+      static_cast<unsigned long long>(hook.fallbackAllocations),
+      static_cast<unsigned long long>(hook.failures));
+  Logger::GetInstance().FlushLogs();
+
+  if (GetConsoleWindow() != nullptr) {
+    char title[128]{};
+    std::snprintf(title, sizeof(title),
+                  "StormBreaker Large Block - %s - %s", backend,
+                  hooks ? "HOOKED" : "NOT HOOKED");
+    SetConsoleTitleA(title);
+    std::printf(
+        "\n[StormBreaker Large Block Control Panel] READY=%s HOOKS=%s "
+        "BACKEND=%s\n"
+        "  build identity=%s, takeover=large-four-hook, threshold=0x%zX\n"
+        "  live blocks=%llu, live=%llu MiB, requested=%llu MiB\n"
+        "  reserved=%llu MiB, committed=%llu MiB\n"
+        "  managed alloc=%llu, managed free=%llu, fallback=%llu, "
+        "failures=%llu\n"
+        "  next refresh in %lu seconds\n",
+        ready ? "YES" : "NO", hooks ? "YES" : "NO", backend,
+        buildIdentity, StormHook::GetLargeBlockThreshold(), liveBlocks,
+        liveMiB, requestedMiB, reservedMiB, committedMiB,
+        static_cast<unsigned long long>(hook.managedAllocations),
+        static_cast<unsigned long long>(hook.managedFrees),
+        static_cast<unsigned long long>(hook.fallbackAllocations),
+        static_cast<unsigned long long>(hook.failures),
+        ControlPanelIntervalMilliseconds() / 1000);
+    std::fflush(stdout);
+  }
+  return;
+#else
   const StormTakeover::RuntimeStats takeover =
       StormTakeover::GetRuntimeStats();
   const unsigned long long liveBlocks = static_cast<unsigned long long>(
@@ -414,6 +476,7 @@ void EmitControlPanelStatus() noexcept {
         ControlPanelIntervalMilliseconds() / 1000);
     std::fflush(stdout);
   }
+#endif
 }
 
 DWORD WINAPI ControlPanelThreadMain(LPVOID) {
@@ -588,6 +651,7 @@ bool InitializeStormBreaker() {
     return false;
   }
 
+#if !STORMBREAKER_LARGE_ONLY
   if (!StormTakeover::Initialize()) {
     Logger::GetInstance().LogError("Storm全导出接管层初始化失败");
     StormHook::Shutdown();
@@ -595,10 +659,16 @@ bool InitializeStormBreaker() {
     MemoryPool::Shutdown();
     return false;
   }
+#else
+  Logger::GetInstance().LogInfo(
+      "大块专用构建：不初始化全导出 registry，不接管 Storm 小块 heap");
+#endif
 
   if (!StormBreaker::LeakProfiler::StartFromEnvironment()) {
     Logger::GetInstance().LogError("LeakProfiler初始化失败");
+#if !STORMBREAKER_LARGE_ONLY
     StormTakeover::Shutdown();
+#endif
     StormHook::Shutdown();
     MemorySafety::GetInstance().Shutdown();
     MemoryPool::Shutdown();
@@ -610,7 +680,9 @@ bool InitializeStormBreaker() {
       Logger::GetInstance().LogError("遥测输出初始化失败");
       StormBreaker::Telemetry::SetSnapshotProvider(nullptr);
       StormBreaker::LeakProfiler::Stop();
+#if !STORMBREAKER_LARGE_ONLY
       StormTakeover::Shutdown();
+#endif
       StormHook::Shutdown();
       MemorySafety::GetInstance().Shutdown();
       MemoryPool::Shutdown();
@@ -634,8 +706,12 @@ bool InitializeStormBreaker() {
 void ShutdownStormBreaker() {
   Logger::GetInstance().LogInfo("关闭StormBreaker系统...");
 
+#if STORMBREAKER_LARGE_ONLY
+  const size_t liveManagedBlocks = StormHook::GetManagedBlockCount();
+#else
   const size_t liveManagedBlocks = static_cast<size_t>(
       StormTakeover::GetRuntimeStats().liveBlocks);
+#endif
   const uint64_t livePoolBytes =
       MemoryPool::GetExtendedStats().requestedLiveBytes;
   if (g_hooksInstalled.load(std::memory_order_acquire) &&
@@ -682,11 +758,13 @@ void ShutdownStormBreaker() {
   StormBreaker::LeakProfiler::Stop();
 
   // 关闭各个子系统
+#if !STORMBREAKER_LARGE_ONLY
   if (!StormTakeover::Shutdown()) {
     Logger::GetInstance().LogError(
         "拒绝继续关闭：全导出接管层仍有存活块或Hook");
     return;
   }
+#endif
   StormHook::Shutdown();
   MemorySafety::GetInstance().Shutdown();
   MemoryPool::Shutdown();
@@ -710,6 +788,91 @@ bool InstallStormHooks() {
   if (g_hooksInstalled.load(std::memory_order_acquire)) {
     return true;
   }
+#if STORMBREAKER_LARGE_ONLY
+  HMODULE storm = GetModuleHandleA("Storm.dll");
+  StormApi::ResolvedApi verified{};
+  wchar_t failure[256]{};
+  if (!storm || !StormVersionProfile::ResolveVerified127a(
+                    storm, &verified, failure, ARRAYSIZE(failure))) {
+    Logger::GetInstance().LogError(
+        "大块Hook版本校验失败；保持原生Storm不变: %ls", failure);
+    return false;
+  }
+
+  g_origStormAlloc = reinterpret_cast<Storm_MemAlloc_t>(verified.alloc);
+  g_origStormFree = reinterpret_cast<Storm_MemFree_t>(verified.free);
+  g_origStormGetSize =
+      reinterpret_cast<Storm_MemGetSize_t>(verified.getSize);
+  g_origStormReAlloc =
+      reinterpret_cast<Storm_MemReAlloc_t>(verified.reAlloc);
+  g_origCleanupAll = nullptr;
+  g_origResetMemoryManager = nullptr;
+
+  const auto clearOriginals = []() noexcept {
+    g_origStormAlloc = nullptr;
+    g_origStormFree = nullptr;
+    g_origStormGetSize = nullptr;
+    g_origStormReAlloc = nullptr;
+  };
+  LONG result = DetourTransactionBegin();
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError(
+        "大块Hook DetourTransactionBegin失败: %ld", result);
+    clearOriginals();
+    return false;
+  }
+  result = DetourUpdateThread(GetCurrentThread());
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError(
+        "大块Hook DetourUpdateThread失败: %ld", result);
+    DetourTransactionAbort();
+    clearOriginals();
+    return false;
+  }
+
+  const auto attach = [](PVOID *target, PVOID hook,
+                         const char *name) noexcept -> bool {
+    const LONG attachResult = DetourAttach(target, hook);
+    if (attachResult != NO_ERROR) {
+      Logger::GetInstance().LogError(
+          "DetourAttach(%s)失败: %ld", name, attachResult);
+      return false;
+    }
+    return true;
+  };
+  const bool attached =
+      attach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemAlloc),
+             "401 SMemAlloc") &&
+      attach(&reinterpret_cast<PVOID &>(g_origStormFree),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemFree),
+             "403 SMemFree") &&
+      attach(&reinterpret_cast<PVOID &>(g_origStormGetSize),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemGetSize),
+             "404 SMemGetSize") &&
+      attach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemReAlloc),
+             "405 SMemReAlloc");
+  if (!attached) {
+    DetourTransactionAbort();
+    clearOriginals();
+    return false;
+  }
+  result = DetourTransactionCommit();
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError(
+        "大块Hook Detours事务提交失败: %ld", result);
+    clearOriginals();
+    return false;
+  }
+
+  g_hooksInstalled.store(true, std::memory_order_release);
+  Logger::GetInstance().LogInfo(
+      "Storm大块Hook安装成功: ordinals 401/403/404/405, threshold=0x%zX",
+      StormHook::GetLargeBlockThreshold());
+  PublishTelemetrySnapshot();
+  return true;
+#else
   HMODULE verifiedStorm = GetModuleHandleA("Storm.dll");
   if (!verifiedStorm || !StormTakeover::Install(verifiedStorm)) {
     Logger::GetInstance().LogError(
@@ -719,6 +882,7 @@ bool InstallStormHooks() {
   g_hooksInstalled.store(true, std::memory_order_release);
   PublishTelemetrySnapshot();
   return true;
+#endif
 
 #if 0 // Retained only as a source-level reference for the legacy large hook.
 
@@ -860,6 +1024,65 @@ bool UninstallStormHooks() {
   if (!g_hooksInstalled.load(std::memory_order_acquire)) {
     return true;
   }
+#if STORMBREAKER_LARGE_ONLY
+  LONG result = DetourTransactionBegin();
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError(
+        "大块Hook卸载事务启动失败: %ld", result);
+    return false;
+  }
+  result = DetourUpdateThread(GetCurrentThread());
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError(
+        "大块Hook卸载线程登记失败: %ld", result);
+    DetourTransactionAbort();
+    return false;
+  }
+
+  const auto detach = [](PVOID *target, PVOID hook,
+                         const char *name) noexcept -> bool {
+    const LONG detachResult = DetourDetach(target, hook);
+    if (detachResult != NO_ERROR) {
+      Logger::GetInstance().LogError(
+          "DetourDetach(%s)失败: %ld", name, detachResult);
+      return false;
+    }
+    return true;
+  };
+  const bool detached =
+      detach(&reinterpret_cast<PVOID &>(g_origStormAlloc),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemAlloc),
+             "401 SMemAlloc") &&
+      detach(&reinterpret_cast<PVOID &>(g_origStormFree),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemFree),
+             "403 SMemFree") &&
+      detach(&reinterpret_cast<PVOID &>(g_origStormGetSize),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemGetSize),
+             "404 SMemGetSize") &&
+      detach(&reinterpret_cast<PVOID &>(g_origStormReAlloc),
+             reinterpret_cast<PVOID>(Hooked_Storm_MemReAlloc),
+             "405 SMemReAlloc");
+  if (!detached) {
+    DetourTransactionAbort();
+    Logger::GetInstance().LogError(
+        "大块Hook未完整卸载；保留trampoline、Hook和内存池");
+    return false;
+  }
+  result = DetourTransactionCommit();
+  if (result != NO_ERROR) {
+    Logger::GetInstance().LogError(
+        "大块Hook卸载事务提交失败: %ld；保留后端");
+    return false;
+  }
+
+  g_hooksInstalled.store(false, std::memory_order_release);
+  g_origStormAlloc = nullptr;
+  g_origStormFree = nullptr;
+  g_origStormGetSize = nullptr;
+  g_origStormReAlloc = nullptr;
+  PublishTelemetrySnapshot();
+  return true;
+#else
   if (!StormTakeover::Uninstall()) {
     Logger::GetInstance().LogError(
         "全导出Detours未完整卸载；保留trampoline、Hook和内存池");
@@ -868,6 +1091,7 @@ bool UninstallStormHooks() {
   g_hooksInstalled.store(false, std::memory_order_release);
   PublishTelemetrySnapshot();
   return true;
+#endif
 
 #if 0 // Retained only as a source-level reference for the legacy large hook.
   if (!g_hooksInstalled.load(std::memory_order_acquire)) {

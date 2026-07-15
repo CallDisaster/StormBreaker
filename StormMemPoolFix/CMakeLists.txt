@@ -13,10 +13,8 @@ set(STORMBREAKER_LIBRARY_SOURCES
   Game/PathCapUnlock.cpp
   Storm/MemoryPool.cpp
   Storm/MimallocBackend.cpp
-  Storm/StormHeapRegistry.cpp
   Storm/StormHook.cpp
   Storm/StormOffsets.cpp
-  Storm/StormTakeover.cpp
   Storm/StormVersionProfile.cpp
   Storm/TlsfBackend.cpp
   Storm/tlsf.c
@@ -38,6 +36,7 @@ function(add_stormbreaker_library target_name output_name default_backend lock_b
     _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
     MI_STATIC_LIB
     STORMBREAKER_PINNED_RUNTIME=1
+    STORMBREAKER_LARGE_ONLY=1
     STORMBREAKER_DEFAULT_BACKEND=${default_backend}
     STORMBREAKER_LOCK_MEMORY_BACKEND=${lock_backend}
   )
@@ -75,8 +74,8 @@ function(add_stormbreaker_library target_name output_name default_backend lock_b
   endforeach()
 endfunction()
 
-# Generic build: TLSF by default, runtime environment selection remains enabled.
-add_stormbreaker_library(StormBreaker StormBreaker 0 0)
+# Production build on this branch is deliberately locked to large-block TLSF.
+add_stormbreaker_library(StormBreaker StormBreaker 0 1)
 
 option(STORMBREAKER_BUILD_VARIANTS
   "Build backend-locked TLSF and mimalloc ASIs for manual comparison" OFF)
@@ -143,6 +142,7 @@ if(STORMBREAKER_BUILD_TESTS)
     MI_STATIC_LIB
     STORMBREAKER_TESTING
     STORMBREAKER_PINNED_RUNTIME=0
+    STORMBREAKER_LARGE_ONLY=0
     STORMBREAKER_DEFAULT_BACKEND=0
     STORMBREAKER_LOCK_MEMORY_BACKEND=0
   )

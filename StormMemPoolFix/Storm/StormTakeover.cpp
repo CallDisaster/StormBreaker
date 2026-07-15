@@ -23,6 +23,10 @@
 #define STORMBREAKER_BENCHMARK_PINNED_HOTPATH 0
 #endif
 
+#ifndef STORMBREAKER_LARGE_ONLY
+#define STORMBREAKER_LARGE_ONLY 0
+#endif
+
 namespace {
 
 #pragma pack(push, 1)
@@ -608,8 +612,20 @@ bool ShouldManage(uint32_t size) noexcept {
   return size >= g_threshold.load(std::memory_order_relaxed);
 }
 
+bool CanPassDirectlyToNative(const void* pointer) noexcept {
+  return g_mode.load(std::memory_order_relaxed) ==
+             StormTakeover::TakeoverMode::Large &&
+         !DetailedAccountingEnabled() && !WasRecentlyFreed(pointer) &&
+         !MemoryPool::MayOwnAddress(pointer, nullptr);
+}
+
 bool ParseTakeoverMode(StormTakeover::TakeoverMode* mode,
                        uint32_t* threshold) noexcept {
+#if STORMBREAKER_LARGE_ONLY
+  *mode = StormTakeover::TakeoverMode::Large;
+  *threshold = StormApi::kNativeLargeThreshold;
+  return true;
+#else
   char value[32]{};
   const DWORD length = GetEnvironmentVariableA(
       "STORMBREAKER_TAKEOVER_MODE", value, ARRAYSIZE(value));
@@ -643,6 +659,7 @@ bool ParseTakeoverMode(StormTakeover::TakeoverMode* mode,
     return false;
   }
   return true;
+#endif
 }
 
 uint32_t GenerateSecret() noexcept {
@@ -816,13 +833,20 @@ bool DecodeRawAllocation(void* raw, size_t usableSize,
 
 bool TryDecodePointerHeader(const void* pointer,
                             ManagedBlock* output) noexcept {
-  if (!pointer || !output || WasRecentlyFreed(pointer)) {
+  if (!pointer || !output || WasRecentlyFreed(pointer) ||
+      !MemoryPool::MayOwnAddress(pointer, nullptr)) {
     return false;
   }
   const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
-  const size_t headerSizes[] = {sizeof(SmallManagedHeader),
+  const bool largeOnly =
+      g_mode.load(std::memory_order_relaxed) ==
+      StormTakeover::TakeoverMode::Large;
+  const size_t headerSizes[] = {largeOnly ? sizeof(LargeManagedHeader)
+                                         : sizeof(SmallManagedHeader),
                                 sizeof(LargeManagedHeader)};
-  for (size_t headerSize : headerSizes) {
+  const size_t headerCount = largeOnly ? 1u : ARRAYSIZE(headerSizes);
+  for (size_t index = 0; index < headerCount; ++index) {
+    const size_t headerSize = headerSizes[index];
     if (address < headerSize) {
       continue;
     }
@@ -864,12 +888,21 @@ StormTakeover::BlockQueryResult QueryPointerImpl(
   if (WasRecentlyFreed(pointer)) {
     return StormTakeover::BlockQueryResult::Rejected;
   }
+  if (!MemoryPool::MayOwnAddress(pointer, nullptr)) {
+    return StormTakeover::BlockQueryResult::Native;
+  }
 
   const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
-  const size_t headerSizes[] = {sizeof(SmallManagedHeader),
+  const bool largeOnly =
+      g_mode.load(std::memory_order_relaxed) ==
+      StormTakeover::TakeoverMode::Large;
+  const size_t headerSizes[] = {largeOnly ? sizeof(LargeManagedHeader)
+                                         : sizeof(SmallManagedHeader),
                                 sizeof(LargeManagedHeader)};
+  const size_t headerCount = largeOnly ? 1u : ARRAYSIZE(headerSizes);
   bool sawOwnedCandidate = false;
-  for (size_t headerSize : headerSizes) {
+  for (size_t index = 0; index < headerCount; ++index) {
+    const size_t headerSize = headerSizes[index];
     if (address < headerSize) {
       continue;
     }
@@ -1203,13 +1236,17 @@ FastFreeResult TryFastManagedFree(void* pointer, uint32_t expectedHeapId,
   ConditionalManagedFreeContext validation{};
   validation.expectedUser = pointer;
   validation.route = candidate.route;
+  // Publish the tombstone before the backend can release its final pool. This
+  // closes the window where a concurrent double-free could otherwise miss
+  // both the managed address directory and the recent-free table.
+  RememberFreed(pointer);
   if (!MemoryPool::FreeRoutedConditional(
           candidate.raw, candidate.requestedSize, candidate.route,
           &ValidateAndPoisonManagedFree, &validation, nullptr)) {
+    ForgetFreed(pointer);
     result.disposition = FastFreeDisposition::Rejected;
     return result;
   }
-  RememberFreed(pointer);
   AccountFree(guard, validation.block);
   result.disposition = FastFreeDisposition::Freed;
   result.block = validation.block;
@@ -3601,6 +3638,14 @@ extern "C" int __stdcall HookedFull_SMemFree(
   if (!depth.IsOutermost()) {
     return CallNativeFree(pointer, sourceFile, sourceLine, flags);
   }
+  if (CanPassDirectlyToNative(pointer)) {
+    const NativeLargeInfo largeInfo = QueryNativeLarge(pointer);
+    const int result = CallNativeFree(pointer, sourceFile, sourceLine, flags);
+    if (result) {
+      ApplyNativeCounterCorrection(largeInfo);
+    }
+    return result;
+  }
   const FastFreeResult fastFree =
       TryFastManagedFree(pointer, 0, false);
   if (fastFree.disposition == FastFreeDisposition::Freed) {
@@ -3682,6 +3727,9 @@ extern "C" int __stdcall HookedFull_SMemGetSize(
     const void* pointer, const char* sourceFile, int32_t sourceLine) {
   ScopedHookDepth depth;
   if (!depth.IsOutermost()) {
+    return CallNativeGetSize(pointer, sourceFile, sourceLine);
+  }
+  if (CanPassDirectlyToNative(pointer)) {
     return CallNativeGetSize(pointer, sourceFile, sourceLine);
   }
   ManagedBlock block{};
@@ -3773,6 +3821,16 @@ extern "C" void* __fastcall HookedFull_SMemReAlloc(
                                     StormBreaker::LeakProfiler::BackendRoute::NativeStorm,
                                     reason, attemptedManaged || protectFallback,
                                     attemptedManaged || protectFallback));
+    return native;
+  }
+
+  if (CanPassDirectlyToNative(pointer)) {
+    const NativeLargeInfo largeInfo = QueryNativeLarge(pointer);
+    void* native = CallNativeReAlloc(ecx, edx, pointer, newSize, sourceFile,
+                                     sourceLine, flags);
+    if (native && native != pointer) {
+      ApplyNativeCounterCorrection(largeInfo);
+    }
     return native;
   }
 

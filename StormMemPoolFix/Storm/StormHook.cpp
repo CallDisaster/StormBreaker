@@ -15,6 +15,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef STORMBREAKER_LARGE_ONLY
+#define STORMBREAKER_LARGE_ONLY 0
+#endif
+
 // ======================== 全局变量定义 ========================
 Storm_MemAlloc_t g_origStormAlloc = nullptr;
 Storm_MemFree_t g_origStormFree = nullptr;
@@ -97,6 +101,22 @@ thread_local void *tls_rejectedManagedProbe = nullptr;
 // 关闭状态
 std::atomic<bool> g_shutdownMode{false};
 std::atomic<DWORD> g_shutdownThreadId{0};
+#if defined(STORMBREAKER_TESTING)
+std::atomic<bool> g_testingMinimalLargeHookPath{false};
+#endif
+
+bool MinimalLargeHookPathEnabled() noexcept {
+#if defined(STORMBREAKER_TESTING)
+  if (!g_testingMinimalLargeHookPath.load(std::memory_order_relaxed)) {
+    return false;
+  }
+#elif !STORMBREAKER_LARGE_ONLY
+  return false;
+#endif
+  return !g_runtimeStatsEnabled.load(std::memory_order_relaxed) &&
+         !g_shutdownMode.load(std::memory_order_acquire) &&
+         !StormBreaker::LeakProfiler::IsEnabled();
+}
 
 class ScopedHookFlag {
 public:
@@ -351,12 +371,7 @@ bool IsRecentlyFreedPointer(void *userPtr) {
   const uintptr_t observed =
       g_recentlyFreedPointers[FreedPointerSlot(userPtr)].load(
           std::memory_order_acquire);
-  if (observed != value || value < sizeof(StormAllocHeader)) {
-    return false;
-  }
-
-  void *rawPtr = reinterpret_cast<void *>(value - sizeof(StormAllocHeader));
-  return MemoryPool::IsFromPool(rawPtr);
+  return observed == value && value >= sizeof(StormAllocHeader);
 }
 
 bool HeaderHasManagedMarker(const StormAllocHeader &header) {
@@ -374,6 +389,9 @@ bool HeaderHasManagedMarker(const StormAllocHeader &header) {
 bool HasManagedHeaderMarker(void *userPtr) {
   if (!userPtr || reinterpret_cast<uintptr_t>(userPtr) <
                       sizeof(StormAllocHeader)) {
+    return false;
+  }
+  if (!MemoryPool::MayOwnAddress(userPtr, nullptr)) {
     return false;
   }
   __try {
@@ -434,9 +452,17 @@ bool QueryManagedBlock(void *userPtr, StormAllocHeader **outOriginalHeader,
   if (!userPtr)
     return false;
 
+  if (IsRecentlyFreedPointer(userPtr)) {
+    tls_rejectedManagedProbe = userPtr;
+    return false;
+  }
+
   uint8_t *ptr = static_cast<uint8_t *>(userPtr);
   uintptr_t ptrValue = reinterpret_cast<uintptr_t>(ptr);
   if (ptrValue < sizeof(StormAllocHeader) || (ptrValue & 0x0F) != 0) {
+    return false;
+  }
+  if (!MemoryPool::MayOwnAddress(userPtr, nullptr)) {
     return false;
   }
 
@@ -562,6 +588,11 @@ struct NativeLargeBlockInfo {
   size_t stormAccountedSize = 0;
   size_t counterCorrection = 0;
 };
+
+bool NativeReallocReleasedOldPointer(void *oldPtr, void *newPtr,
+                                     size_t newSize) noexcept {
+  return oldPtr && ((newPtr && newPtr != oldPtr) || newSize == 0);
+}
 
 NativeLargeBlockInfo QueryNativeLargeBlockForCounterFix(void *userPtr) {
   NativeLargeBlockInfo info{};
@@ -976,6 +1007,14 @@ bool ValidateBlockAlignment(void *userPtr) {
 
   return IsPointerAligned(userPtr, 16);
 }
+
+#if defined(STORMBREAKER_TESTING)
+namespace Testing {
+void SetMinimalLargeHookPathEnabled(bool enabled) noexcept {
+  g_testingMinimalLargeHookPath.store(enabled, std::memory_order_release);
+}
+} // namespace Testing
+#endif
 } // namespace StormHook
 
 // ======================== Hook函数实现 ========================
@@ -983,6 +1022,12 @@ bool ValidateBlockAlignment(void *userPtr) {
 void *__fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
                                        const char *name, DWORD srcLine,
                                        DWORD flags) {
+#if STORMBREAKER_LARGE_ONLY || defined(STORMBREAKER_TESTING)
+  if (MinimalLargeHookPathEnabled() &&
+      size < g_largeBlockThreshold.load(std::memory_order_relaxed)) {
+    return g_origStormAlloc(ecx, edx, size, name, srcLine, flags);
+  }
+#endif
   AddRuntimeStat(g_hookAllocCalls);
   if (StormHook_Internal::ShouldBypassHooks()) {
     AddRuntimeStat(g_hookBypassCalls);
@@ -1037,6 +1082,23 @@ void *__fastcall Hooked_Storm_MemAlloc(int ecx, int edx, size_t size,
 
 int __stdcall Hooked_Storm_MemFree(void *ptr, const char *name, int argList,
                                    DWORD flags) {
+#if STORMBREAKER_LARGE_ONLY || defined(STORMBREAKER_TESTING)
+  if (!ptr) {
+    return 1;
+  }
+  if (MinimalLargeHookPathEnabled() &&
+      !StormHook_Internal::IsRecentlyFreedPointer(ptr) &&
+      !MemoryPool::MayOwnAddress(ptr, nullptr)) {
+    const auto nativeLargeInfo =
+        StormHook_Internal::QueryNativeLargeBlockForCounterFix(ptr);
+    const int result = g_origStormFree(ptr, name, argList, flags);
+    if (result != 0) {
+      StormHook_Internal::ApplyNativeLargeFreeCounterCorrection(
+          nativeLargeInfo);
+    }
+    return result;
+  }
+#endif
   AddRuntimeStat(g_hookFreeCalls);
   const bool profilerEnabled = StormBreaker::LeakProfiler::IsEnabled();
   if (StormHook_Internal::ShouldBypassHooks()) {
@@ -1109,6 +1171,13 @@ int __stdcall Hooked_Storm_MemFree(void *ptr, const char *name, int argList,
 
 int __stdcall Hooked_Storm_MemGetSize(void *ptr, const char *name,
                                       int argList) {
+#if STORMBREAKER_LARGE_ONLY || defined(STORMBREAKER_TESTING)
+  if (MinimalLargeHookPathEnabled() && ptr &&
+      !StormHook_Internal::IsRecentlyFreedPointer(ptr) &&
+      !MemoryPool::MayOwnAddress(ptr, nullptr)) {
+    return g_origStormGetSize(ptr, name, argList);
+  }
+#endif
   AddRuntimeStat(g_hookGetSizeCalls);
   if (StormHook_Internal::ShouldBypassHooks()) {
     AddRuntimeStat(g_hookBypassCalls);
@@ -1138,6 +1207,25 @@ int __stdcall Hooked_Storm_MemGetSize(void *ptr, const char *name,
 void *__fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void *oldPtr,
                                          size_t newSize, const char *name,
                                          DWORD srcLine, DWORD flags) {
+#if STORMBREAKER_LARGE_ONLY || defined(STORMBREAKER_TESTING)
+  if (MinimalLargeHookPathEnabled() &&
+      ((!oldPtr &&
+       newSize < g_largeBlockThreshold.load(std::memory_order_relaxed)) ||
+       (oldPtr && !StormHook_Internal::IsRecentlyFreedPointer(oldPtr) &&
+        !MemoryPool::MayOwnAddress(oldPtr, nullptr)))) {
+    const auto nativeLargeInfo =
+        StormHook_Internal::QueryNativeLargeBlockForCounterFix(oldPtr);
+    void *result =
+        g_origStormReAlloc(ecx, edx, oldPtr, newSize, name, srcLine, flags);
+    if ((flags & 0x10) == 0 &&
+        StormHook_Internal::NativeReallocReleasedOldPointer(
+            oldPtr, result, newSize)) {
+      StormHook_Internal::ApplyNativeLargeFreeCounterCorrection(
+          nativeLargeInfo);
+    }
+    return result;
+  }
+#endif
   using StormBreaker::LeakProfiler::AllocationDomain;
   AddRuntimeStat(g_hookReallocCalls);
 
@@ -1157,7 +1245,8 @@ void *__fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void *oldPtr,
         ecx, edx, oldPtr, newSize, name, srcLine, flags);
     const bool succeeded = SEH_Helpers::GetLastExceptionCode() == 0;
     const bool oldFreed =
-        succeeded && oldPtr && (result != nullptr || newSize == 0);
+        succeeded && StormHook_Internal::NativeReallocReleasedOldPointer(
+                         oldPtr, result, newSize);
     const bool newAllocated = succeeded && result != nullptr;
     RecordReallocProfile(profilerEnabled, oldPtr, result, observedOldSize,
                          newSize, oldFreed,
@@ -1251,7 +1340,11 @@ void *__fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void *oldPtr,
 
   // 检查是否有异常发生
   DWORD exceptCode = SEH_Helpers::GetLastExceptionCode();
-  if (exceptCode == 0 && (flags & 0x10) == 0) {
+  const bool oldFreed =
+      exceptCode == 0 &&
+      StormHook_Internal::NativeReallocReleasedOldPointer(oldPtr, result,
+                                                          newSize);
+  if (oldFreed && (flags & 0x10) == 0) {
     StormHook_Internal::ApplyNativeLargeFreeCounterCorrection(nativeLargeInfo);
   }
   if (exceptCode != 0) {
@@ -1263,8 +1356,6 @@ void *__fastcall Hooked_Storm_MemReAlloc(int ecx, int edx, void *oldPtr,
   }
 
   const bool succeeded = exceptCode == 0;
-  const bool oldFreed =
-      succeeded && oldPtr && (result != nullptr || newSize == 0);
   const bool newAllocated = succeeded && result != nullptr;
   if (newAllocated) {
     AddRuntimeStat(g_nativeAllocations);

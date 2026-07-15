@@ -1541,6 +1541,37 @@ bool OwnsAddress(const void* ptr, BackendRoute* route) {
     return owned;
 }
 
+bool MayOwnAddress(const void* ptr, BackendRoute* route) {
+    if (route) {
+        *route = BackendRoute::Automatic;
+    }
+    if (!ptr) {
+        return false;
+    }
+
+    BackendOperationPin operation;
+    if (!operation) {
+        return false;
+    }
+    BackendSet* backends = PublishedBackendSet();
+    if (!backends) {
+        return false;
+    }
+
+    const BackendRoute candidates[] = {
+        BackendRoute::Tlsf, BackendRoute::Mimalloc};
+    for (BackendRoute candidateRoute : candidates) {
+        MemoryBackend* candidate = BackendForRoute(backends, candidateRoute);
+        if (candidate && candidate->MayContainAddress(ptr)) {
+            if (route) {
+                *route = candidateRoute;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 bool QueryAllocation(
     void* ptr, AllocationOwnership* ownership) {
     return QueryAllocation(ptr, BackendRoute::Automatic, ownership);

@@ -118,12 +118,14 @@ class ScheduleTests(unittest.TestCase):
         )
         self.assertEqual(
             {
+                "native-storm",
                 "winheap",
                 "private-heap",
                 "rpmalloc",
                 "rpmalloc-threaded",
                 "segregated-arena",
                 "segregated-hybrid",
+                "legacy-large/tlsf",
                 "pool/tlsf",
                 "pool/mimalloc",
                 "takeover/tlsf",

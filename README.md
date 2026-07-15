@@ -1,8 +1,8 @@
 # StormBreaker
 
-StormBreaker 是面向 Warcraft III 1.27a x86 的 Storm 内存 API 兼容与优化插件。它具备在 Storm 导出边界接管 ordinals `401/403/404/405/406/481-490/496` 的能力，保留原生 Storm 数据结构不变，并支持 TLSF、mimalloc v3.3.2 与 hybrid 后端。
+StormBreaker 是面向 Warcraft III 1.27a x86 的 Storm 内存 API 兼容与优化插件。
 
-当前生产安全默认值仍是 `large/tlsf`：只托管 `>= 0xFE7C` 的请求。`full/hybrid` 已完成实现和离线测试，但必须通过真实地图与 WorldEdit 的内存、延迟和 32 位地址空间门槛后才能晋级为默认。
+当前 `codex/large-block-optimized` 分支是编译期锁定的 `large/tlsf` 版本：只安装 ordinals `401/403/404/405`，只托管 `>= 0xFE7C` 的请求，并从生产链接中移除了全接管 registry。完整导出接管保存在 `codex/full-takeover-experiment`。分支结构、TLSF 改进和本轮基准详见 [大块接管优化分支](Document/Large_Block_Optimized_Branch.md)。
 
 ## 版本门禁
 
@@ -18,9 +18,9 @@ War3 运行时要求匹配 `Storm.dll + Game.dll`；WorldEdit 运行时要求匹
 
 ## 当前实现
 
-### 全导出接管
+### 接管边界
 
-为保证分阶段兼容，`large` 生产档只安装 `401/403/404/405` 核心 Hook；`32k/8k/2k/256/full` 才安装完整 `401-496` 导出面。这样 large 不再改变 Game 可观察的 406/482/496 行为，也缩短 Detours 暂停其他线程的时间。
+当前生产 ASI 只安装 `401/403/404/405` 核心 Hook，不初始化或链接全接管 heap registry。这样不会改变 Game 可观察的 `406/482/496` 行为，也不会让原生小块经过 full takeover 的 heap-ID 路径。下列完整导出能力属于实验分支和离线测试目标。
 
 - `401/403/404/405`：通用 alloc/free/size/realloc，按每个指针的受保护头与后端所有权在托管和原生域之间分流。
 - `406`：在全导出档返回原生存量与托管 requested-live 的统一 32 位计数，并同步三个可选输出参数；不再暴露后端头部和 size-class 舍入差异。
@@ -78,7 +78,7 @@ STORMBREAKER_MIMALLOC_PAGE_FULL_RETAIN=-1..8
 STORMBREAKER_MIMALLOC_PAGE_MAX_CANDIDATES=1..16
 ```
 
-默认值是 `large/tlsf/system/profiler-off/telemetry-off`。可显式设置 `STORMBREAKER_TLSF_ADDRESS_POLICY=clustered` 运行高地址布局诊断；clustered 主池若无法分配，会记录警告并自动退回 system 布局。非法 takeover/backend/address-policy 值或指定后端初始化失败会拒绝初始化。`tlsf-sharded` 已实现但未通过标准 map-load 与内存门槛，只用于离线诊断。
+当前分支的生产值编译期锁定为 `large/tlsf/system/profiler-off/telemetry-off`；`STORMBREAKER_TAKEOVER_MODE` 和 `STORMBREAKER_MEMORY_BACKEND` 不会改写生产选择。所有 TLSF 地址范围还必须完整低于 `0x80000000`。`tlsf-sharded`、mimalloc、hybrid 和 full takeover 只在实验分支或离线测试目标中使用。
 `STORMBREAKER_MIMALLOC_PURGE_DELAY_MS` 默认为 `-1`（关闭自动 purge）；非负值用于诊断上游 mimalloc 的延迟策略。
 其余 mimalloc 参数只用于离线诊断：arena 的 `0` 表示上游 x86 默认 128 MiB，满页保留与候选页搜索默认分别为 `2/4`。当前没有任何组合通过相对 TLSF 的 3% 内存门槛。
 
@@ -129,7 +129,7 @@ cmake --build build-stormbreaker --config Release --target `
 
 输出位于 `StormMemPoolFix/Build/`：
 
-- `StormBreaker.asi`：默认 TLSF，可由环境变量选择后端和 takeover mode。
+- `StormBreaker.asi`：当前分支的四 Hook、大块专用、后端锁定 TLSF 产物。
 - `StormBreaker-TLSF.asi`：后端锁定 TLSF。
 - `StormBreaker-mimalloc.asi`：后端锁定 mimalloc。
 - `StormBreaker-hybrid.asi`：后端锁定 hybrid。
@@ -140,7 +140,7 @@ cmake --build build-stormbreaker --config Release --target `
 python tools/write_stormbreaker_variant_manifest.py
 ```
 
-锁定版只锁后端；takeover mode 仍由 `STORMBREAKER_TAKEOVER_MODE` 选择。
+当前生产构建同时锁定后端与 takeover 边界；环境变量不能把它切换为 full。
 
 ## 测试
 

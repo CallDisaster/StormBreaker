@@ -422,3 +422,23 @@ map-load and realloc traces also completed with zero allocator failures and
 zero >10 ms samples. Their artifacts are
 `tlsf-class-growth-fix-hotpath-20260714` and
 `tlsf-class-growth-fix-trim-20260714`.
+
+## Four-hook large-only baseline (2026-07-15)
+
+The benchmark now exposes `--engine legacy-large` and
+`--tlsf-warm-empty-pools 0..8`. `legacy-large` invokes the production
+`Hooked_Storm_MemAlloc/Free/GetSize/ReAlloc` contract against the same
+Storm-shaped native mock used by `native-storm`; profiler, telemetry and
+MemorySafety tracking are disabled, matching release defaults.
+
+Seven standard `small-churn` pairs produced a median four-hook overhead of
+1.56%, with identical 400 ns sampled p99. A separate seven-pair standard
+`map-load` factor compared immediate extension release (`warm=0`) with one
+retained empty pool (`warm=1`). The retained pool was 1.04% slower at the
+median and increased post-drain reserved/committed memory from 64 to 80 MiB.
+Production therefore uses `warm=0`; the alternate remains benchmark-only.
+
+The map trace's native engine uses the current Windows process heap. It is a
+correct fixed-overhead control but not a performance model for Warcraft III
+1.27a's native large allocation path, so no in-game speed claim is derived
+from native-versus-legacy map timings.

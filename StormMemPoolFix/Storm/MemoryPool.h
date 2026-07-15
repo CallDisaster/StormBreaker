@@ -122,6 +122,10 @@ namespace MemoryPool {
     // raw pointer; only VisitAllocations is a definitive live-block snapshot.
     bool OwnsAddress(
         const void* ptr, BackendRoute* route = nullptr);
+    // Conservative O(1) prefilter used before inspecting StormBreaker headers.
+    // A false result guarantees that no active backend range contains ptr.
+    bool MayOwnAddress(
+        const void* ptr, BackendRoute* route = nullptr);
     bool QueryAllocation(
         void* ptr, AllocationOwnership* ownership);
     bool QueryAllocation(
@@ -259,6 +263,7 @@ namespace MemoryPool {
         void SetTlsfMainPoolDecommitEnabledForTesting(bool enabled);
         void SetTlsfTopDownEnabledForTesting(bool enabled);
         void SetTlsfConstantTimeEmptyCheckEnabledForTesting(bool enabled);
+        void SetTlsfWarmEmptyPoolLimitForTesting(size_t limit);
         void SetTlsfShardAffinityForTesting(size_t shardIndex);
         void SetTlsfShardExtendFailureForTesting(size_t shardIndex);
         void SetDetailedCounterBatchingEnabledForTesting(bool enabled);
